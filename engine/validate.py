@@ -72,6 +72,18 @@ def section_totals(rows, col, total_level=None, item_level=None, tol=TOL,
         x = r["x0"]
         if x is None:
             continue
+        if not any(r["values"]):
+            # A row carrying no figures cannot be a total, whatever indent it
+            # sits at. A page footer ("Page 2 of 3") is printed well right of
+            # the line items, so it landed in the total branch and emptied the
+            # section -- and the General & Administrative section of this
+            # report runs across a page break, with its items on one page and
+            # its total on the next. The footer between them discarded eleven
+            # line items and the total was then never checked at all. Only a
+            # heading, printed left of the items, starts a new section.
+            if x < item_x0 - indent_tol:
+                bucket = []
+            continue
         if x < item_x0 - indent_tol:        # a header starts a new section
             bucket = []
             continue

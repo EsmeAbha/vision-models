@@ -194,7 +194,7 @@ def _edges(row, tol=8.0):
     return {round(t["x1"] / tol) for t in row if looks_value(t["text"])}
 
 
-def find_regions(rows, min_rows=3, overlap=0.5, gap_rows=3):
+def find_regions(rows, min_rows=3, overlap=0.5, gap_rows=3, odd_rows=2):
     """Split a page's rows into bands that share one column structure.
 
     A page is not a table. This one carries a rollover schedule, three
@@ -206,7 +206,7 @@ def find_regions(rows, min_rows=3, overlap=0.5, gap_rows=3):
     A row with nothing in it does not end a band, since tables contain blank
     lines and sub-headings; a run of them does.
     """
-    regions, cur, cur_edges, blanks = [], [], set(), 0
+    regions, cur, cur_edges, blanks, odd = [], [], set(), 0, []
 
     def close():
         if len([r for r in cur if _edges(r)]) >= min_rows:
@@ -218,18 +218,37 @@ def find_regions(rows, min_rows=3, overlap=0.5, gap_rows=3):
             blanks += 1
             if cur and blanks >= gap_rows:
                 close()
-                cur, cur_edges, blanks = [], set(), 0
+                cur, cur_edges, blanks, odd = [], set(), 0, []
             elif cur:
                 cur.append(row)
             continue
         blanks = 0
-        if cur_edges:
-            shared = len(e & cur_edges) / len(e)
-            if shared < overlap:
+        if cur_edges and len(e & cur_edges) / len(e) < overlap:
+            # One row that does not fit is not the end of the table. A
+            # footnote printed inside a record ("Free rent for April totaling
+            # $8,225") carries figures at the right margin that match no
+            # column, and closing on it split a tenant's rent schedule in two
+            # and silently orphaned half the steps. A table ends where a RUN
+            # of rows stops fitting, which is what a new table looks like.
+            #
+            # Two, not three. Prose between tables also carries figures -- a
+            # paragraph describing a tenant quotes its share of the rent --
+            # and at three a page's commentary was absorbed into the table
+            # below it. The stray footnote was a single row; real prose runs
+            # longer than that.
+            odd.append(row)
+            if len(odd) >= odd_rows:
                 close()
-                cur, cur_edges = [], set()
+                cur = list(odd)
+                cur_edges = set().union(*(_edges(r) for r in odd))
+                odd = []
+            continue
+        if odd:
+            cur.extend(odd)
+            odd = []
         cur.append(row)
         cur_edges |= e
+    cur.extend(odd)
     close()
     return regions
 
