@@ -22,6 +22,12 @@ from . import geometry as G
 
 # 1,234.56  (1,234.56)  -1,234.56  1234  .55  1,234.56-
 MONEY = re.compile(r"^\(?-?[\d,]*\.?\d+\)?-?$")
+PERCENT = re.compile(r"^\(?-?[\d,]*\.?\d+\)?%$")
+# 6/1/25  10/31/2030  2024-12-31  Sep-27  May 2029
+DATE = re.compile(
+    r"^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\*?"
+    r"|\d{4}-\d{1,2}-\d{1,2}"
+    r"|(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*[\s.-]*\d{2,4})$")
 
 
 def looks_numeric(text):
@@ -31,10 +37,38 @@ def looks_numeric(text):
     return bool(MONEY.match(t.replace("$", "")))
 
 
+def classify(text):
+    """What kind of value a token is: money, percent, date, number or text.
+
+    A rent roll puts percentages and lease dates in columns of their own, and
+    treating them as label text -- which a money-only test does -- glued
+    "13.0% 11.1% 6/1/25" onto the end of every tenant name and left three
+    columns of the table unread. They are values; they are simply not values
+    that may be added together, which is the validator's business, not the
+    parser's.
+    """
+    t = text.strip()
+    if not t or not any(ch.isdigit() for ch in t):
+        return "text"
+    if DATE.match(t):
+        return "date"
+    if PERCENT.match(t.replace("$", "")):
+        return "percent"
+    body = t.replace("$", "")
+    if MONEY.match(body):
+        return "money" if "$" in t or "," in t or "." in t else "number"
+    return "text"
+
+
+def looks_value(text):
+    """Any token that belongs in a column rather than in the label."""
+    return classify(text) != "text"
+
+
 def parse_number(text):
     """Printed figure -> float, or None. Parentheses and trailing minus are
     both negatives in accounting output."""
-    t = str(text).strip().replace("$", "").replace(",", "")
+    t = str(text).strip().replace("$", "").replace(",", "").rstrip("%")
     if not t:
         return None
     neg = False
@@ -61,7 +95,7 @@ def discover_columns(rows, tol=6.0, min_rows=3):
     edges = []
     for row in rows:
         for t in row:
-            if looks_numeric(t["text"]):
+            if looks_value(t["text"]):
                 edges.append(t["x1"])
     edges.sort()
     clusters, cur = [], []
@@ -84,7 +118,7 @@ def indent_levels(rows, tol=3.0):
     """Distinct left edges of the label part of each row, ascending."""
     lefts = []
     for row in rows:
-        label = [t for t in row if not looks_numeric(t["text"])]
+        label = [t for t in row if not looks_value(t["text"])]
         if label:
             lefts.append(label[0]["x0"])
     lefts.sort()
@@ -117,9 +151,9 @@ def read_rows(tokens, page=None, row_tol=2.0, col_tol=6.0, columns=None):
     out = []
     for row in rows:
         labels = [t for t in row
-                  if not looks_numeric(t["text"]) or t["x1"] < value_zone]
+                  if not looks_value(t["text"]) or t["x1"] < value_zone]
         nums = [t for t in row
-                if looks_numeric(t["text"]) and t["x1"] >= value_zone]
+                if looks_value(t["text"]) and t["x1"] >= value_zone]
         if not labels and not nums:
             continue
 
@@ -153,3 +187,72 @@ def read_rows(tokens, page=None, row_tol=2.0, col_tol=6.0, columns=None):
             "unbinned": unbinned,
         })
     return out, cols, levels
+
+
+def _edges(row, tol=8.0):
+    """The right edges of a row's value tokens, coarsened for comparison."""
+    return {round(t["x1"] / tol) for t in row if looks_value(t["text"])}
+
+
+def find_regions(rows, min_rows=3, overlap=0.5, gap_rows=3):
+    """Split a page's rows into bands that share one column structure.
+
+    A page is not a table. This one carries a rollover schedule, three
+    paragraphs of prose and a tenant exposure table, and discovering columns
+    across all of it produced eighteen columns for a nine-column table --
+    every band's edges merged into one model that fits none of them.
+
+    Rows are grouped while their value edges keep landing in the same places.
+    A row with nothing in it does not end a band, since tables contain blank
+    lines and sub-headings; a run of them does.
+    """
+    regions, cur, cur_edges, blanks = [], [], set(), 0
+
+    def close():
+        if len([r for r in cur if _edges(r)]) >= min_rows:
+            regions.append(list(cur))
+
+    for row in rows:
+        e = _edges(row)
+        if not e:
+            blanks += 1
+            if cur and blanks >= gap_rows:
+                close()
+                cur, cur_edges, blanks = [], set(), 0
+            elif cur:
+                cur.append(row)
+            continue
+        blanks = 0
+        if cur_edges:
+            shared = len(e & cur_edges) / len(e)
+            if shared < overlap:
+                close()
+                cur, cur_edges = [], set()
+        cur.append(row)
+        cur_edges |= e
+    close()
+    return regions
+
+
+def read_tables(tokens, page=None, row_tol=2.0, col_tol=6.0, min_rows=3):
+    """[{rows, cols, y0, y1}] -- one entry per table found on the page.
+
+    Columns are discovered inside each band, so a page with several tables
+    gets several column models instead of one that averages them.
+    """
+    toks = [t for t in tokens if page is None or t["page"] == page]
+    all_rows = G.group_rows(toks, tol=row_tol)
+
+    out = []
+    for band in find_regions(all_rows, min_rows=min_rows):
+        flat = [t for row in band for t in row]
+        if not flat:
+            continue
+        rows, cols, _levels = read_rows(flat, page=None, row_tol=row_tol,
+                                        col_tol=col_tol)
+        if not cols:
+            continue
+        out.append({"rows": rows, "cols": cols,
+                    "y0": min(t["top"] for t in flat),
+                    "y1": max(t["bottom"] for t in flat)})
+    return out
