@@ -13,6 +13,8 @@ flagged, and a reason given to the person who has to fix it:
 """
 from __future__ import annotations
 
+import re
+
 from .tabular import parse_number
 
 # Printed figures are rounded, so sums carry a little slack. Anything larger
@@ -101,6 +103,165 @@ def section_totals(rows, col, total_level=None, item_level=None, tol=TOL,
     return out
 
 
+# A row that sums the rows above it. "Total", "Subtotal" and "Grand Total"
+# are the obvious spellings; "Top 10 Tenant Exposure" is the convention these
+# reports use for a subtotal over the largest tenants. "All Others" is NOT
+# here on purpose -- it is a residual line, a data row like any other, and
+# treating it as a total would make the grand total check compare against
+# itself.
+TOTAL_LABEL = re.compile(
+    r"^\s*(grand\s+)?(sub)?\s*totals?\b"
+    r"|^\s*top\s+\d+\b"
+    r"|\btotals?\s*$", re.I)
+
+
+def _hypotheses(pending, col, n_cols):
+    """Every way this total could relate to the rows above it: {name: value}.
+
+    Not every column is added up. A rent roll's rent and area are sums, but
+    its rent per square foot is a ratio of the two totals and its remaining
+    lease term is an average weighted by area -- adding those up gives $327.92
+    per square foot, which is less a failed check than a wrong question.
+    """
+    vals = [_val(r, col) for r in pending]
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return {}
+
+    out = {"sum": round(sum(vals), 2),
+           "average": round(sum(vals) / len(vals), 4)}
+
+    for w in range(n_cols):
+        if w == col:
+            continue
+        num = den = 0.0
+        ok = True
+        for r in pending:
+            wv, cv = _val(r, w), _val(r, col)
+            if wv is None or cv is None:
+                ok = False
+                break
+            num += wv * cv
+            den += wv
+        if ok and den:
+            out[f"average weighted by column {w + 1}"] = round(num / den, 4)
+
+    for x in range(n_cols):
+        for y in range(n_cols):
+            if x == y or col in (x, y):
+                continue
+            tx = [_val(r, x) for r in pending]
+            ty = [_val(r, y) for r in pending]
+            if any(v is None for v in tx) or any(v is None for v in ty):
+                continue
+            den = sum(ty)
+            if den:
+                out[f"column {x + 1} total over column {y + 1} total"] =                     round(sum(tx) / den, 4)
+    return out
+
+
+def _tolerance(method, printed, n):
+    """A sum is exact; an average is printed rounded and built from rounded
+    figures, so it needs more slack."""
+    if method == "sum":
+        return max(TOL, TOL * n)
+    return max(0.05, abs(printed) * 0.002)
+
+
+# How much a method has to recommend itself before an exotic one is believed.
+_SIMPLICITY = {"sum": 0, "average": 1}
+
+
+def _rank(method):
+    return _SIMPLICITY.get(method, 2 if method.startswith("average") else 3)
+
+
+def flat_totals(rows, col, n_cols=1, tol=TOL):
+    """Totals in a table whose rows all share one indent.
+
+    The income statement marks a total by printing it at a different indent.
+    A rent roll does not: on the tenant exposure table every row, totals
+    included, starts at the same x, so `body_indents` finds no total level
+    and `section_totals` returns nothing at all. Here the label is the only
+    signal available, so the label is what is used.
+
+    A matched total consumes the rows accumulated since the last one and then
+    stands in their place, so a grand total below a subtotal is checked
+    against the subtotal rather than against the rows the subtotal already
+    covered. Without that, a table with both would double-count everything
+    above the subtotal and fail a document that is perfectly correct.
+    """
+    segments, pending = [], []
+    for r in rows:
+        v = _val(r, col)
+        if v is None:
+            continue
+        if TOTAL_LABEL.search(r["label"] or ""):
+            if pending:
+                segments.append((r, v, list(pending)))
+            pending = [r]
+        else:
+            pending.append(r)
+    if not segments:
+        return []
+
+    # The relationship is a property of the COLUMN, settled once and then
+    # applied to every total in it. Testing each total against sixty
+    # hypotheses independently invites numerology: on this table the grand
+    # total's rate per square foot came within 0.07 of the rate averaged and
+    # weighted by remaining lease term, which is not a quantity anyone
+    # computes. Requiring one method to serve the whole column kills those
+    # coincidences, and it makes a failure legible -- the subtotal establishes
+    # that the rate is rent over area, so the grand total is reported against
+    # rent over area rather than against whatever number happens to be near.
+    votes = {}
+    hyps = []
+    for row, printed, pend in segments:
+        h = _hypotheses(pend, col, n_cols)
+        hyps.append(h)
+        for name, value in h.items():
+            if abs(value - printed) <= _tolerance(name, printed, len(pend)):
+                # Weighted by how many rows stood behind the agreement. A
+                # relationship confirmed across ten tenant rows is evidence;
+                # the same relationship "confirmed" by two subtotals is
+                # nearly arithmetic-free. Counting segments equally let a
+                # simple average of two numbers outrank an area-weighted
+                # average that held over ten.
+                votes[name] = votes.get(name, 0) + len(pend)
+    if votes:
+        method = min(votes, key=lambda m: (-votes[m], _rank(m), m))
+    else:
+        method = "sum"
+
+    out = []
+    for (row, printed, pend), h in zip(segments, hyps):
+        got = h.get(method)
+        if got is None:
+            got, used = h.get("sum"), "sum"
+        else:
+            used = method
+        if got is None:
+            continue
+        ok = abs(got - printed) <= _tolerance(used, printed, len(pend))
+        out.append({
+            "check": "table_total",
+            "scope": f"col{col}",
+            "label": row["label"],
+            "expected": printed,
+            "got": got,
+            "diff": round(got - printed, 2),
+            "ok": ok,
+            "note": (f"{len(pend)} row(s) above it, as {used}" if ok else
+                     f"{len(pend)} row(s) above it; does not reconcile as "
+                     f"{used}, which is how this column's other totals are "
+                     f"reached" if len(segments) > 1 else
+                     f"{len(pend)} row(s) above it; does not reconcile"),
+            "page": row["page"],
+            "y": row["y"],
+        })
+    return out
+
+
 def unbinned_tokens(rows):
     """Any numeric token that matched no column. Must be zero, or explained.
 
@@ -158,12 +319,22 @@ def column_completeness(rows, cols, item_level=None):
 
 
 def run_all(rows, cols):
-    """Every check, for every numeric column."""
+    """Every check, for every numeric column.
+
+    Which total check applies is decided by the document, not configured:
+    when the rows carry a total indent the sections are read from the
+    geometry, and when they are all at one indent the labels are all there
+    is to go on.
+    """
     results = []
+    _item, total_x0 = body_indents(rows)
+    indented = total_x0 is not None
     for c in range(len(cols)):
-        results += section_totals(rows, c)
+        results += (section_totals(rows, c) if indented
+                    else flat_totals(rows, c, len(cols)))
     results += unbinned_tokens(rows)
-    results += column_completeness(rows, cols)
+    if indented:
+        results += column_completeness(rows, cols)
     return results
 
 
