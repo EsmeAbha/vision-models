@@ -27,22 +27,60 @@ HEADER = Font(bold=True)
 THIN = Side(style="thin", color="BFBFBF")
 BOX = Border(bottom=THIN)
 MONEY = "#,##0.00;(#,##0.00)"
+WHOLE = "#,##0;(#,##0)"
+# The figure is stored as it was printed -- 13.0, not 0.13 -- and the format
+# puts the sign back. Storing 0.13 so that Excel's own percent format applies
+# would mean the cell no longer holds the number on the page, and every sheet
+# here is meant to be checkable against the document line by line.
+PCT = '0.0"%"'
+TEXT = "@"
 
 
 def _flagged_rows(results):
-    """(page, y) -> [reasons] for every check that failed."""
+    """(page, y) -> {"why": [reasons], "cols": {column indexes}}.
+
+    The column is kept, not just the row. A reader asked to check a flagged
+    line should be looking at the figure that did not reconcile, and on a
+    table nine columns wide a whole highlighted row does not tell them which
+    one that is.
+    """
     flags = {}
     for r in results:
         if r["ok"]:
             continue
         key = (r.get("page"), r.get("y"))
         if r["diff"] is not None:
-            why = (f"{r['check']}: printed {r['expected']:,.2f} but the items "
-                   f"sum to {r['got']:,.2f} (difference {r['diff']:,.2f})")
+            why = (f"{r['check']}: printed {r['expected']:,.2f}, computed "
+                   f"{r['got']:,.2f} (difference {r['diff']:,.2f}) - {r['note']}")
         else:
             why = f"{r['check']}: {r['got']} ({r['note']})"
-        flags.setdefault(key, []).append(why)
+        f = flags.setdefault(key, {"why": [], "cols": set()})
+        f["why"].append(why)
+        scope = str(r.get("scope", ""))
+        if scope.startswith("col") and scope[3:].isdigit():
+            f["cols"].add(int(scope[3:]))
     return flags
+
+
+def _column_formats(rows, n_cols):
+    """The printed type of each column, so the sheet reads like the report."""
+    from .tabular import classify
+
+    out = []
+    for i in range(n_cols):
+        kinds = {}
+        for r in rows:
+            v = r["values"][i] if i < len(r["values"]) else None
+            if v:
+                k = classify(v)
+                kinds[k] = kinds.get(k, 0) + 1
+        if not kinds:
+            out.append(None)
+            continue
+        kind = max(kinds, key=kinds.get)
+        out.append({"percent": PCT, "date": TEXT, "money": MONEY,
+                    "number": WHOLE}.get(kind))
+    return out
 
 
 def write(path, rows, cols, results, source_name="", column_names=None,
@@ -62,10 +100,12 @@ def write(path, rows, cols, results, source_name="", column_names=None,
         cell.alignment = Alignment(vertical="bottom", wrap_text=False)
 
     flags = _flagged_rows(results)
+    formats = _column_formats(rows, len(cols))
     n_flagged = 0
 
     for i, r in enumerate(rows, start=1):
-        note = "; ".join(flags.get((r["page"], r["y"]), []))
+        flag = flags.get((r["page"], r["y"]))
+        note = "; ".join(flag["why"]) if flag else ""
         # Values are written as numbers where they parse, so the sheet can be
         # used for arithmetic, and as the printed string where they do not --
         # never reformatted into something the report did not say.
@@ -83,13 +123,21 @@ def write(path, rows, cols, results, source_name="", column_names=None,
 
         for j in range(len(names)):
             cell = ws.cell(row=excel_row, column=4 + j)
-            if isinstance(cell.value, float):
+            fmt = formats[j] if j < len(formats) else None
+            if fmt and isinstance(cell.value, (int, float)):
+                cell.number_format = fmt
+            elif isinstance(cell.value, float):
                 cell.number_format = MONEY
 
         if note:
             n_flagged += 1
-            for c in range(1, len(head) + 1):
+            # The label and the note are marked so the row can be found, and
+            # then only the figures that actually failed.
+            for c in (3, len(head)):
                 ws.cell(row=excel_row, column=c).fill = YELLOW
+            for j in sorted(flag["cols"]):
+                if j < len(names):
+                    ws.cell(row=excel_row, column=4 + j).fill = YELLOW
 
     widths = [6, 6, 52] + [16] * len(names) + [70]
     for i, w in enumerate(widths, start=1):
