@@ -145,37 +145,49 @@ def from_ocr_json(words, page=1, pass_no=1, scale=1.0):
 
 
 _VOWEL = re.compile(r"[aeiouyAEIOUY]")
-_PUNCT_EDGE = re.compile(r"^[^\w$]+|[^\w%]+$")
+_EDGE = re.compile(r"^[^0-9A-Za-z$]+|[^0-9A-Za-z%)]+$")
+# Punctuation that legitimately appears INSIDE a token: decimals, thousands
+# separators, hyphenated names, dates, times, citations, footnote marks, and
+# the curly quotes a word processor produces. The list is deliberately
+# generous -- a missing mark costs a good document an unnecessary OCR pass,
+# and a semicolon and a curly apostrophe between them were enough to flag a
+# clean paper at 90%.
+_INNER_OK = set(".,-/':&#$%()[]{}!?;+*=@_~"
+                "’‘“”–—°§")
 
 
 def _wordlike(tok):
-    """Is this token a word, a figure or a code -- or is it glyph soup?
+    """True, False, or None when the token is no evidence either way.
 
-    Mojibake is built out of exactly the characters a business document is
-    full of: commas, colons, hyphens, quotes. Counting "legible characters"
-    therefore scores ",:!IT-" at 100% and passes a ruined text layer. What
-    broken text does NOT have is word structure, so that is what is measured.
+    Mojibake is built from the same characters a business document is full
+    of -- commas, colons, hyphens -- so counting "legible characters" scores
+    ",:!IT-" at 100%. What broken text lacks is word SHAPE: real tokens are
+    words, figures or codes, optionally wrapped in punctuation, while broken
+    ones carry punctuation in their middle.
+
+    Tokens with one alphanumeric character abstain rather than counting
+    against the document. A dash standing for an empty cell, and the "R:"
+    "G:" "B:" of a colour table, are layout marks on both sides of the
+    question; scoring them as junk sent a perfectly readable style guide to
+    OCR at 89%.
     """
-    t = _PUNCT_EDGE.sub("", tok.strip())
-    if not t:
-        return False
-    core = t.replace(",", "").replace(".", "").replace("/", "").replace("-", "")
-    core = core.replace("$", "").replace("%", "").replace(":", "")
-    if not core:
-        return False
-    if core.isdigit():
-        return True                      # a figure, a date, a year
-    if any(c.isdigit() for c in core) and core.isalnum():
-        return True                      # unit code: A101, 3BR, 225bush
-    letters = [c for c in core if c.isalpha()]
-    if len(letters) < 2:
-        return False                     # stray single glyph
-    if len(letters) < len(core) * 0.6:
-        return False                     # letters drowned in punctuation
-    return True                          # word, or abbreviation (LLC, SF, TI)
+    t = _EDGE.sub("", tok.strip())
+    alnum = [c for c in t if c.isalnum()]
+    if len(alnum) <= 1:
+        return None
+    if any((not c.isalnum()) and c not in _INNER_OK for c in t):
+        return False                     # interior junk: "m•T", ")WP(•W:"
+    letters = [c for c in t if c.isalpha()]
+    if not letters:
+        return True                      # a figure, a date
+    if any(c.isdigit() for c in t):
+        return True                      # a code: A101, 3BR, 225bush
+    if len(letters) >= 5 and not _VOWEL.search("".join(letters)):
+        return False                     # a long consonant run is not a word
+    return True
 
 
-def has_text_layer(path, sample_pages=6, min_chars=200, min_wordlike=0.90):
+def has_text_layer(path, sample_pages=6, min_chars=200, min_wordlike=0.89):
     """(bool, note). False when the words are pixels, or are mojibake.
 
     Some PDFs carry a text layer that renders perfectly and extracts as
@@ -201,17 +213,20 @@ def has_text_layer(path, sample_pages=6, min_chars=200, min_wordlike=0.90):
     if len(joined) < min_chars:
         return False, f"only {len(joined)} characters of text - likely scanned"
 
-    # Single glyphs are judged on neither side. A dash standing for an empty
-    # cell and a rule of "=" are layout marks, not text, and they are common
-    # enough in a clean report to drag it down: counting them put a good
-    # income statement at 92% against a ruined lease report at 77%, which is
-    # too little daylight for a threshold. Ignoring them separates the two at
-    # 99% and 79%.
-    body = [t for t in toks if len(t["text"].strip()) > 1]
-    if len(body) < 20:
-        return False, f"only {len(body)} multi-character tokens - likely scanned"
-    good = sum(1 for t in body if _wordlike(t["text"]))
-    ratio = good / len(body)
+    # Measured over 99 documents. Every financial report scores 97% or
+    # better and the one with dead fonts scores 85.3%; the lowest clean file
+    # of any kind is a diagram export at 92.9%. The threshold sits in that
+    # gap rather than at a guessed round number.
+    #
+    # A ratio of alphanumeric to total characters was tried first and is
+    # useless here: the broken tokens ("lC-CIM", "oalll", "rs-") are mostly
+    # letters, so the ruined file scored HIGHER than many good ones. What
+    # separates them is punctuation in the middle of a token, not the amount
+    # of it.
+    votes = [v for v in (_wordlike(t["text"]) for t in toks) if v is not None]
+    if len(votes) < 20:
+        return False, f"only {len(votes)} substantive tokens - likely scanned"
+    ratio = sum(1 for v in votes if v) / len(votes)
     if ratio < min_wordlike:
         return False, (f"text layer is mojibake (only {ratio:.0%} of tokens are "
                        f"words, figures or codes) - the embedded fonts have no "
