@@ -1,0 +1,36 @@
+{
+  "template_id": "income_statement_v1",
+  "created": "2026-09-18 21:08",
+  "signature": [
+    "af32a4f966e9",
+    "0cba2b2e6cd3",
+    "99f991fb3a76",
+    "845125ed44e2",
+    "ce2bd222be4e",
+    "0f613350b66e",
+    "9aceeae8353d",
+    "58127e680cf2"
+  ],
+  "page_w": 550,
+  "page_h": 740,
+  "columns": [
+    {
+      "name": "Period to Date",
+      "x1": 336.9
+    },
+    {
+      "name": "Year to Date",
+      "x1": 431.3
+    }
+  ],
+  "indents": {
+    "item_x0": 59.0,
+    "total_x0": 63.0
+  },
+  "validations": [
+    "section_total",
+    "unbinned_token",
+    "ragged_row"
+  ],
+  "notes": "Quarterly income statement, two value columns. Line items at x0=59, section totals deeper, grand totals flush with the section headings."
+}
