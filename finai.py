@@ -179,9 +179,39 @@ def index():
 """
 
 
-app = gr.mount_gradio_app(app, demo, path="/finai")
+def _serve_opts():
+    """Where to listen, and the password that is required to leave localhost.
+
+    The same VM_HOST / VM_USER / VM_PASS convention as the other pages, with
+    one difference: here a password is REQUIRED rather than advised.
+
+    Those pages accept an upload and hand back a result. This one hands a
+    chat model tools that read any path on this machine -- list a folder,
+    open a spreadsheet, extract a document. On an open port that is not a
+    file-upload form, it is a way for anyone who can reach it to read the
+    disk by asking. So binding beyond localhost without credentials is
+    refused rather than warned about.
+    """
+    host = os.environ.get("VM_HOST", "127.0.0.1")
+    user, password = os.environ.get("VM_USER"), os.environ.get("VM_PASS")
+    auth = (user, password) if user and password else None
+    if host != "127.0.0.1" and not auth:
+        raise SystemExit(
+            "REFUSING to listen on %s with no password.\n"
+            "This page's tools can read any file on this machine, so it is\n"
+            "not safe to expose unauthenticated. Set VM_USER and VM_PASS, or\n"
+            "start it with serve_finai.ps1 -Password \"something-long\"."
+            % host)
+    return host, auth
+
+
+HOST, AUTH = _serve_opts()
+app = gr.mount_gradio_app(app, demo, path="/finai", auth=AUTH)
 
 if __name__ == "__main__":
     import uvicorn
-    host = "0.0.0.0" if os.environ.get("SERVE_LAN") else "127.0.0.1"
-    uvicorn.run(app, host=host, port=7870, log_level="warning")
+    where = "127.0.0.1" if HOST == "127.0.0.1" else HOST
+    print(f"FinAI on http://{where}:7870/finai"
+          + ("  (password required)" if AUTH else "  (localhost only)"),
+          flush=True)
+    uvicorn.run(app, host=HOST, port=7870, log_level="warning")
