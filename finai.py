@@ -24,6 +24,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 import finai_agent as FA
+import ollama_proxy
 
 _here = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(_here, "uploads", "finai")
@@ -182,6 +183,9 @@ with gr.Blocks(title="FinAI", fill_height=True) as demo:
 
 app = FastAPI(title="FinAI")
 
+# The local models, reachable over the network behind the same password.
+app.include_router(ollama_proxy.router)
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -203,6 +207,15 @@ def index():
  <li><a href="http://127.0.0.1:7862">7862</a> &mdash; appraisal fields</li>
  <li><a href="http://127.0.0.1:7863">7863</a> &mdash; folder / loan extraction</li>
  <li><a href="http://127.0.0.1:7864">7864</a> &mdash; lease abstraction</li>
+</ul>
+<h3>Local model API</h3>
+<p>The Ollama API is proxied at <code>/ollama</code>, behind the same
+ username and password as the chat page. Ollama itself stays bound to
+ localhost.</p>
+<ul>
+ <li><code>POST /ollama/api/chat</code> &mdash; native Ollama</li>
+ <li><code>POST /ollama/v1/chat/completions</code> &mdash; OpenAI-compatible</li>
+ <li><a href="/ollama/api/tags"><code>GET /ollama/api/tags</code></a> &mdash; list models</li>
 </ul>
 <p><small>Start one with
  <code>./.venv/Scripts/python folder_ui.py</code> and so on. Nothing on this
