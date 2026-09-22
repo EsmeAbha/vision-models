@@ -22,6 +22,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from .tabular import parse_number
+
 YELLOW = PatternFill("solid", start_color="FFF2CC", end_color="FFF2CC")
 HEADER = Font(bold=True)
 THIN = Side(style="thin", color="BFBFBF")
@@ -180,6 +182,150 @@ def _issues_sheet(wb, results, source_name):
                    "No cell required a review flag."])
 
     for col, w in zip("ABCDEFG", (18, 6, 46, 16, 16, 14, 60)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+    return ws
+
+
+def write_skill_workbook(path, cfg, res, series, source_name=""):
+    """Source, Workings and Issues for a run of a learned skill.
+
+    Three sheets, because two different readers need two different shapes.
+    "Source" is one row per printed line and is checkable against the page
+    with a finger. "Workings" is one row per record, with the repeating
+    series laid across it, and is the sheet people actually work in. Both
+    carry the same flags, so a doubt cannot be escaped by switching tabs.
+    """
+    from .skills import steps_of
+
+    names = res["column_names"]
+    wb = Workbook()
+
+    # -- flags, keyed by the row they were raised on -------------------------
+    by_row = {}
+    for f in res["flags"]:
+        by_row.setdefault((f["page"], f["y"]), []).append(f)
+
+    # -- Source --------------------------------------------------------------
+    ws = wb.active
+    ws.title = "Source (as printed)"
+    head = ["Page", "Section", "Line Kind"] + names + ["Review Note"]
+    ws.append(head)
+    for c in range(1, len(head) + 1):
+        ws.cell(row=1, column=c).font = HEADER
+        ws.cell(row=1, column=c).border = BOX
+
+    n_flagged = 0
+    for rec in res["records"]:
+        block = [(rec["head"], "Record")]
+        block += [(ln, "Series") for ln in rec["lines"]]
+        if rec.get("subtotal") is not None:
+            block.append((rec["subtotal"], "Record Total"))
+        for row, kind in block:
+            fl = by_row.get((row["page"], row["y"]), [])
+            note = "; ".join(f"{x['name']}: {x['detail']}" for x in fl)
+            vals = []
+            for v in row["values"]:
+                n = parse_number(v) if v else None
+                vals.append(n if n is not None else v)
+            ws.append([row["page"], rec.get("section"), kind] + vals
+                      + [note or None])
+            if note:
+                n_flagged += 1
+                ws.cell(row=ws.max_row, column=2).fill = YELLOW
+                ws.cell(row=ws.max_row, column=len(head)).fill = YELLOW
+                for x in fl:
+                    ws.cell(row=ws.max_row, column=4 + x["column"]).fill = YELLOW
+    ws.freeze_panes = "A2"
+    for i, w in enumerate([6, 16, 13] + [15] * len(names) + [80], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # -- Workings ------------------------------------------------------------
+    _workings(wb, cfg, res, series, names, by_row)
+    _skill_issues(wb, cfg, res, source_name)
+    wb.save(path)
+    return len(res["records"]), n_flagged
+
+
+def _workings(wb, cfg, res, series, names, by_row):
+    """One row per record, the series laid across it as numbered groups."""
+    from .skills import steps_of
+
+    ws = wb.create_sheet("Workings")
+    keep = [i for i in range(len(names)) if i not in set(series)]
+    step_names = cfg.get("series", {}).get("columns", [])
+    label = cfg.get("series", {}).get("name", "Group")
+
+    widest = max((len(steps_of(r, series)) for r in res["records"]), default=0)
+    head = ["Page", "Section", "Occupant / Label"] + [names[i] for i in keep]
+    for k in range(widest):
+        head += [f"{label} {k + 1} Code"] + [f"{label} {k + 1} {s.split()[-1]}"
+                                             for s in step_names]
+    head += ["Review Note"]
+    ws.append(head)
+    for c in range(1, len(head) + 1):
+        ws.cell(row=1, column=c).font = HEADER
+        ws.cell(row=1, column=c).border = BOX
+
+    for rec in res["records"]:
+        h = rec["head"]
+        fl = by_row.get((h["page"], h["y"]), [])
+        note = "; ".join(f"{x['name']}: {x['detail']}" for x in fl)
+        fields = []
+        for i in keep:
+            v = h["values"][i] if i < len(h["values"]) else None
+            n = parse_number(v) if v else None
+            fields.append(n if n is not None else v)
+        line = [h["page"], rec.get("section"), h["label"]] + fields
+        for st in steps_of(rec, series):
+            vals = []
+            for v in st["values"]:
+                n = parse_number(v) if v else None
+                vals.append(n if n is not None else v)
+            line += [st["code"]] + vals
+        line += [None] * (len(head) - 1 - len(line))
+        ws.append(line + [note or None])
+        if note:
+            ws.cell(row=ws.max_row, column=3).fill = YELLOW
+            ws.cell(row=ws.max_row, column=len(head)).fill = YELLOW
+    ws.freeze_panes = "D2"
+    for i, w in enumerate([6, 16, 34] + [15] * len(keep), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    return ws
+
+
+def _skill_issues(wb, cfg, res, source_name):
+    ws = wb.create_sheet("Issues")
+    ws.append(["Kind", "Where", "What", "Computed", "Printed", "Difference",
+               "Why it is flagged"])
+    for c in range(1, 8):
+        ws.cell(row=1, column=c).font = HEADER
+        ws.cell(row=1, column=c).border = BOX
+
+    for c in res["checks"]:
+        ws.append(["reconciliation", "report total", c["label"], c["got"],
+                   c["expected"], c["diff"],
+                   "reconciles" if c["ok"] else
+                   "does NOT reconcile with the total the report prints"])
+        if not c["ok"]:
+            for i in range(1, 8):
+                ws.cell(row=ws.max_row, column=i).fill = YELLOW
+
+    for f in res["flags"]:
+        ws.append(["confusion", f"page {f['page']}", f["label"], None, None,
+                   None, f"{f['name']}: {f['detail']}. {f['why']}"])
+        for i in range(1, 8):
+            ws.cell(row=ws.max_row, column=i).fill = YELLOW
+
+    passed = sum(1 for c in res["checks"] if c["ok"])
+    ws.append([])
+    ws.append(["Summary", f"{passed} of {len(res['checks'])} printed totals "
+                          f"reconcile; {len(res['flags'])} cell(s) need a human"])
+    ws.cell(row=ws.max_row, column=1).font = HEADER
+    ws.append(["Skill", cfg.get("slug", "")])
+    ws.append(["Source", os.path.basename(source_name) if source_name else ""])
+    ws.append(["Written", datetime.now().strftime("%Y-%m-%d %H:%M")])
+    for col, w in zip("ABCDEFG", (16, 14, 46, 16, 16, 14, 86)):
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "A2"
     return ws

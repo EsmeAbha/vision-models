@@ -226,20 +226,37 @@ def apply(cfg, tokens, pages=None):
         rows += r
 
     section = None
-    data, summaries, flags = [], [], []
+    data, summaries, flags, records = [], [], [], []
+    current = None
     for r in rows:
         kind, marker = classify(r, cfg)
         if kind == "section":
             section = marker
+            current = None
             continue
         if kind == "summary":
             summaries.append(r)
             continue
-        if kind in ("subtotal", "other"):
+        if kind == "subtotal":
+            # A per-record subtotal is not added to anything -- the rows it
+            # covers are already counted -- but it is kept, because it is the
+            # document's own statement about the record and can be checked.
+            if current is not None:
+                current["subtotal"] = r
+            continue
+        if kind == "other":
+            # Not a record of its own: a rent step, or any line carrying
+            # figures without the field that identifies a record. Dropping it
+            # would lose the whole future-increase schedule, which is the part
+            # of a rent roll people most want.
+            if current is not None and any(r["values"]):
+                current["lines"].append(r)
             continue
         r = dict(r)
         r["section"] = section
         data.append(r)
+        current = {"head": r, "lines": [], "subtotal": None, "section": section}
+        records.append(current)
         flags += _flags_for(r, cfg, names)
 
     totals = _sum_sections(data, cfg)
@@ -247,7 +264,42 @@ def apply(cfg, tokens, pages=None):
     checks = _reconcile(totals, printed, cfg, names)
     return {"rows": data, "summaries": summaries, "column_names": names,
             "totals": totals, "printed": printed, "checks": checks,
-            "flags": flags}
+            "flags": flags, "records": records}
+
+
+def series_indexes(cfg):
+    """Positions of the recipe's series columns in the column list."""
+    names = [c["name"] for c in cfg.get("columns", [])]
+    return [names.index(n) for n in cfg.get("series", {}).get("columns", [])
+            if n in names]
+
+
+def steps_of(record, series):
+    """The record's series, its own row first -- the head carries step one."""
+    out = []
+    for row in [record["head"]] + record["lines"]:
+        step = [row["values"][i] if i < len(row["values"]) else None
+                for i in series]
+        if any(step):
+            out.append({"values": step, "page": row["page"], "y": row["y"],
+                        "code": _charge_code(row, None)})
+    return out
+
+
+def _charge_code(row, cfg):
+    """The charge code printed beside a step, if the row carries one.
+
+    It sits in the label rather than a numeric column, because it is text.
+    The rightmost short alphabetic token is the code -- "BRT", "ABA" -- and
+    it is what steps are grouped by.
+    """
+    best = None
+    for t in row.get("label_tokens", []):
+        txt = t["text"].strip()
+        if txt.isalpha() and 2 <= len(txt) <= 4 and txt.isupper():
+            if best is None or t["x0"] > best[0]:
+                best = (t["x0"], txt)
+    return best[1] if best else None
 
 
 def _flags_for(row, cfg, names):
