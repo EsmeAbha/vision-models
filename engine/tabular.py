@@ -114,6 +114,70 @@ def discover_columns(rows, tol=6.0, min_rows=3):
     return sorted(cols, key=lambda c: c["x1"])
 
 
+def discover_text_columns(rows, tol=4.0, min_rows=3, exclude=None):
+    """Left edges where TEXT repeatedly lines up -> text columns.
+
+    Numbers are right-aligned and bin by their right edge; text is
+    left-aligned and bins by its left edge. Discovering only the numeric ones
+    leaves every non-numeric field inside the label, which on a rent roll
+    means the charge code that identifies a rent step ("BRT", "ABA") is
+    glued to the tenant's name -- and the charge code is exactly what the
+    steps have to be grouped by.
+
+    `exclude` holds the x positions of the record label itself, which is text
+    that lines up too and is not a column.
+    """
+    lefts = []
+    for row in rows:
+        for t in row:
+            if not looks_value(t["text"]):
+                lefts.append(t["x0"])
+    lefts.sort()
+    clusters, cur = [], []
+    for x in lefts:
+        if cur and x - cur[-1] > tol:
+            clusters.append(cur)
+            cur = []
+        cur.append(x)
+    if cur:
+        clusters.append(cur)
+
+    out = []
+    for c in clusters:
+        if len(c) < min_rows:
+            continue
+        x0 = round(sum(c) / len(c), 1)
+        if exclude and any(abs(x0 - e) <= tol for e in exclude):
+            continue
+        out.append({"x0": x0, "n": len(c), "align": "left",
+                    "lo": c[0], "hi": c[-1]})
+    return sorted(out, key=lambda c: c["x0"])
+
+
+def bin_text(rows, text_cols, tol=4.0):
+    """Pull text tokens that sit in a known text column out of the label.
+
+    Returns a parallel list of field lists, one per row, leaving the label as
+    whatever text did not belong to a column.
+    """
+    out = []
+    for r in rows:
+        fields = [None] * len(text_cols)
+        keep = []
+        for part in r.get("label_tokens", []):
+            hit = None
+            for i, c in enumerate(text_cols):
+                if abs(part["x0"] - c["x0"]) <= tol:
+                    hit = i
+                    break
+            if hit is not None and fields[hit] is None:
+                fields[hit] = part["text"]
+            else:
+                keep.append(part)
+        out.append(fields)
+    return out
+
+
 def indent_levels(rows, tol=3.0):
     """Distinct left edges of the label part of each row, ascending."""
     lefts = []
@@ -183,6 +247,8 @@ def read_rows(tokens, page=None, row_tol=2.0, col_tol=6.0, columns=None):
             "x0": x0,
             "level": level,
             "label": G.row_text(labels).strip(),
+            "label_tokens": [{"text": t["text"], "x0": t["x0"], "x1": t["x1"]}
+                             for t in labels],
             "values": values,
             "unbinned": unbinned,
         })
@@ -253,11 +319,19 @@ def find_regions(rows, min_rows=3, overlap=0.5, gap_rows=3, odd_rows=2):
     return regions
 
 
-def read_tables(tokens, page=None, row_tol=2.0, col_tol=6.0, min_rows=3):
+def read_tables(tokens, page=None, row_tol=2.0, col_tol=6.0, min_rows=3,
+                columns=None):
     """[{rows, cols, y0, y1}] -- one entry per table found on the page.
 
     Columns are discovered inside each band, so a page with several tables
     gets several column models instead of one that averages them.
+
+    `columns` pins them instead. A report whose table runs over four pages
+    prints its headings once and then relies on the reader to carry them
+    over; discovering afresh on each page gives the last page five columns
+    and the first twelve, because a column is only found where it happens to
+    be filled. Pinning keeps every page on one model, so the pages can be
+    concatenated without silently shifting a value into its neighbour.
     """
     toks = [t for t in tokens if page is None or t["page"] == page]
     all_rows = G.group_rows(toks, tol=row_tol)
@@ -268,7 +342,7 @@ def read_tables(tokens, page=None, row_tol=2.0, col_tol=6.0, min_rows=3):
         if not flat:
             continue
         rows, cols, _levels = read_rows(flat, page=None, row_tol=row_tol,
-                                        col_tol=col_tol)
+                                        col_tol=col_tol, columns=columns)
         if not cols:
             continue
         out.append({"rows": rows, "cols": cols,

@@ -35,3 +35,6 @@ LOCAL_AI_KNOWLEDGE.zip
 .kb_clean/
 .work_knowledge/
 prompt i gave.txt
+
+# Confidential client test documents - never committed
+test_files/
