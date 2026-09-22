@@ -1,0 +1,138 @@
+{
+  "title": "Receiver report rent roll",
+  "kind": "rent roll",
+  "summary": "A property management rent roll printed by suite, with vacant and occupied sections, additional-space lines folded into a lease, and a future rent increase series carrying a charge code per step.",
+  "columns": [
+    {
+      "name": "BldgId",
+      "x1": 45.6
+    },
+    {
+      "name": "SuiteId",
+      "x1": 64.8
+    },
+    {
+      "name": "AddlBldgId",
+      "x1": 162.6
+    },
+    {
+      "name": "RentStart",
+      "x1": 235.1
+    },
+    {
+      "name": "Expiration",
+      "x1": 282.8
+    },
+    {
+      "name": "GLA Sqft",
+      "x1": 341.1
+    },
+    {
+      "name": "Monthly Base Rent",
+      "x1": 395.1
+    },
+    {
+      "name": "Annual Rate PSF",
+      "x1": 435.6
+    },
+    {
+      "name": "Monthly Cost Recovery",
+      "x1": 494.1
+    },
+    {
+      "name": "Monthly Other Income",
+      "x1": 593.1
+    },
+    {
+      "name": "Bump Date",
+      "x1": 662.1
+    },
+    {
+      "name": "Bump Monthly Amount",
+      "x1": 723.6
+    },
+    {
+      "name": "Bump PSF",
+      "x1": 755.1
+    }
+  ],
+  "text_columns": [
+    {
+      "name": "Charge Code",
+      "x0": 606.6
+    }
+  ],
+  "sections": {
+    "markers": [
+      "VacantSuites",
+      "OccupiedSuites"
+    ]
+  },
+  "skip": {
+    "contains": [
+      ":"
+    ],
+    "startswith": [
+      "Total"
+    ]
+  },
+  "data_requires_column": 5,
+  "series": {
+    "columns": [
+      "Bump Date",
+      "Bump Monthly Amount",
+      "Bump PSF"
+    ],
+    "group_by": "Charge Code",
+    "name": "Bump"
+  },
+  "printed": {
+    "OccupiedSuites": {
+      "startswith": "OccupiedSqft:",
+      "section": "OccupiedSuites"
+    },
+    "VacantSuites": {
+      "startswith": "VacantSqft:",
+      "section": "VacantSuites"
+    }
+  },
+  "flags": [
+    {
+      "name": "name_overflows_into_date",
+      "when": "label_token_in_column_range",
+      "column": 3,
+      "x_range": [
+        225,
+        300
+      ],
+      "why": "A long occupant name runs into the rent start column and interleaves with the date, so neither can be read with confidence. The name and the date must both be checked against the page."
+    }
+  ],
+  "slug": "rent_roll_by_suite_v1",
+  "signature": [
+    "8b88280347a0",
+    "919fdd9b63a3",
+    "dc3be05e36e5",
+    "a659e97e448b",
+    "3a64270708fa",
+    "d35681c3d1be",
+    "40631591b8ea",
+    "540b303cfc1d"
+  ],
+  "page_w": 760,
+  "page_h": 550,
+  "created": "2026-09-22 09:29",
+  "updated": "2026-09-22 09:30",
+  "runs": {
+    "applied": 1,
+    "reconciled": 1,
+    "failed": 0
+  },
+  "history": [
+    {
+      "when": "2026-09-22 09:30",
+      "reconciled": true,
+      "note": "pages 38-41 of the source report"
+    }
+  ]
+}

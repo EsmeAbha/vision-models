@@ -38,7 +38,15 @@ def fingerprint(tokens, head_rows=12):
     """
     from . import geometry as G
 
-    p1 = [t for t in tokens if t["page"] == 1]
+    # The FIRST page present, not page 1. A report is often handled as a page
+    # range out of a larger file -- the rent roll inside a 92-page receiver
+    # report starts at page 38 -- and looking for page 1 in those tokens found
+    # nothing, so the fingerprint came back empty and the document failed to
+    # match even the skill learned from it.
+    if not tokens:
+        return {"head_lines": [], "page_w": 0, "page_h": 0, "n_pages": 0}
+    first = min(t["page"] for t in tokens)
+    p1 = [t for t in tokens if t["page"] == first]
     rows = G.group_rows(p1)[:head_rows]
     lines = [_norm(G.row_text(r)) for r in rows]
     lines = [ln for ln in lines if ln]
