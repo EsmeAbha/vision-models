@@ -45,7 +45,36 @@ def _stash(path):
     return dest
 
 
-def respond(message, history, folder, allow_ocr, model):
+def _paths_in_history(history):
+    """Files attached earlier in this conversation.
+
+    Gradio keeps an attachment in the history as its path, in one of several
+    shapes depending on how the turn was built. Without this, the second
+    question about a file got no path at all and the model asked for it again
+    -- which reads as the agent forgetting what it was just handed.
+    """
+    found = []
+
+    def walk(v):
+        if isinstance(v, str):
+            if os.path.sep in v and os.path.isfile(v):
+                found.append(v)
+        elif isinstance(v, dict):
+            for key in ("path", "file", "url", "name"):
+                if isinstance(v.get(key), str):
+                    walk(v[key])
+            if "content" in v:
+                walk(v["content"])
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                walk(item)
+
+    for turn in history or []:
+        walk(turn)
+    return list(dict.fromkeys(found))
+
+
+def respond(message, history, folder, model):
     """One turn. Yields as the agent works so its reasoning is visible."""
     text = (message or {}).get("text", "") if isinstance(message, dict) else str(message)
     files = (message or {}).get("files", []) if isinstance(message, dict) else []
@@ -65,6 +94,10 @@ def respond(message, history, folder, allow_ocr, model):
     if docs:
         prompt += "\n\n[Files the user attached, already on disk:]\n" + \
                   "\n".join(f"- {d}" for d in docs)
+    earlier = [p for p in _paths_in_history(history) if p not in docs]
+    if earlier:
+        prompt += "\n\n[Files from earlier in this conversation:]\n" + \
+                  "\n".join(f"- {d}" for d in earlier[-5:])
     if images and not prompt:
         prompt = "Describe what this image shows and what you would do with it."
     if not prompt:
@@ -94,8 +127,7 @@ def respond(message, history, folder, allow_ocr, model):
     yield "*working…*"
 
     answer, steps = FA.run_agent(prompt, history=past, model=model,
-                                 allow_ocr=bool(allow_ocr), images=images or None,
-                                 on_event=on_event)
+                                 images=images or None, on_event=on_event)
 
     work = ""
     if lines:
@@ -117,31 +149,30 @@ with gr.Blocks(title="FinAI", fill_height=True) as demo:
         "Ask for what you want. The model looks at what is on disk, decides "
         "what to run, and reuses what it has learned about a report type when "
         "it recognises one. Everything stays on this machine.\n\n"
-        "*A figure is reported as clean only when the document's own printed "
-        "totals agree with it. Anything doubtful comes back flagged, with the "
-        "reason.*"
+        "*It reads scanned pages by itself with the local vision model, so "
+        "there is nothing to switch on. A figure is reported as clean only "
+        "when the document's own printed totals agree with it; anything "
+        "doubtful comes back flagged, with the reason.*"
     )
     with gr.Row():
         folder_in = gr.Textbox(label="Working folder (optional)", scale=4,
                                placeholder=r"C:\...\reports")
         model_in = gr.Dropdown(MODELS, value=MODELS[0], label="Local model",
                                scale=2)
-        ocr_in = gr.Checkbox(False, label="Allow OCR", scale=1)
 
     gr.ChatInterface(
         respond,
         # Gradio 6 dropped the `type` argument: message dicts are the only
         # history format now, which is the shape `respond` already expects.
         multimodal=True,
-        additional_inputs=[folder_in, ocr_in, model_in],
+        additional_inputs=[folder_in, model_in],
         textbox=gr.MultimodalTextbox(
             placeholder="e.g. what is in this folder?  /  pull the rent roll "
                         "out of that report into Excel  /  what have you "
                         "learned so far?",
             file_count="multiple"),
         examples=[
-            [{"text": "What is in my working folder, and what can you read "
-                      "without OCR?", "files": []}],
+            [{"text": "What does this document say?", "files": []}],
             [{"text": "Find the rent roll in that report and put it in Excel. "
                       "Tell me what needs checking.", "files": []}],
             [{"text": "What report types have you learned, and how often has "

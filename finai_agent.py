@@ -39,28 +39,26 @@ VISION_MODEL = os.environ.get("FINAI_VISION_MODEL", "gemma4-32k:latest")
 _here = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(_here, "outputs")
 
-SYSTEM = """You are a financial document analyst working entirely on a local \
-machine. You have tools that read PDFs and spreadsheets and write Excel \
-workbooks. Decide for yourself which tools to use and in what order.
+SYSTEM = """You are a capable assistant working entirely on a local machine, with tools that read and analyse documents. Financial work is what you are used for most, but you are not limited to it: answer whatever is asked.
+
+Your tools:
+
+- read_document reads ANY document and gives you its text -- PDF, Word, PowerPoint, Excel, text, CSV. Use it whenever someone asks what a document says, or asks anything you would need to read it to answer. It handles scanned PDFs by itself, so you never need permission to read something.
+- list_folder shows what is on disk.
+- inspect_document tells you whether a PDF is a report type you already know how to extract, and on which pages.
+- extract_document pulls a report's tables into Excel and checks the figures against the totals the document prints about itself. This is for reports with tables that need to reconcile -- it is not how you read a document.
+- list_skills says what report types you have learned.
 
 How to work:
 
-- Look before you act. If the user names a folder or file, inspect it first \
-rather than assuming what it contains.
-- A large PDF is usually a pack containing one report you care about. \
-inspect_document tells you whether a known report type appears in it and on \
-which pages; use those pages.
-- If a skill already matches, use it. If nothing matches, extract anyway and \
-report what reconciled and what did not.
-- Accuracy outranks completeness. Never state a figure as correct unless the \
-tool result says its checks passed. If checks failed or cells were flagged, \
-say so plainly and say which.
-- Never invent a number. Every figure you report must come from a tool result.
-- You cannot OCR unless the tool tells you it is permitted. If a document has \
-no text layer and OCR is not allowed, say so and stop; do not guess contents.
+- Read first. If someone gives you a file and asks about it, call read_document and answer from what it says.
+- Do not tell someone their document is unusable because it has no table. A CV, a letter and a term sheet are all readable; tables are a special case, not the point.
+- Use extract_document when the task is getting tabular data OUT of a report into a spreadsheet, or when the figures have to reconcile.
+- Never invent a number or a fact about a document. Everything you state must come from a tool result. If you have not read it, say so and read it.
+- When a tool warns that text came from reading images rather than a text layer, pass that warning on: transcription can misread a digit.
+- If an extraction reports failed checks or flagged cells, lead with that and name them. Accuracy outranks tidiness.
 
-Answer briefly and concretely. State what you did, what reconciled, and what \
-needs a human. If something is doubtful, lead with it."""
+Be brief and concrete."""
 
 
 # ----------------------------------------------------------------- the tools
@@ -152,6 +150,24 @@ def extract_document(path: str, pages: str = "", **_):
     return res
 
 
+def read_document(path: str, pages: str = "", **_):
+    """Read any document and return its text."""
+    import readers
+
+    path = (path or "").strip().strip('"').strip("'")
+    want = None
+    if pages.strip():
+        want = set()
+        for part in pages.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                want.update(range(int(lo), int(hi) + 1))
+            elif part:
+                want.add(int(part))
+    return readers.read_document(path, pages=want)
+
+
 def list_skills(**_):
     """Report types this agent has already learned."""
     from engine import skills as S
@@ -188,27 +204,30 @@ def read_spreadsheet(path: str, sheet: str = "", max_rows: int = 25, **_):
     return {"sheets": names, "showing": target, "rows": rows}
 
 
-def ocr_document(path: str, pages: str = "", _allow_ocr=False, **_):
-    """OCR a scanned document. Refused unless the user allowed it this turn."""
-    if not _allow_ocr:
-        return {"error": "OCR is not permitted for this request. The user has "
-                         "not enabled it. Tell them the document needs OCR and "
-                         "that they can tick the OCR box, and stop."}
-    return {"error": "OCR is enabled but not yet wired into this page. It still "
-                     "runs from the OCR page on port 7860. Tell the user to run "
-                     "it there, and do not guess the contents."}
-
-
 TOOLS = {
+    "read_document": read_document,
     "list_folder": list_folder,
     "inspect_document": inspect_document,
     "extract_document": extract_document,
     "list_skills": list_skills,
     "read_spreadsheet": read_spreadsheet,
-    "ocr_document": ocr_document,
 }
 
 SCHEMA = [
+    {"type": "function", "function": {
+        "name": "read_document",
+        "description": "Read any document and return its text: PDF, Word, "
+                       "PowerPoint, Excel, text or CSV. Use this whenever "
+                       "someone asks what a document says, or asks anything "
+                       "you would have to read it to answer. Scanned PDFs are "
+                       "handled automatically by reading the pages as images, "
+                       "so no permission is needed.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "pages": {"type": "string",
+                      "description": "optional, e.g. '1-3'. Omit for the "
+                                     "whole document."}},
+            "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "list_folder",
         "description": "List the documents in a folder (PDF, Excel, CSV, Word). "
@@ -248,13 +267,6 @@ SCHEMA = [
             "path": {"type": "string"},
             "sheet": {"type": "string"},
             "max_rows": {"type": "integer"}}, "required": ["path"]}}},
-    {"type": "function", "function": {
-        "name": "ocr_document",
-        "description": "OCR a scanned PDF that has no text layer. Only works "
-                       "if the user has enabled OCR for this request.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"}, "pages": {"type": "string"}},
-            "required": ["path"]}}},
 ]
 
 
@@ -276,7 +288,7 @@ def _chat(model, messages, tools=None, timeout=600):
     return r.json()
 
 
-def run_agent(prompt, history=None, model=DEFAULT_MODEL, allow_ocr=False,
+def run_agent(prompt, history=None, model=DEFAULT_MODEL,
               images=None, max_steps=8, on_event=None):
     """Answer a request, calling tools as the model decides. Yields nothing;
     reports progress through `on_event(kind, text)` so a UI can show its work.
@@ -328,10 +340,7 @@ def run_agent(prompt, history=None, model=DEFAULT_MODEL, allow_ocr=False,
                 result = {"error": f"no such tool: {name}"}
             else:
                 try:
-                    if name == "ocr_document":
-                        result = impl(_allow_ocr=allow_ocr, **args)
-                    else:
-                        result = impl(**args)
+                    result = impl(**args)
                 except TypeError as e:
                     result = {"error": f"bad arguments: {e}"}
                 except Exception as e:
