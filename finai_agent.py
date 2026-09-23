@@ -46,14 +46,16 @@ Your tools:
 - read_document reads ANY document and gives you its text -- PDF, Word, PowerPoint, Excel, text, CSV. Use it whenever someone asks what a document says, or asks anything you would need to read it to answer. It handles scanned PDFs by itself, so you never need permission to read something.
 - list_folder shows what is on disk.
 - inspect_document tells you whether a PDF is a report type you already know how to extract, and on which pages.
-- extract_document pulls a report's tables into Excel and checks the figures against the totals the document prints about itself. This is for reports with tables that need to reconcile -- it is not how you read a document.
+- extract_as_asked pulls data out of ANY document into Excel, in whatever shape the user described. Use this whenever someone asks for data in a particular form and no known report type fits -- it works on layouts nobody has seen before. Pass their requirement in their own words.
+- extract_document is the faster path for a report type already learned, where the figures must reconcile against the totals the document prints about itself. Prefer it when inspect_document reports a known report; otherwise use extract_as_asked.
 - list_skills says what report types you have learned.
 
 How to work:
 
 - Read first. If someone gives you a file and asks about it, call read_document and answer from what it says.
 - Do not tell someone their document is unusable because it has no table. A CV, a letter and a term sheet are all readable; tables are a special case, not the point.
-- Use extract_document when the task is getting tabular data OUT of a report into a spreadsheet, or when the figures have to reconcile.
+- To get data out into a spreadsheet: if inspect_document found a known report type, use extract_document; otherwise use extract_as_asked and pass the user's requirement verbatim. Never tell someone you cannot extract from a document because its layout is unfamiliar.
+- extract_as_asked reports how many values were checked against the document and how many were NOT found in it. Always pass that on: values not found are the ones that might be invented, and the user must be told which.
 - Never invent a number or a fact about a document. Everything you state must come from a tool result. If you have not read it, say so and read it.
 - When a tool warns that text came from reading images rather than a text layer, pass that warning on: transcription can misread a digit.
 - If an extraction reports failed checks or flagged cells, lead with that and name them. Accuracy outranks tidiness.
@@ -168,6 +170,46 @@ def read_document(path: str, pages: str = "", **_):
     return readers.read_document(path, pages=want)
 
 
+def extract_as_asked(path: str, requirement: str, pages: str = "", **_):
+    """Extract whatever the user described, from any document, any layout."""
+    import ai_extract
+
+    path = (path or "").strip().strip('"').strip("'")
+    if not os.path.isfile(path):
+        return {"error": f"no such file: {path}"}
+    want = None
+    if pages.strip():
+        want = set()
+        for part in pages.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                want.update(range(int(lo), int(hi) + 1))
+            elif part:
+                want.add(int(part))
+
+    res = ai_extract.extract(path, requirement, pages=want)
+    if res.get("error"):
+        return res
+    book = ai_extract.to_workbook(res)
+    flags = res["flags"]
+    return {
+        "file": res["file"],
+        "columns": res["columns"],
+        "rows_extracted": res["n_rows"],
+        "values_checked_against_document": res["values_checked"],
+        "values_NOT_found_in_document": len(flags),
+        "flagged": [{"row": f["row"] + 1, "column": f["column_name"],
+                     "value": f["value"]} for f in flags[:10]],
+        "uncertain": res["uncertain"][:5],
+        "truncated": res["truncated"],
+        "how_read": res["how_read"],
+        "workbook": book,
+        "sample_rows": [r["values"] for r in res["rows"][:5]],
+        "seconds": res["seconds"],
+    }
+
+
 def list_skills(**_):
     """Report types this agent has already learned."""
     from engine import skills as S
@@ -206,6 +248,7 @@ def read_spreadsheet(path: str, sheet: str = "", max_rows: int = 25, **_):
 
 TOOLS = {
     "read_document": read_document,
+    "extract_as_asked": extract_as_asked,
     "list_folder": list_folder,
     "inspect_document": inspect_document,
     "extract_document": extract_document,
@@ -228,6 +271,22 @@ SCHEMA = [
                       "description": "optional, e.g. '1-3'. Omit for the "
                                      "whole document."}},
             "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "extract_as_asked",
+        "description": "Extract data from ANY document into Excel, in whatever "
+                       "shape the user described, whatever its layout. Pass "
+                       "their requirement in their own words -- which columns "
+                       "they want, one row per what. Use this whenever someone "
+                       "asks for data pulled out in a particular form and no "
+                       "known report type fits. Every value is checked back "
+                       "against the document and anything not found there is "
+                       "flagged for a human.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "requirement": {"type": "string",
+                            "description": "What the user asked for, in full."},
+            "pages": {"type": "string", "description": "optional, e.g. '38-41'"}},
+            "required": ["path", "requirement"]}}},
     {"type": "function", "function": {
         "name": "list_folder",
         "description": "List the documents in a folder (PDF, Excel, CSV, Word). "
