@@ -48,6 +48,7 @@ Your tools:
 - inspect_document tells you whether a PDF is a report type you already know how to extract, and on which pages.
 - extract_as_asked pulls data out of ANY document into Excel, in whatever shape the user described. Use this whenever someone asks for data in a particular form and no known report type fits -- it works on layouts nobody has seen before. Pass their requirement in their own words.
 - extract_document is the faster path for a report type already learned, where the figures must reconcile against the totals the document prints about itself. Prefer it when inspect_document reports a known report; otherwise use extract_as_asked.
+- extract_units fills a template with one row per unit, when a folder holds a sub-folder per unit and each holds that unit's own documents. Each unit is read in isolation, so one unit's figures cannot land on another's row.
 - list_skills says what report types you have learned.
 
 How to work:
@@ -210,6 +211,40 @@ def extract_as_asked(path: str, requirement: str, pages: str = "", **_):
     }
 
 
+def extract_units(root: str, template: str = "", out_name: str = "", **_):
+    """One row per unit sub-folder, each read only from its own documents."""
+    import unit_extract as U
+
+    root = (root or "").strip().strip('"').strip("'")
+    template = (template or "").strip().strip('"').strip("'")
+    if not os.path.isdir(root):
+        return {"error": f"not a folder: {root}"}
+    if not template or not os.path.isfile(template):
+        return {"error": "I need the path to the template workbook to fill."}
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out = os.path.join(OUTPUT_DIR,
+                       out_name or (os.path.basename(root.rstrip("/\\")) +
+                                    " - units.xlsx"))
+    try:
+        summary, rows = U.run(root, template, out)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    if summary.get("error"):
+        return summary
+
+    # Unit labels and flag reasons only. The values themselves stay in the
+    # workbook: this is confidential tenancy data, and there is no reason for
+    # it to travel through a chat transcript to be reported on.
+    summary["units_detail"] = [
+        {"unit": r["unit"], "files_read": r["files_read"],
+         "files_skipped": r["files_skipped"],
+         "fields_filled": sum(1 for k, _c, _l in U.FIELDS if r["values"].get(k)),
+         "flags": r["flags"][:6]}
+        for r in rows]
+    return summary
+
+
 def list_skills(**_):
     """Report types this agent has already learned."""
     from engine import skills as S
@@ -254,6 +289,7 @@ TOOLS = {
     "extract_document": extract_document,
     "list_skills": list_skills,
     "read_spreadsheet": read_spreadsheet,
+    "extract_units": extract_units,
 }
 
 SCHEMA = [
@@ -314,6 +350,22 @@ SCHEMA = [
             "pages": {"type": "string",
                       "description": "e.g. '38-41'. Empty means find it."}},
             "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "extract_units",
+        "description": "Fill a template workbook with one row per unit, where "
+                       "a folder holds a sub-folder per unit (an apartment, a "
+                       "loan, a property) and each sub-folder holds that "
+                       "unit's own documents. Each unit is read in isolation "
+                       "so one unit's figures cannot land on another's row. "
+                       "Use this when the user points at a folder of "
+                       "sub-folders and wants a row for each.",
+        "parameters": {"type": "object", "properties": {
+            "root": {"type": "string",
+                     "description": "Folder containing one sub-folder per unit"},
+            "template": {"type": "string",
+                         "description": "Path to the template workbook to fill"},
+            "out_name": {"type": "string"}},
+            "required": ["root", "template"]}}},
     {"type": "function", "function": {
         "name": "list_skills",
         "description": "List the report types this agent has already learned, "
