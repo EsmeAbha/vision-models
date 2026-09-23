@@ -80,14 +80,35 @@ def respond(message, history, folder, model):
     text = (message or {}).get("text", "") if isinstance(message, dict) else str(message)
     files = (message or {}).get("files", []) if isinstance(message, dict) else []
 
-    images, docs = [], []
+    images, docs, folders, notes = [], [], [], []
     for f in files or []:
         p = _stash(f)
-        if os.path.splitext(p)[1].lower() in IMAGE_EXT:
+        ext = os.path.splitext(p)[1].lower()
+        if ext in IMAGE_EXT:
             with open(p, "rb") as fh:
                 images.append(base64.b64encode(fh.read()).decode())
+        elif ext == ".zip":
+            # Unpacked here rather than left for the model to puzzle over: a
+            # zip of per-unit folders is the usual way this work arrives, and
+            # the agent needs a folder path, not an archive.
+            try:
+                import zips
+                root, note = zips.extract(p)
+                folders.append(root)
+                notes.append(f"{os.path.basename(p)}: {note}")
+            except Exception as e:
+                notes.append(f"{os.path.basename(p)} could not be unpacked: "
+                             f"{type(e).__name__}: {e}")
         else:
             docs.append(p)
+            if ext in (".xlsx", ".xlsm"):
+                # A workbook with Tenant/Suite headings is a template to fill,
+                # and is kept so it need not be attached again next time.
+                try:
+                    import unit_extract as _U
+                    _U.remember_template(p)
+                except Exception:
+                    pass
 
     prompt = text.strip()
     if folder and folder.strip():
@@ -95,6 +116,12 @@ def respond(message, history, folder, model):
     if docs:
         prompt += "\n\n[Files the user attached, already on disk:]\n" + \
                   "\n".join(f"- {d}" for d in docs)
+    if folders:
+        prompt += ("\n\n[Folders unpacked from what the user attached. Each "
+                   "immediate sub-folder is one unit:]\n"
+                   + "\n".join(f"- {d}" for d in folders))
+    if notes:
+        prompt += "\n\n[" + "; ".join(notes) + "]"
     earlier = [p for p in _paths_in_history(history) if p not in docs]
     if earlier:
         prompt += "\n\n[Files from earlier in this conversation:]\n" + \
@@ -171,7 +198,8 @@ with gr.Blocks(title="FinAI", fill_height=True) as demo:
             placeholder="e.g. what is in this folder?  /  pull the rent roll "
                         "out of that report into Excel  /  what have you "
                         "learned so far?",
-            file_count="multiple"),
+            file_count="multiple",
+            file_types=None),
         examples=[
             [{"text": "What does this document say?", "files": []}],
             [{"text": "Find the rent roll in that report and put it in Excel. "

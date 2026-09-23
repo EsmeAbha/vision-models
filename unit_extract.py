@@ -82,6 +82,60 @@ TEXT:
 
 # ------------------------------------------------------------------ the units
 
+TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "uploads", "finai", "templates")
+
+
+def resolve_root(root):
+    """(folder, note). A zip is unpacked; a folder is used as it stands."""
+    import zips
+
+    root = str(root or "").strip().strip('"').strip("'")
+    if root.lower().endswith(".zip") and os.path.isfile(root):
+        return zips.extract(root)
+    return root, ""
+
+
+def remember_template(path):
+    """Keep an uploaded template so it need not be given again."""
+    os.makedirs(TEMPLATE_DIR, exist_ok=True)
+    dest = os.path.join(TEMPLATE_DIR, os.path.basename(path))
+    if os.path.abspath(path) != os.path.abspath(dest):
+        shutil.copyfile(path, dest)
+    return dest
+
+
+def find_template():
+    """The most recent template kept, or None.
+
+    So the second job does not have to be told where the template is. It is
+    matched on its own headings rather than its file name, because the name
+    is whatever the sender called it.
+    """
+    if not os.path.isdir(TEMPLATE_DIR):
+        return None
+    best, best_time = None, -1
+    for fn in os.listdir(TEMPLATE_DIR):
+        if not fn.lower().endswith((".xlsx", ".xlsm")):
+            continue
+        path = os.path.join(TEMPLATE_DIR, fn)
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True)
+            ws = wb[wb.sheetnames[0]]
+            heads = {str(c.value).strip().lower()
+                     for row in ws.iter_rows(min_row=1, max_row=6)
+                     for c in row if c.value}
+            wb.close()
+        except Exception:
+            continue
+        if {"tenant", "suite"} <= heads:
+            t = os.path.getmtime(path)
+            if t > best_time:
+                best, best_time = path, t
+    return best
+
+
 def find_units(root):
     """[(unit_name, [file paths])] -- one entry per immediate sub-folder."""
     root = (root or "").strip().strip('"').strip("'")
@@ -271,11 +325,19 @@ def write_template(template, out_path, rows, start_row=4):
 
 
 def run(root, template, out_path, on_event=None):
-    """Every unit under `root`, each read alone, into a copy of the template."""
+    """Every unit under `root`, each read alone, into a copy of the template.
+
+    `root` may be a folder or a zip; a zip is unpacked first, and a wrapper
+    folder inside it is stepped through, so that a unit is a unit rather than
+    the archive's own top level.
+    """
     def say(msg):
         if on_event:
             on_event(msg)
 
+    root, note = resolve_root(root)
+    if note:
+        say(note)
     units = find_units(root)
     if not units:
         return {"error": f"no unit sub-folders found under {root}"}, []

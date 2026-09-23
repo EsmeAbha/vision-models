@@ -217,15 +217,20 @@ def extract_units(root: str, template: str = "", out_name: str = "", **_):
 
     root = (root or "").strip().strip('"').strip("'")
     template = (template or "").strip().strip('"').strip("'")
-    if not os.path.isdir(root):
-        return {"error": f"not a folder: {root}"}
-    if not template or not os.path.isfile(template):
-        return {"error": "I need the path to the template workbook to fill."}
+    if not (os.path.isdir(root) or
+            (root.lower().endswith(".zip") and os.path.isfile(root))):
+        return {"error": f"not a folder or zip: {root}"}
+    if template and os.path.isfile(template):
+        template = U.remember_template(template)
+    else:
+        template = U.find_template()
+    if not template:
+        return {"error": "I have no template to fill. Attach the template "
+                         "workbook once and I will remember it."}
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out = os.path.join(OUTPUT_DIR,
-                       out_name or (os.path.basename(root.rstrip("/\\")) +
-                                    " - units.xlsx"))
+    stem = os.path.splitext(os.path.basename(root.rstrip("/\\")))[0]
+    out = os.path.join(OUTPUT_DIR, out_name or f"{stem} - units.xlsx")
     try:
         summary, rows = U.run(root, template, out)
     except Exception as e:
