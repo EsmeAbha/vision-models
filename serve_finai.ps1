@@ -17,7 +17,11 @@ param(
     [Parameter(Mandatory = $true)][string]$Password,
     [string]$User = "esme",
     [string]$BindHost = "0.0.0.0",
-    [int]$Port = 7870
+    [int]$Port = 7870,
+    # Lets the agent write and run Python. That is what makes it able to do
+    # work nobody built a tool for -- and it is arbitrary code running as you,
+    # on a port other machines can reach. Deliberate, never the default.
+    [switch]$AllowCode
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +36,7 @@ if ($Password.Length -lt 8) {
 $env:VM_HOST = $BindHost
 $env:VM_USER = $User
 $env:VM_PASS = $Password
+if ($AllowCode) { $env:FINAI_ALLOW_CODE = "1" } else { $env:FINAI_ALLOW_CODE = "" }
 
 # Free the port if something is already on it.
 Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
@@ -53,6 +58,11 @@ Write-Host "FinAI is serving on the network." -ForegroundColor Green
 Write-Host "  From this machine : http://127.0.0.1:$Port/finai"
 Write-Host "  From another PC   : http://${ip}:$Port/finai"
 Write-Host "  Sign in as        : $User"
+if ($AllowCode) {
+  Write-Host "  Code execution    : ON - the agent can run Python as you" -ForegroundColor Yellow
+} else {
+  Write-Host "  Code execution    : off (add -AllowCode to enable)"
+}
 Write-Host ""
 Write-Host "If another machine cannot reach it, the firewall rule is missing."
 Write-Host "Run this once in an ADMIN PowerShell:" -ForegroundColor Yellow

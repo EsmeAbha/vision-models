@@ -49,6 +49,7 @@ Your tools:
 - extract_as_asked pulls data out of ANY document into Excel, in whatever shape the user described. Use this whenever someone asks for data in a particular form and no known report type fits -- it works on layouts nobody has seen before. Pass their requirement in their own words.
 - extract_document is the faster path for a report type already learned, where the figures must reconcile against the totals the document prints about itself. Prefer it when inspect_document reports a known report; otherwise use extract_as_asked.
 - extract_units fills a template with one row per unit, when a folder holds a sub-folder per unit and each holds that unit's own documents. Each unit is read in isolation, so one unit's figures cannot land on another's row.
+- run_python writes and runs Python on this machine. This is your general ability: use it for ANYTHING the other tools do not cover -- splitting or merging PDFs, renaming files, charting, converting formats, arithmetic across many files. Never tell someone you cannot do something because no tool exists for it; write the code instead. If it fails, read the traceback, fix it and run it again.
 - list_skills says what report types you have learned.
 
 How to work:
@@ -57,6 +58,7 @@ How to work:
 - Do not tell someone their document is unusable because it has no table. A CV, a letter and a term sheet are all readable; tables are a special case, not the point.
 - To get data out into a spreadsheet: if inspect_document found a known report type, use extract_document; otherwise use extract_as_asked and pass the user's requirement verbatim. Never tell someone you cannot extract from a document because its layout is unfamiliar.
 - extract_as_asked reports how many values were checked against the document and how many were NOT found in it. Always pass that on: values not found are the ones that might be invented, and the user must be told which.
+- Do not refuse a task for want of a tool. The other tools are shortcuts for common work; run_python is how anything else gets done. Only say you cannot do something if run_python is switched off or the machine genuinely lacks what is needed.
 - Never invent a number or a fact about a document. Everything you state must come from a tool result. If you have not read it, say so and read it.
 - When a tool warns that text came from reading images rather than a text layer, pass that warning on: transcription can misread a digit.
 - If an extraction reports failed checks or flagged cells, lead with that and name them. Accuracy outranks tidiness.
@@ -250,6 +252,13 @@ def extract_units(root: str, template: str = "", out_name: str = "", **_):
     return summary
 
 
+def run_python(code: str, timeout: int = 180, **_):
+    """Write and run code, for anything the other tools do not cover."""
+    import run_code
+
+    return run_code.run_python(code, timeout=timeout)
+
+
 def list_skills(**_):
     """Report types this agent has already learned."""
     from engine import skills as S
@@ -287,6 +296,7 @@ def read_spreadsheet(path: str, sheet: str = "", max_rows: int = 25, **_):
 
 
 TOOLS = {
+    "run_python": run_python,
     "read_document": read_document,
     "extract_as_asked": extract_as_asked,
     "list_folder": list_folder,
@@ -298,6 +308,14 @@ TOOLS = {
 }
 
 SCHEMA = [
+    {"type": "function", "function": {
+        "name": "run_python",
+        "description": __import__("run_code").HELP,
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python to run. print() "
+                                                      "what you want to see."},
+            "timeout": {"type": "integer", "description": "seconds, default 180"}},
+            "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "read_document",
         "description": "Read any document and return its text: PDF, Word, "
@@ -405,7 +423,7 @@ def _chat(model, messages, tools=None, timeout=600):
 
 
 def run_agent(prompt, history=None, model=DEFAULT_MODEL,
-              images=None, max_steps=8, on_event=None):
+              images=None, max_steps=24, on_event=None):
     """Answer a request, calling tools as the model decides. Yields nothing;
     reports progress through `on_event(kind, text)` so a UI can show its work.
     """
