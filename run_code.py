@@ -120,7 +120,19 @@ def run_python(code: str, timeout: int = 180, **_):
 HELP = """Write and run Python on this machine. Use it for anything the other tools do not cover: splitting or merging PDFs, renaming files, charting, converting formats, arithmetic over many files, anything.
 
 - print() what you want to see. Nothing is returned automatically.
+- OPEN FILES FROM DISK inside your code. Never paste a document's contents
+into the code as a string literal: it gets truncated, and you end up
+processing a fraction of the data while believing you have all of it. Use
+openpyxl.load_workbook(path) or pandas.read_excel(path) and iterate every row.
+- Before writing output, print how many rows you are about to write and check
+it against how many the source has. A count that does not match is the error
+showing itself.
 - Installed: pypdf (read AND write PDFs -- splitting, merging), pdfplumber (text and layout), pypdfium2 (rendering to images), openpyxl, pandas, python-docx, python-pptx, PIL, requests, numpy. PyPDF2, fitz/pymupdf and reportlab are NOT installed; use pypdf instead of guessing.
 - The project folder is the working directory and is on sys.path, so the project's own modules can be imported (readers, ai_extract, engine.*).
 - If it fails you get the traceback. Read it, fix the code, run it again.
+- Writing Excel: store numbers as NUMBERS, not strings. float('12666.54'),
+not '12666.54'. A sheet of numeric-looking text looks correct and is useless:
+SUM returns zero, sorting goes alphabetical, and formulas referring to it are
+fragile. Same for dates -- use datetime, or leave them as text deliberately
+and say so.
 - Write output files under outputs/ and tell the user the path."""

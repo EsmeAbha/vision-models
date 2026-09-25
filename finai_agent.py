@@ -282,6 +282,65 @@ def run_python(code: str, timeout: int = 180, **_):
     return run_code.run_python(code, timeout=timeout)
 
 
+def write_excel(path: str, sheets: list, **_):
+    """Write a workbook with the types right, so the model cannot get them wrong.
+
+    Telling the model "store numbers as numbers" did not work: the rule was in
+    the tool description, it was read, and the sheet still came back as text --
+    43 cells of numeric-looking string, SUM returning zero, sorting
+    alphabetical. A guarantee that depends on the model remembering is not a
+    guarantee. This coerces on the way in.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    from ai_extract import _as_number
+
+    if not path:
+        return {"error": "give a path"}
+    if not os.path.isabs(path):
+        path = os.path.join(_here, path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    made = []
+    for spec in (sheets or []):
+        name = (spec.get("name") or "Sheet")[:31]
+        ws = wb.create_sheet(name)
+        headers = spec.get("headers") or []
+        if headers:
+            ws.append(list(headers))
+            for c in range(1, len(headers) + 1):
+                ws.cell(row=1, column=c).font = Font(bold=True)
+        n_num = 0
+        for row in (spec.get("rows") or []):
+            out = []
+            for v in row:
+                if isinstance(v, str) and v.startswith("="):
+                    out.append(v)           # a formula stays a formula
+                    continue
+                conv = _as_number(v)
+                if isinstance(conv, (int, float)) and isinstance(v, str):
+                    n_num += 1
+                out.append(conv)
+            ws.append(out)
+        widths = spec.get("widths") or ([18] * max(len(headers), 1))
+        for i, w in enumerate(widths[:len(headers) or 1], start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        if headers:
+            ws.freeze_panes = "A2"
+        made.append({"sheet": name, "rows": ws.max_row - (1 if headers else 0),
+                     "text_converted_to_numbers": n_num})
+    if not made:
+        return {"error": "no sheets given"}
+    wb.save(path)
+    return {"workbook": path, "sheets": made,
+            "note": "Numeric-looking strings were stored as numbers, so SUM "
+                    "and sorting work. Cells starting with = were kept as "
+                    "formulas."}
+
+
 def list_skills(**_):
     """Report types this agent has already learned."""
     from engine import skills as S
@@ -297,8 +356,9 @@ def list_skills(**_):
     return {"count": len(out), "skills": out}
 
 
-def read_spreadsheet(path: str, sheet: str = "", max_rows: int = 25, **_):
-    """Look at an Excel file -- sheet names, headings and the first rows."""
+def read_spreadsheet(path: str, sheet: str = "", max_rows: int = 25,
+                     start_row: int = 1, **_):
+    """Look at an Excel file. Says plainly when it is showing only part."""
     path = (path or "").strip().strip('"').strip("'")
     if not os.path.isfile(path):
         return {"error": f"no such file: {path}"}
@@ -310,16 +370,36 @@ def read_spreadsheet(path: str, sheet: str = "", max_rows: int = 25, **_):
     names = wb.sheetnames
     target = sheet if sheet in names else names[0]
     ws = wb[target]
+    total = ws.max_row or 0
+
+    limit = max(1, min(int(max_rows), 200))
+    start = max(1, int(start_row))
     rows = []
-    for i, r in enumerate(ws.iter_rows(values_only=True)):
-        if i >= max(1, min(int(max_rows), 60)):
+    for i, r in enumerate(ws.iter_rows(values_only=True), start=1):
+        if i < start:
+            continue
+        if len(rows) >= limit:
             break
-        rows.append([("" if v is None else str(v)[:40]) for v in r[:16]])
-    return {"sheets": names, "showing": target, "rows": rows}
+        rows.append([("" if v is None else str(v)[:60]) for v in r[:24]])
+
+    shown_to = start + len(rows) - 1
+    out = {"sheets": names, "showing": target, "total_rows_in_sheet": total,
+           "rows_shown": f"{start}-{shown_to}", "rows": rows}
+    if shown_to < total:
+        # A preview that does not admit it is a preview gets treated as the
+        # whole sheet. That happened: a 114-row rent roll was summarised from
+        # its first 25 rows and the answer came back four leases long.
+        out["INCOMPLETE"] = (
+            f"You have seen rows {start}-{shown_to} of {total}. This is NOT "
+            f"the whole sheet. To see the rest, call this again with "
+            f"start_row={shown_to + 1}, or use read_document which returns "
+            f"every row at once. Do not answer as though you have seen it all.")
+    return out
 
 
 TOOLS = {
     "run_python": run_python,
+    "write_excel": write_excel,
     "read_document": read_document,
     "extract_as_asked": extract_as_asked,
     "list_folder": list_folder,
@@ -339,6 +419,14 @@ SCHEMA = [
                                                       "what you want to see."},
             "timeout": {"type": "integer", "description": "seconds, default 180"}},
             "required": ["code"]}}},
+    {"type": "function", "function": {
+        "name": "write_excel",
+        "description": "Write an Excel workbook with the cell types correct. PREFER THIS over writing a spreadsheet yourself with run_python.\n\nPass `sheets` as a list of {name, headers, rows}, where rows is a list of lists. A value starting with = is kept as a formula; everything that looks like a number is stored AS a number, so SUM and sorting work and the sheet is usable rather than merely correct-looking.\n\nExample: sheets=[{'name':'Leases','headers':['Suite','Rent','Annual'],'rows':[['100','12666.54','=B2*12']]}]\n\nWriting a workbook by hand with openpyxl is where numbers end up as text. Use this instead unless you need formatting it cannot do.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "e.g. outputs/report.xlsx"},
+            "sheets": {"type": "array", "description": "list of {name, headers, rows}",
+                       "items": {"type": "object"}}},
+            "required": ["path", "sheets"]}}},
     {"type": "function", "function": {
         "name": "read_document",
         "description": "Read any document and return its text: PDF, Word, PowerPoint, Excel, text or CSV. Scanned PDFs are handled automatically by reading the pages as images, so no permission is needed and you should never say a document cannot be read.\n\nUse this to ANSWER something: what does this say, summarise it, find the clause about X, who signed it, is there a date, does it mention Y. If the user wants prose back, this is the tool.\n\nDo NOT use this when the user wants a grid back -- rows and columns in a spreadsheet. That is extract_as_asked. 'What does the lease say about rent?' is this tool; 'list every lease with its rent' is not.\n\nPass `pages` when the document is long and you know which part you need; leaving it empty reads from the start and may be truncated. The result says how the text was obtained: if it says the vision model, transcription can misread a digit and you must pass that warning on.",
@@ -399,11 +487,13 @@ SCHEMA = [
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "read_spreadsheet",
-        "description": "Look inside an existing Excel workbook: its sheet names, and the first rows of one sheet.\n\nUse this to inspect a spreadsheet that already exists -- a template you must fill, a reference file to compare against, or output you produced earlier and want to check.\n\nFor the full contents of a spreadsheet as text, read_document handles .xlsx too and returns every sheet. This tool is for a quick look at the shape: what sheets exist and what the headings are.",
+        "description": "Look inside an existing Excel workbook: its sheet names, how many rows each holds, and a window of rows.\n\nIt shows at most 200 rows at a time and TELLS YOU when there are more, with the row numbers you have seen. If the result contains INCOMPLETE, you have not seen the whole sheet: page on with start_row, or use read_document, which returns every row in one go. Never summarise a sheet from a partial view.\n\nUse this for a quick look at shape and headings. For the full contents, read_document handles .xlsx and returns all sheets.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "sheet": {"type": "string"},
-            "max_rows": {"type": "integer"}}, "required": ["path"]}}},
+            "max_rows": {"type": "integer", "description": "up to 200"},
+            "start_row": {"type": "integer", "description": "1-based; page through a long sheet"}},
+            "required": ["path"]}}},
 ]
 
 

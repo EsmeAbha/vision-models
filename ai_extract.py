@@ -233,6 +233,23 @@ def extract(path, requirement, pages=None, model=MODEL, max_chars=48000):
     }
 
 
+def _as_number(v):
+    """'12,666.54' -> 12666.54, but 'Suite 100' stays a string."""
+    if not isinstance(v, str):
+        return v
+    t = v.strip().replace(",", "").replace("$", "")
+    if not t:
+        return v
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()")
+    try:
+        n = float(t)
+    except ValueError:
+        return v
+    n = -n if neg else n
+    return int(n) if n.is_integer() and abs(n) < 1e15 else n
+
+
 def to_workbook(result, path=None):
     """Write the result, colouring every value that could not be verified."""
     from openpyxl import Workbook
@@ -264,7 +281,13 @@ def to_workbook(result, path=None):
                  if (i, j) in by_cell]
         if row.get("note"):
             notes.append(row["note"])
-        ws.append(list(row.get("values", [])) + ["; ".join(notes) or None])
+        # Numbers as numbers. The model returns every value as a string,
+        # because the JSON schema says so, and writing those straight into
+        # cells produces a sheet that LOOKS right and cannot be used: SUM over
+        # the column returns zero, sorting is alphabetical, and a date is
+        # text. Anything that parses as a number is stored as one.
+        ws.append([_as_number(v) for v in row.get("values", [])]
+                  + ["; ".join(notes) or None])
         for j in range(len(columns)):
             if (i, j) in by_cell:
                 ws.cell(row=ws.max_row, column=j + 1).fill = YELLOW
