@@ -113,6 +113,59 @@ def _render(path, page_no, scale=2.0):
         doc.close()
 
 
+def _unload(model, timeout=120):
+    """Evict a model so the next one has room to load."""
+    try:
+        requests.post(f"{OLLAMA}/api/generate",
+                      json={"model": model, "keep_alive": 0}, timeout=timeout)
+    except Exception:
+        pass
+
+
+def best_vision_model():
+    """An installed model that can see, preferring the smallest."""
+    try:
+        r = requests.get(f"{OLLAMA}/api/tags", timeout=30)
+        cands = [(m.get("size", 0), m["name"]) for m in r.json().get("models", [])
+                 if "vision" in (m.get("capabilities") or [])]
+        return sorted(cands)[0][1] if cands else None
+    except Exception:
+        return None
+
+
+def read_pages_with_vision(path, page_nos, timeout=600):
+    """Transcribe several pages in ONE visit to the vision model.
+
+    The expensive part is not the looking, it is the swapping: on a 16GB card
+    the text model and the vision model cannot both be resident, so each
+    change of mind costs an evict and a 13-18GB load, and asking for them one
+    page at a time would pay that twice per page.
+
+    So the working model is evicted once, every page is read while the vision
+    model is up, and it is evicted in turn. The text it produces goes back as
+    an ordinary tool result -- the conversation never moved, so nothing has to
+    be replayed to catch the main model up.
+    """
+    vm = best_vision_model()
+    if not vm:
+        return {}, None
+
+    _unload(VISION_MODEL if VISION_MODEL != vm else "")
+    out = {}
+    try:
+        for pg in page_nos:
+            try:
+                out[pg] = read_page_with_vision(path, pg, model=vm,
+                                                timeout=timeout)
+            except Exception as e:
+                out[pg] = f"[page {pg} could not be read: {type(e).__name__}]"
+    finally:
+        # Put the card back the way it was found, so the next ordinary turn
+        # is not the one that pays for this.
+        _unload(vm)
+    return out, vm
+
+
 def read_page_with_vision(path, page_no, model=VISION_MODEL, timeout=300):
     """Transcribe one page using the local vision model."""
     png = _render(path, page_no)
@@ -237,36 +290,29 @@ def read_document(path, pages=None, max_chars=18000, allow_vision=True):
                              "it as images is switched off.",
                     "pages_read": []}
 
-        if not model_can_see():
-            others = vision_models()
+        if not model_can_see() and not best_vision_model():
             return {"kind": "pdf (scanned)", "how": "none", "pages_read": [],
-                    "error": (
-                        f"This PDF has no usable text layer, so it can only be "
-                        f"read as images -- and the model in use "
-                        f"({VISION_MODEL}) cannot see. Tell the user plainly: "
-                        f"do not guess the contents."),
-                    "fix": (f"Restart with FINAI_MODEL set to one of: "
-                            f"{', '.join(others)}" if others else
-                            "No installed model has vision. Pull one, e.g. "
-                            "ollama pull gemma3:4b")}
+                    "error": "This PDF has no usable text layer and no "
+                             "installed model can see, so its contents cannot "
+                             "be read. Tell the user; do not guess.",
+                    "fix": "ollama pull gemma3:4b"}
 
-        # Scanned. Read it with the local vision model, a few pages at a time:
-        # a page of inference each, on the machine, with nothing to unload.
-        todo = sorted(want) if want else sorted(by_page)[:6]
+        # Scanned. Swap to a model that can see, read every page needed while
+        # it is up, and swap back. One visit, however many pages.
+        todo = (sorted(want) if want else sorted(by_page)[:6])[:8]
+        pages_text, used_model = read_pages_with_vision(path, todo)
         done, chunks = [], []
-        for p in todo[:8]:
-            try:
+        for p in todo:
+            if p in pages_text:
                 chunks.append(f"--- page {p} (read as an image) ---\n"
-                              + read_page_with_vision(path, p))
+                              + pages_text[p])
                 done.append(p)
-            except Exception as e:
-                chunks.append(f"--- page {p} could not be read: "
-                              f"{type(e).__name__}: {e}")
         text, cut = _clip("\n".join(chunks), max_chars)
-        note = ("This document has no usable text layer, so the pages were "
-                "rendered and read by the local vision model. Transcription "
-                "from an image is less exact than a text layer: check any "
-                "figure that matters against the page.")
+        note = (f"This document has no usable text layer, so the pages were "
+                f"rendered and read by the local vision model"
+                f"{' (' + used_model + ')' if used_model else ''}. "
+                f"Transcription from an image is less exact than a text "
+                f"layer: check any figure that matters against the page.")
         return {"kind": "pdf (scanned)", "how": "the local vision model",
                 "pages_read": done, "text": text, "truncated": cut,
                 "note": note}
