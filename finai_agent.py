@@ -343,14 +343,7 @@ SCHEMA = [
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "extract_as_asked",
-        "description": "Extract data from ANY document into Excel, in whatever "
-                       "shape the user described, whatever its layout. Pass "
-                       "their requirement in their own words -- which columns "
-                       "they want, one row per what. Use this whenever someone "
-                       "asks for data pulled out in a particular form and no "
-                       "known report type fits. Every value is checked back "
-                       "against the document and anything not found there is "
-                       "flagged for a human.",
+        "description": "Pull data OUT of any document and into an Excel workbook, in whatever shape the user described, whatever the document's layout. Works on layouts nobody has seen before.\n\nUse this when the user wants DATA IN A SPREADSHEET: 'give me a list of', 'put X in Excel', 'one row per tenant', 'extract the table', 'I need columns A, B and C'. The giveaway is that they describe a SHAPE -- rows, columns, one-per-something.\n\nDo NOT use this to answer a question about what a document says -- that is read_document. 'What does this lease say about renewal?' is a question; 'list every lease with its renewal date' is an extraction. If the user wants prose back, read it; if they want a grid back, extract it.\n\nPass `requirement` as the user's own words, in full, including which columns they named and what each row should represent. Do not summarise their requirement -- the wording is what decides the output columns.\n\nEvery value returned is searched for in the document's own text before you see it. The result says how many values were checked and how many were NOT found. Values not found may have been invented: always report that count and name them.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "requirement": {"type": "string",
