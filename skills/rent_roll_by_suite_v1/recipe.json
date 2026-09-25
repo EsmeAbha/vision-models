@@ -122,10 +122,10 @@
   "page_w": 760,
   "page_h": 550,
   "created": "2026-09-22 09:29",
-  "updated": "2026-09-22 09:30",
+  "updated": "2026-09-22 10:00",
   "runs": {
-    "applied": 1,
-    "reconciled": 1,
+    "applied": 7,
+    "reconciled": 7,
     "failed": 0
   },
   "history": [
@@ -133,6 +133,36 @@
       "when": "2026-09-22 09:30",
       "reconciled": true,
       "note": "pages 38-41 of the source report"
+    },
+    {
+      "when": "2026-09-22 09:32",
+      "reconciled": true,
+      "note": "pages 38-41"
+    },
+    {
+      "when": "2026-09-22 09:42",
+      "reconciled": true,
+      "note": "a document, 34 records"
+    },
+    {
+      "when": "2026-09-22 09:46",
+      "reconciled": true,
+      "note": "a document, 34 records"
+    },
+    {
+      "when": "2026-09-22 09:59",
+      "reconciled": true,
+      "note": "a document, 34 records"
+    },
+    {
+      "when": "2026-09-22 10:00",
+      "reconciled": true,
+      "note": "a document, 34 records"
+    },
+    {
+      "when": "2026-09-22 10:00",
+      "reconciled": true,
+      "note": "a document, 34 records"
     }
   ]
 }

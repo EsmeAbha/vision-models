@@ -189,7 +189,8 @@ def _run_one(path, pages, learn_new):
         passed = sum(1 for c in res["checks"] if c["ok"])
         total = len(res["checks"])
         reconciled = total > 0 and passed == total
-        S.record_run(cfg, reconciled=reconciled, note=f"{name}, {n} records")
+        S.record_run(cfg, reconciled=reconciled,
+                     note=f"{n} records, {passed}/{total} reconciled")
         status = ("every printed total reconciles" if reconciled else
                   f"{total - passed} printed total(s) DO NOT reconcile")
         detail = "\n".join(
