@@ -28,7 +28,38 @@ import os
 import requests
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-VISION_MODEL = os.environ.get("FINAI_VISION_MODEL", "gemma4-32k:latest")
+# One model for everything. Reading a scan needs vision, and not every model
+# has it -- but quietly loading a second one to cover the gap is worse than
+# the gap: on a 16GB card it evicts the first, costs a minute, and sometimes
+# fails the load outright with a 500. If the chosen model cannot see, that is
+# reported, not worked around behind the user's back.
+VISION_MODEL = os.environ.get("FINAI_MODEL", "gpt-oss-64k:latest")
+
+_CAN_SEE = {}
+
+
+def model_can_see(model=None):
+    """Does the configured model accept images? Asked once, then remembered."""
+    model = model or VISION_MODEL
+    if model in _CAN_SEE:
+        return _CAN_SEE[model]
+    try:
+        r = requests.post(f"{OLLAMA}/api/show", json={"model": model}, timeout=30)
+        caps = r.json().get("capabilities", []) if r.ok else []
+        _CAN_SEE[model] = "vision" in caps
+    except Exception:
+        _CAN_SEE[model] = False
+    return _CAN_SEE[model]
+
+
+def vision_models():
+    """Which installed models could read a scan, for telling the user."""
+    try:
+        r = requests.get(f"{OLLAMA}/api/tags", timeout=30)
+        return [m["name"] for m in r.json().get("models", [])
+                if "vision" in (m.get("capabilities") or [])]
+    except Exception:
+        return []
 
 TEXT_EXT = {".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml", ".ini"}
 
@@ -205,6 +236,19 @@ def read_document(path, pages=None, max_chars=18000, allow_vision=True):
                     "error": "This PDF has little or no text layer and reading "
                              "it as images is switched off.",
                     "pages_read": []}
+
+        if not model_can_see():
+            others = vision_models()
+            return {"kind": "pdf (scanned)", "how": "none", "pages_read": [],
+                    "error": (
+                        f"This PDF has no usable text layer, so it can only be "
+                        f"read as images -- and the model in use "
+                        f"({VISION_MODEL}) cannot see. Tell the user plainly: "
+                        f"do not guess the contents."),
+                    "fix": (f"Restart with FINAI_MODEL set to one of: "
+                            f"{', '.join(others)}" if others else
+                            "No installed model has vision. Pull one, e.g. "
+                            "ollama pull gemma3:4b")}
 
         # Scanned. Read it with the local vision model, a few pages at a time:
         # a page of inference each, on the machine, with nothing to unload.

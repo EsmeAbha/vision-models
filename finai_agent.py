@@ -33,8 +33,11 @@ import time
 import requests
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+# ONE model. Swapping between two on a 16GB card evicts and reloads
+# 13-18GB each time -- that is where the minute-long stalls and the 500s
+# came from, since Ollama cannot hold two of these at once.
 DEFAULT_MODEL = os.environ.get("FINAI_MODEL", "gpt-oss-64k:latest")
-VISION_MODEL = os.environ.get("FINAI_VISION_MODEL", "gemma4-32k:latest")
+VISION_MODEL = DEFAULT_MODEL
 
 _here = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(_here, "outputs")
@@ -91,16 +94,23 @@ def list_folder(path: str, **_):
                            "kind": os.path.splitext(path)[1].lower()}]}
     if not os.path.isdir(path):
         return {"error": f"not a folder or file: {path}"}
-    out = []
+    # Every file, not a chosen few. This listed only documents, so a folder
+    # holding a zip came back as "count: 0, files: []" -- and the model, told
+    # the folder was empty, correctly gave up. It was not being unintelligent;
+    # the tool had lied to it. A tool that hides things makes the model look
+    # like the thing that failed.
+    docs, other = [], []
     for dp, _d, fs in os.walk(path):
         for fn in sorted(fs):
             ext = os.path.splitext(fn)[1].lower()
-            if ext in (".pdf", ".xlsx", ".xls", ".csv", ".docx"):
-                out.append({"path": os.path.join(dp, fn), "name": fn,
-                            "kind": ext})
-        if len(out) > 200:
+            rec = {"path": os.path.join(dp, fn), "name": fn, "kind": ext}
+            (docs if ext in (".pdf", ".xlsx", ".xls", ".csv", ".docx",
+                             ".pptx", ".txt", ".md") else other).append(rec)
+        if len(docs) + len(other) > 400:
             break
-    return {"count": len(out), "files": out[:200]}
+    files = (docs + other)[:250]
+    return {"count": len(files), "documents": len(docs),
+            "other_files": len(other), "files": files}
 
 
 def inspect_document(path: str, **_):
@@ -397,6 +407,21 @@ SCHEMA = [
 
 # ------------------------------------------------------------- the agent loop
 
+def _last_failed(steps):
+    """Did the most recent tool call fail?
+
+    A result counts as a failure when it carries an error, or when a code run
+    came back with ok=False. That is the moment a model is most likely to
+    stop early, and the moment it is most worth another turn.
+    """
+    if not steps:
+        return False
+    r = steps[-1].get("result")
+    if not isinstance(r, dict):
+        return False
+    return bool(r.get("error")) or r.get("ok") is False
+
+
 def _chat(model, messages, tools=None, timeout=600):
     body = {
         "model": model,
@@ -428,21 +453,55 @@ def run_agent(prompt, history=None, model=DEFAULT_MODEL,
     user_msg = {"role": "user", "content": prompt}
     if images:
         user_msg["images"] = images
-        model = VISION_MODEL          # only this one can see
     messages.append(user_msg)
 
     steps = []
+    nudged = False
     for step in range(max_steps):
         t0 = time.time()
-        try:
-            data = _chat(model, messages, SCHEMA)
-        except Exception as e:
-            return (f"The local model did not answer: {type(e).__name__}: {e}\n\n"
-                    f"Check Ollama is running at {OLLAMA}."), steps
+        data = None
+        for attempt in range(3):
+            try:
+                data = _chat(model, messages, SCHEMA)
+                break
+            except Exception as e:
+                # A 500 here is usually not a broken request: it is Ollama
+                # failing to load this model because another is resident and
+                # the card is full. That clears once the other is evicted, so
+                # it is worth waiting for. Giving up on a transient error is
+                # the same failure as giving up on a traceback.
+                last = f"{type(e).__name__}: {e}"
+                if attempt == 2:
+                    return (f"The local model did not answer after 3 tries: "
+                            f"{last}. If that is a 500, the GPU may be full: "
+                            f"another model is loaded and there is no room "
+                            f"for this one."), steps
+                say("tool", f"(model error, retrying in {4 * (attempt + 1)}s)")
+                time.sleep(4 * (attempt + 1))
 
         msg = data.get("message", {}) or {}
         calls = msg.get("tool_calls") or []
         if msg.get("content") and not calls:
+            # The model has stopped. Stopping is not the same as finishing:
+            # a model that has just been handed a traceback will often report
+            # what went wrong and fall silent, because nothing asked it to
+            # continue. A person told "this task" tries again; the model
+            # cannot, unless the loop gives it another turn.
+            #
+            # So when the last thing that happened was a failure, push back
+            # once and let it keep going. Once only -- twice is nagging, and
+            # a model that has genuinely hit a wall should be allowed to say
+            # so rather than be made to invent a way around it.
+            if steps and not nudged and _last_failed(steps):
+                nudged = True
+                say("tool", "(not done yet - asking it to continue)")
+                messages.append({k: v for k, v in msg.items() if k != "images"})
+                messages.append({"role": "user", "content": (
+                    "That did not succeed. The error above is information, "
+                    "not a dead end: work out what it tells you and try a "
+                    "different approach. If you genuinely cannot do it, say "
+                    "exactly what is missing.")})
+                continue
             say("answer", msg["content"])
             return msg["content"], steps
 
