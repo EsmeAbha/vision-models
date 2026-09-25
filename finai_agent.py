@@ -329,12 +329,7 @@ SCHEMA = [
             "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "read_document",
-        "description": "Read any document and return its text: PDF, Word, "
-                       "PowerPoint, Excel, text or CSV. Use this whenever "
-                       "someone asks what a document says, or asks anything "
-                       "you would have to read it to answer. Scanned PDFs are "
-                       "handled automatically by reading the pages as images, "
-                       "so no permission is needed.",
+        "description": "Read any document and return its text: PDF, Word, PowerPoint, Excel, text or CSV. Scanned PDFs are handled automatically by reading the pages as images, so no permission is needed and you should never say a document cannot be read.\n\nUse this to ANSWER something: what does this say, summarise it, find the clause about X, who signed it, is there a date, does it mention Y. If the user wants prose back, this is the tool.\n\nDo NOT use this when the user wants a grid back -- rows and columns in a spreadsheet. That is extract_as_asked. 'What does the lease say about rent?' is this tool; 'list every lease with its rent' is not.\n\nPass `pages` when the document is long and you know which part you need; leaving it empty reads from the start and may be truncated. The result says how the text was obtained: if it says the vision model, transcription can misread a digit and you must pass that warning on.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "pages": {"type": "string",
@@ -352,26 +347,18 @@ SCHEMA = [
             "required": ["path", "requirement"]}}},
     {"type": "function", "function": {
         "name": "list_folder",
-        "description": "List the documents in a folder (PDF, Excel, CSV, Word). "
-                       "Use this first when the user names a folder.",
+        "description": "List the documents in a folder: PDFs, Excel, CSV and Word files, with their full paths.\n\nUse this when the user points at a FOLDER, or refers to 'these documents' without naming a file. It answers 'what is here', nothing more.\n\nDo NOT use it when the user has given you a file path -- go straight to that file with inspect_document or read_document. Only fall back to listing when a path you tried does not exist, to find the real name.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Folder or file path"}},
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "inspect_document",
-        "description": "Inspect a PDF: how many pages, whether it can be read "
-                       "without OCR, and whether a report type this agent "
-                       "already knows appears inside it and on which pages. "
-                       "Always inspect before extracting.",
+        "description": "Ask what a PDF IS, without reading its contents: how many pages, whether it has a usable text layer, and whether it contains a report type this agent has already learned to extract and on which pages.\n\nTriggers: 'do you already know this report', 'have you seen this format before', 'do you recognise it', 'how many pages is it', 'will this need OCR', 'can you handle this one'. Any question about the FILE rather than what it says.\n\nUse it BEFORE extracting, to choose the extraction tool. If it names a known report, extract_document reconciles against the document's own printed totals. If it names none, use extract_as_asked.\n\nDo NOT use it to find out what a document SAYS -- that is read_document. Do NOT list the folder first when you have been given a file path; come straight here.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}}, "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "extract_document",
-        "description": "Read a PDF into an Excel workbook and check the figures "
-                       "against the totals the document prints about itself. "
-                       "Returns how many checks passed and how many cells were "
-                       "flagged for a human. Pass the page range from "
-                       "inspect_document when it found one.",
+        "description": "Extract a report this agent has ALREADY LEARNED, using the stored recipe for its layout, and check every figure against the totals the report prints about itself.\n\nOnly worth using when inspect_document reported a known report type. It is faster and stronger than extract_as_asked because it proves the arithmetic rather than just checking that figures appear in the source -- but it only works on layouts already learned.\n\nIf inspect_document found no known report, use extract_as_asked instead. Do not force this tool onto an unfamiliar layout.\n\nThe result reports checks passed and cells flagged. A failed check means the figures read do not add up to the total the document states: say so plainly and name which column.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "pages": {"type": "string",
@@ -400,7 +387,7 @@ SCHEMA = [
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "read_spreadsheet",
-        "description": "Read an existing Excel file: sheet names and first rows.",
+        "description": "Look inside an existing Excel workbook: its sheet names, and the first rows of one sheet.\n\nUse this to inspect a spreadsheet that already exists -- a template you must fill, a reference file to compare against, or output you produced earlier and want to check.\n\nFor the full contents of a spreadsheet as text, read_document handles .xlsx too and returns every sheet. This tool is for a quick look at the shape: what sheets exist and what the headings are.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "sheet": {"type": "string"},

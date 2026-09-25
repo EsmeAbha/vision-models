@@ -117,15 +117,10 @@ def run_python(code: str, timeout: int = 180, **_):
             pass
 
 
-HELP = """\
-Write and run Python on this machine. Use it for anything the other tools do \
-not cover: splitting or merging PDFs, renaming files, charting, converting \
-formats, arithmetic over many files, anything.
+HELP = """Write and run Python on this machine. Use it for anything the other tools do not cover: splitting or merging PDFs, renaming files, charting, converting formats, arithmetic over many files, anything.
 
 - print() what you want to see. Nothing is returned automatically.
-- Already installed: pdfplumber, pypdfium2, openpyxl, pandas, python-docx, \
-python-pptx, PIL, requests, numpy.
-- The project folder is the working directory and is on sys.path, so the \
-project's own modules can be imported (readers, ai_extract, engine.*).
+- Installed: pypdf (read AND write PDFs -- splitting, merging), pdfplumber (text and layout), pypdfium2 (rendering to images), openpyxl, pandas, python-docx, python-pptx, PIL, requests, numpy. PyPDF2, fitz/pymupdf and reportlab are NOT installed; use pypdf instead of guessing.
+- The project folder is the working directory and is on sys.path, so the project's own modules can be imported (readers, ai_extract, engine.*).
 - If it fails you get the traceback. Read it, fix the code, run it again.
 - Write output files under outputs/ and tell the user the path."""
