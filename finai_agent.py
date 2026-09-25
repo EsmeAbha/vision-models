@@ -226,6 +226,8 @@ def extract_as_asked(path: str, requirement: str, pages: str = "", **_):
         "flagged": [{"row": f["row"] + 1, "column": f["column_name"],
                      "value": f["value"]} for f in flags[:10]],
         "uncertain": res["uncertain"][:5],
+        "verification_worth": res.get("verification_worth", ""),
+        "read_from_images": res.get("from_vision", False),
         "truncated": res["truncated"],
         "how_read": res["how_read"],
         "workbook": book,

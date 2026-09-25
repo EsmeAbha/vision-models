@@ -200,6 +200,14 @@ def extract(path, requirement, pages=None, model=MODEL, max_chars=48000):
             row["values"] = (vals + [""] * len(columns))[:len(columns)]
 
     flags, checked = verify(rows, columns, text)
+
+    # Where the text came from decides what the checking is worth. Grounding
+    # compares each value against the source text -- but when that text was
+    # itself transcribed from an image, the check only proves the model
+    # copied its own transcription faithfully. It cannot see a digit the
+    # vision model misread. On a dense table that is exactly what goes wrong,
+    # so the result says so rather than reporting a clean check.
+    from_vision = "vision" in (doc.get("how") or "")
     return {
         "file": os.path.basename(path),
         "how_read": doc.get("how"),
@@ -213,6 +221,14 @@ def extract(path, requirement, pages=None, model=MODEL, max_chars=48000):
         "ragged_rows": ragged,
         "uncertain": out.get("uncertain") or [],
         "source_note": doc.get("note", ""),
+        "from_vision": from_vision,
+        "verification_worth": (
+            "WEAK -- the text was transcribed from images, so checking a value "
+            "against it only proves the transcription was copied correctly, "
+            "not that it was read correctly. Every figure needs eyes on the "
+            "original page." if from_vision else
+            "Values were checked against the document's own text layer, which "
+            "is exact."),
         "seconds": round(time.time() - t0, 1),
     }
 
@@ -267,6 +283,12 @@ def to_workbook(result, path=None):
     info.append(["Rows", result.get("n_rows", 0)])
     info.append(["Values checked against the document", result.get("values_checked", 0)])
     info.append(["Values NOT found in the document", len(result.get("flags", []))])
+    info.append(["How much the checking is worth", result.get("verification_worth", "")])
+    if result.get("from_vision"):
+        info.append(["WARNING", "This document had no readable text layer. Every "
+                                "value here was transcribed from an image by a "
+                                "local model and CANNOT be treated as verified. "
+                                "Check them against the original page before use."])
     if result.get("truncated"):
         info.append(["WARNING", "The document was longer than could be read in "
                                 "one pass; later pages were not seen."])

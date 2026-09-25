@@ -64,6 +64,25 @@ def vision_models():
 TEXT_EXT = {".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml", ".ini"}
 
 
+def _looks_legible(path):
+    """Is this PDF's text layer usable? Ask the ONE function that decides.
+
+    This was re-implemented here over pdfplumber's extract_text(), and scored
+    the same file at 96% where the engine scored it 85% -- because the engine
+    reads tokens through from_pdf, which corrects page rotation, and raw
+    extract_text() does not. Two measurements of "is this legible" that
+    disagree is worse than one that is imperfect: the agent inspected a file,
+    was told it was unreadable, then read it anyway and got glyph soup back
+    labelled as the document's own text.
+    """
+    try:
+        from engine.geometry import has_text_layer
+        ok, _note = has_text_layer(path)
+        return bool(ok)
+    except Exception:
+        return True                      # cannot tell; let the length gate decide
+
+
 def _clip(text, limit):
     if len(text) <= limit:
         return text, False
@@ -90,27 +109,62 @@ def _read_pdf_text(path, pages=None):
     return out, total
 
 
-def _render(path, page_no, scale=2.0):
-    """One page as PNG bytes, honouring the page's own rotation.
+def _render(path, page_no, scale=3.0, min_px=1400, max_px=3200):
+    """One page as PNG bytes: upright, cropped to its content, big enough to read.
 
-    pypdfium2 ignores /Rotate, which once rendered a landscape schedule on its
-    side and produced 120 characters where there were 2,876.
+    Three things have to be right or the vision model returns an empty string
+    and the document looks unreadable when it is merely badly presented.
+
+    Rotation: pypdfium2 ignores /Rotate, which once rendered a landscape
+    schedule on its side and produced 120 characters where there were 2,876.
+
+    Crop: a rent roll here puts its table across the top fifth of the sheet
+    and leaves the rest white. Sent whole, the text was a few pixels tall and
+    the model transcribed nothing at all. The margins carry no information,
+    so they go.
+
+    Scale: after cropping, the image is enlarged until the content is at
+    least min_px across, which is what actually makes the digits legible.
     """
     import pypdfium2 as pdfium
+    from PIL import Image, ImageChops
 
     doc = pdfium.PdfDocument(path)
     try:
         page = doc[page_no - 1]
         try:
             rot = (360 - page.get_rotation()) % 360
-            img = page.render(scale=scale, rotation=rot).to_pil()
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
+            img = page.render(scale=scale, rotation=rot).to_pil().convert("RGB")
         finally:
             page.close()
     finally:
         doc.close()
+
+    # Trim the blank margin by comparing against a white page.
+    bg = Image.new("RGB", img.size, (255, 255, 255))
+    box = ImageChops.difference(img, bg).convert("L").point(
+        lambda v: 255 if v > 12 else 0).getbbox()
+    if box:
+        pad = 12
+        box = (max(box[0] - pad, 0), max(box[1] - pad, 0),
+               min(box[2] + pad, img.width), min(box[3] + pad, img.height))
+        if (box[2] - box[0]) > 40 and (box[3] - box[1]) > 40:
+            img = img.crop(box)
+
+    # Enlarge until the content is big enough to read, without going silly.
+    longest = max(img.size)
+    if longest < min_px:
+        f = min(min_px / longest, max_px / longest)
+        img = img.resize((int(img.width * f), int(img.height * f)),
+                         Image.LANCZOS)
+    elif longest > max_px:
+        f = max_px / longest
+        img = img.resize((int(img.width * f), int(img.height * f)),
+                         Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _unload(model, timeout=120):
@@ -180,11 +234,22 @@ def read_page_with_vision(path, page_no, model=VISION_MODEL, timeout=300):
             "images": [base64.b64encode(png).decode()],
         }],
         "stream": False,
+        # Thinking OFF. gemma4 is a reasoning model, and on a dense page it
+        # spent its whole budget in the thinking channel and returned an
+        # EMPTY content field -- 8,417 characters of deliberation and not one
+        # of transcription, which read downstream as "this document cannot be
+        # read". With thinking off the same page comes back as 3,287
+        # characters of text in 16 seconds instead of nothing in 35.
+        # Transcription is not a task that wants reasoning; it wants reading.
+        "think": False,
         "options": {"temperature": 0, "top_p": 1, "top_k": 1, "seed": 7},
     }
     r = requests.post(f"{OLLAMA}/api/chat", json=body, timeout=timeout)
     r.raise_for_status()
-    return (r.json().get("message", {}) or {}).get("content", "")
+    msg = r.json().get("message", {}) or {}
+    # Fall back to the thinking channel rather than returning nothing, in case
+    # a model ignores the flag: half an answer beats a false "unreadable".
+    return msg.get("content") or msg.get("thinking") or ""
 
 
 def _read_docx(path):
@@ -273,10 +338,15 @@ def read_document(path, pages=None, max_chars=18000, allow_vision=True):
         by_page, total = _read_pdf_text(path, want)
         n_pages = len(by_page)
 
-        # Enough text to work with: use it. It is exact, and rendering a page
-        # to pixels and reading it back introduces errors that the text layer
-        # does not have.
-        if total >= 120 * max(n_pages, 1) or (total > 400 and not allow_vision):
+        # Enough text is not the same as usable text. This asked only how MANY
+        # characters a page held, so a PDF whose fonts have dead character
+        # maps -- plenty of characters, none of them words -- took the text
+        # path and returned "F52098748C28..." as though it were the document.
+        # inspect_document called the same file unreadable at the same moment,
+        # which is how it was caught: two tools disagreeing about one file.
+        legible = _looks_legible(path)
+        if (total >= 120 * max(n_pages, 1) and legible) or \
+           (total > 400 and not allow_vision):
             body = "\n".join(f"--- page {p} ---\n{t}"
                              for p, t in sorted(by_page.items()) if t.strip())
             text, cut = _clip(body, max_chars)
