@@ -519,6 +519,13 @@ def _chat(model, messages, tools=None, timeout=600):
         "model": model,
         "messages": messages,
         "stream": False,
+        # Thinking stays ON, despite a single-turn test saying otherwise.
+        # With think=False every model picked the same tool and did it far
+        # faster -- gemma4 25s to 2s -- so it looked like a free win. Over a
+        # MULTI-STEP task it is not: gpt-oss went from completing the job to
+        # producing no file at all. One tool choice does not need
+        # deliberation; deciding what to do after four tool results does.
+        # A benchmark of one turn cannot see that.
         # Same answer for the same question: this is financial work, and a
         # figure that changes between runs cannot be checked.
         "options": {"temperature": 0, "top_p": 1, "top_k": 1, "seed": 7},
