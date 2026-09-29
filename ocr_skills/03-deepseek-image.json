@@ -1,0 +1,9 @@
+{
+  "name": "Prompted OCR — Image",
+  "model": "DeepSeek-OCR (document OCR)",
+  "takes": "A photo or scan — PNG, JPG or WEBP — dropped into “Upload image”",
+  "prompt_note": "Used — ask it a question and it answers instead",
+  "gives": "Text, and an annotated image when it grounds",
+  "speed": "~7–17s, ~60s on the first run",
+  "note": "Output varies between runs on the same page."
+}

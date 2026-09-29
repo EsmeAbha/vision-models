@@ -1,0 +1,9 @@
+{
+  "name": "Prompted OCR — PDF",
+  "model": "DeepSeek-OCR (document OCR)",
+  "takes": "One or more PDFs, dropped into “...or upload PDFs”",
+  "prompt_note": "Used — applied to every page",
+  "gives": "Text per page, and the annotated image of the last page",
+  "speed": "~3–15s a page, one page at a time",
+  "note": "No batching, so slow on long documents."
+}
