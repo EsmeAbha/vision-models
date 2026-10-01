@@ -1,0 +1,7 @@
+{
+  "name": "Rent roll",
+  "reader": "PaddleOCR-VL (document OCR)",
+  "why": "The whole table is the answer, so layout matters more than instructions. This reader keeps table structure and ignores prompts.",
+  "fields": [],
+  "instruction": ""
+}

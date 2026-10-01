@@ -1,0 +1,8 @@
+{
+  "name": "Appraisal",
+  "reader": "PaddleOCR-VL (document OCR)",
+  "why": "Named fields scattered through prose and summary tables. This reader keeps the tables and headers intact, which is where the values sit; step 06 then finds them by label.",
+  "fields": ["Cap rate", "As-is market value", "As-is date", "Property address",
+             "Appraiser", "Effective date", "Land value", "Net operating income"],
+  "instruction": ""
+}

@@ -1,0 +1,19 @@
+{
+  "id": "utility-bill-extraction",
+  "name": "Utility Bill Extraction",
+  "version": "1.0.0",
+  "description": "Extract account details, billing dates, meter usage and charges from utility bills. Reads digital PDFs, scanned PDFs and images automatically.",
+  "owner": "Document operations",
+  "status": "Local",
+  "risk": "Medium",
+  "input": "PDF, PNG, JPG, WEBP",
+  "output": "XLSX + field evidence + QC reports",
+  "validation": "Source matching and required-field checks on every run; review required",
+  "dependencies": ["Existing document readers", "Local vision service", "Existing structured extraction", "Workbook writer"],
+  "default_prompt": "Extract the utility bill fields, one row per bill. Preserve the printed values and highlight missing or uncertain fields.",
+  "columns": ["Provider", "Utility type", "Account number", "Invoice number", "Customer name", "Service address", "Meter number", "Billing period start", "Billing period end", "Invoice date", "Due date", "Previous reading", "Current reading", "Consumption", "Consumption unit", "Usage charges", "Fixed charges", "Taxes", "Current charges", "Previous balance", "Payments", "Total due", "Currency"],
+  "required_fields": ["Provider", "Account number", "Service address", "Billing period end", "Total due"],
+  "max_pages": 30,
+  "max_characters": 48000,
+  "adapter": "workspace_extraction"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Bank statement",
+  "reader": "PaddleOCR-VL (document OCR)",
+  "why": "A fixed header block plus a transaction table. Table structure is the whole point here, and this reader batches, so a long statement is minutes rather than an hour.",
+  "fields": ["Account number", "Statement date", "Billing date", "Starting balance",
+             "Ending balance", "Total debits", "Total credits"],
+  "instruction": ""
+}

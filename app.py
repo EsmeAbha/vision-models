@@ -22,6 +22,7 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 import torch
 import gradio as gr
 
+import field_search
 import pdf_pages
 import save_output
 
@@ -446,7 +447,7 @@ def run(model_label, image_path, pdf_file, prompt, pages_spec, dpi, batch=4,
 def save_result(text, pdf_file, image_path):
     """Write the current result to .md / .html / .xlsx and offer them for download."""
     if not text or not str(text).strip():
-        return gr.update(value=None), "Nothing to save yet - run something first."
+        return gr.update(value=None, visible=False), "Nothing to save yet - run something first."
     paths = _as_paths(pdf_file)
     if len(paths) > 1:
         src = f"{os.path.splitext(os.path.basename(paths[0]))[0]}_and_{len(paths) - 1}_more"
@@ -455,9 +456,9 @@ def save_result(text, pdf_file, image_path):
     try:
         files = save_output.save_all(str(text), base_name=src, out_dir=OUTPUT_DIR)
     except Exception as e:
-        return gr.update(value=None), f"Save failed: {type(e).__name__}: {e}"
+        return gr.update(value=None, visible=False), f"Save failed: {type(e).__name__}: {e}"
     names = "\n".join("  " + f for f in files)
-    return gr.update(value=files), f"Saved {len(files)} file(s):\n{names}"
+    return gr.update(value=files, visible=True), f"Saved {len(files)} file(s):\n{names}"
 
 
 def on_model_change(label):
@@ -590,7 +591,12 @@ THEME = gr.themes.Base(
 #
 # Georgia and Segoe UI are both stock on this machine, so nothing is fetched.
 CSS = """
-.gradio-container{max-width:1500px!important;font-synthesis:none;font-size:14px}
+/* No cap: the sidebar already takes the left, and a fixed 1500px left a
+   400px dead strip on the right of a 1900px window. A wide ceiling keeps
+   line lengths sane on an ultra-wide display without wasting an ordinary
+   one. */
+.gradio-container{max-width:2100px!important;font-synthesis:none;font-size:14px;
+  padding-right:26px!important}
 .gradio-container h1{font-family:Georgia,'Times New Roman',serif!important;
   font-size:36px;font-weight:400;letter-spacing:-1.3px;color:#1b2420;
   margin:9px 0 10px}
@@ -611,12 +617,6 @@ footer{display:none!important}
 /* The borders. Gradio draws panels flat by default, so the page read as one
    undivided sheet; the workspace gives every card an outline and it is what
    separates one step from the next. */
-.gradio-container .block,.gradio-container .form{background:#fff;
-  border:1px solid #e2e7df!important;border-radius:10px;padding:14px}
-.gradio-container .form>.block,.gradio-container .form .block{border:0!important;
-  padding:0}
-.gradio-container .form{padding:0;overflow:hidden}
-.gradio-container .block.padded{padding:14px}
 /* Drop targets are dashed, like the workspace's upload areas. */
 .gradio-container .upload-container,.gradio-container .wrap.svelte-.dropzone,
 .gradio-container [data-testid=block-label]+div .wrap{background:#f9fbf6}
@@ -675,6 +675,55 @@ footer{display:none!important}
 .vm-dot{display:inline-block;width:7px;height:7px;border-radius:50%;
   background:#a7d474;margin-right:7px}
 
+/* Furniture borrowed from the workspace: an eyebrow over the title, icons
+   in the nav, the glance rail, and the dashed drop targets. */
+.vm-eyebrow{font-size:10px;letter-spacing:1.8px;font-weight:650;color:#688371;
+  text-transform:uppercase;margin:2px 2px 0}
+
+/* Nav icons. mask-image takes the label's own colour, so the active pill's
+   dark ink and the idle light green both come out right with no extra rules. */
+.vm-nav label::before{content:"";width:16px;height:16px;flex-shrink:0;margin-right:11px;
+  background:currentColor;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;
+  -webkit-mask-position:center;mask-position:center;
+  -webkit-mask-size:contain;mask-size:contain}
+.vm-nav label:nth-of-type(1)::before{-webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='7' height='7' rx='1'/%3E%3Crect x='14' y='3' width='7' height='7' rx='1'/%3E%3Crect x='3' y='14' width='7' height='7' rx='1'/%3E%3Crect x='14' y='14' width='7' height='7' rx='1'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='7' height='7' rx='1'/%3E%3Crect x='14' y='3' width='7' height='7' rx='1'/%3E%3Crect x='3' y='14' width='7' height='7' rx='1'/%3E%3Crect x='14' y='14' width='7' height='7' rx='1'/%3E%3C/svg%3E")}
+.vm-nav label:nth-of-type(2)::before{-webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 3 10 5-10 5L2 8zm-10 9 10 5 10-5M2 16l10 5 10-5'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 3 10 5-10 5L2 8zm-10 9 10 5 10-5M2 16l10 5 10-5'/%3E%3C/svg%3E")}
+
+
+/* Device row under the sidebar status. */
+.vm-profile{display:flex;align-items:center;gap:10px;margin-top:14px;padding-top:13px;
+  border-top:1px solid #2b514a}
+.vm-avatar{width:31px;height:31px;border-radius:50%;background:#2c584d;color:#cfe3d5;
+  display:grid;place-items:center;font-size:9px;font-weight:700;flex-shrink:0}
+.vm-profile strong{display:block;font-size:12px;color:#dbe9df;font-weight:600}
+.vm-profile small{display:block;font-size:9.5px;color:#93aa9e;margin-top:2px}
+
+
+/* Headings and hints are decoration, so they carry a class of their own and
+   are drawn flat. The previous attempt selected them by what the block
+   contained, with a child combinator -- Gradio wraps HTML content in a div,
+   so the marker was a grandchild and the rule never matched, which is why a
+   heading was still being boxed like an input. */
+.vm-flat,.vm-flat.block,.gradio-container .vm-flat{border:0!important;
+  padding:0!important;background:transparent!important;box-shadow:none!important;
+  min-width:0!important;overflow:visible!important}
+/* Both drop targets the same height, so the two columns end level. */
+.vm-sect .image-container,.vm-sect .upload-container{min-height:148px}
+
+/* Sections, not cards.
+   A section is spacing and a heading. The border round each control is the one
+   Gradio already draws, so there is no second panel to fight and no grey band
+   between them. */
+/* A Row of controls should not draw a box round the row itself. */
+
+/* The numbered steps and the hints under the controls. */
+.vm-stepn{width:22px;height:22px;border-radius:5px;background:#f0f3e9;color:#748469;
+  font-size:10px;font-weight:700;display:grid;place-items:center;flex-shrink:0}
+.vm-step b{font-size:14px;font-weight:600;color:#1b2420;display:block}
+.vm-step small{display:block;font-size:11px;color:#6b756f;margin-top:2px}
+
 /* Skill cards on the Skills page. */
 .vm-skill{border:1px solid #e2e7df;border-radius:10px;background:#fff;padding:18px 20px}
 .vm-skill h3{font-family:Georgia,'Times New Roman',serif!important;font-size:19px!important;
@@ -687,11 +736,210 @@ footer{display:none!important}
 .vm-srow b{color:#1b2420;font-weight:600}
 
 /* The prompt bar, sitting at the foot of the page as one unit. */
-.vm-promptbar{margin-top:22px;padding:14px;background:#fafbf7;
-  border:1px solid #e2e7df;border-radius:10px;align-items:flex-end;gap:12px}
-.vm-promptbar .block{border:0!important;background:transparent;padding:0}
-.vm-promptbar button{min-height:46px}
+/* Fill the column rather than floating in the middle of it. */
+
+/* Save and its downloads sit on one line, so they should start on one line. */
+.vm-sect .vm-dl{align-self:start}
+/* Measured: a slider's reset button is 26x24 inside a container that clips at
+   24px. A blanket min-height meant for the Save button stretched it to 44 and
+   the browser cut the icon in half. Action buttons only. */
+.vm-sect button:not(.reset-button){min-height:44px}
+.vm-sect .reset-button{min-height:0!important;height:22px!important;
+  align-self:center}
+/* An empty result panel should not reserve the height of a full one. */
+.vm-sect .image-container{max-height:230px}
+
+/* ---------------------------------------------------------------- rhythm
+   One scale for the whole page, so a gap is never picked by eye again:
+   4px inside a control, 10px between controls, 20px between sections.
+   Every box gets the same padding and radius, whatever it holds. */
+.gradio-container .block{background:#fff!important;
+  border:1px solid #e2e7df!important;border-radius:10px!important;
+  padding:12px 14px!important;box-shadow:none!important;min-width:0!important}
+/* A Row is a layout, not a box: it must not draw one round its children. */
+.gradio-container .form{background:transparent!important;border:0!important;
+  padding:0!important;gap:10px!important}
+.vm-sect{margin:0 0 20px 0!important;gap:10px!important}
+.vm-sect>*{width:100%}
+.vm-step{display:flex;align-items:center;gap:10px;margin:0 2px 4px}
+.vm-hint{font-size:11px;color:#6b756f;line-height:1.6;margin:4px 2px 0}
 .vm-page{padding:4px 2px}
+
+/* --------------------------------------------------- measured corrections
+   Everything below was set from the rendered page, not from guesswork. */
+
+/* The empty downloads placeholder was 236px of nothing inside a 288px box.
+   Specificity has to beat .gradio-container .block, hence the doubled class. */
+.gradio-container .block.vm-dl{padding:8px 10px!important;max-height:96px!important;
+  overflow:auto!important}
+.gradio-container .block.vm-dl .empty{min-height:0!important;height:56px!important}
+.gradio-container .block.vm-dl .wrap{min-height:0!important}
+
+/* The two upload boxes were 150px and 176px, so the hints under them sat 26px
+   apart -- the file box stacks its label above the drop area, the image box
+   floats it. Match the image box to the taller one. */
+
+/* Columns inside a Row were 16px apart while everything else used 10px. */
+.vm-page .row{gap:10px!important}
+
+/* Measured on the rendered page. The title was being drawn as a bordered
+   control box (120px tall, 1px border); it is a heading, so it is flattened
+   by what it contains rather than by touching the call site. */
+.gradio-container .block:has(>.prose h1),.gradio-container .block:has(h1){
+  border:0!important;padding:0!important;background:transparent!important;
+  box-shadow:none!important}
+
+/* The image box measured 150px and the file box 176px -- one floats its label
+   over the drop area, the other stacks it above -- which left the hints under
+   them 26px out of line. Pin both. */
+.gradio-container .block.vm-drop{height:172px!important}
+.gradio-container .block.vm-drop .image-container,
+.gradio-container .block.vm-drop .center.boundedheight{
+  height:100%!important;min-height:0!important}
+
+/* The prompt bar sat 75px below the last section; everything else uses 20. */
+
+/* ------------------------------------------------------- the prompt card
+   Shaped like the workspace's task card: a heading, a roomy cream box, then
+   a rule with the note on one side and the action on the other. */
+/* A panel in its own right, the width of the two above it. */
+.gradio-container .block.vm-prompt{border:0!important;padding:0!important;
+  background:transparent!important}
+.vm-prompt textarea{background:#fdfefa!important;border:1px solid #dce3d5!important;
+  border-radius:7px!important;min-height:104px!important;padding:12px 13px!important;
+  font-size:13px!important;line-height:1.6}
+/* Footer: a rule across the card, note left, action right. */
+
+/* ------------------------------------------------------------ upload tabs
+   Styled as the workspace's segmented control: a quiet row of labels with the
+   active one underlined, not a pair of boxed buttons. */
+.vm-tabs{border:0!important;background:transparent!important;padding:0!important}
+.vm-tabs .tab-nav,.vm-tabs .tab-container{border:0!important;
+  border-bottom:1px solid #e2e7df!important;gap:20px!important;
+  background:transparent!important;padding:0 2px!important;margin-bottom:14px!important}
+.vm-tabs button[role=tab]{background:transparent!important;border:0!important;
+  border-bottom:2px solid transparent!important;border-radius:0!important;
+  padding:8px 1px!important;min-height:0!important;font-size:12.5px!important;
+  font-weight:600!important;color:#6b756f!important}
+.vm-tabs button[role=tab].selected{color:#1b2420!important;
+  border-bottom-color:#245c4d!important}
+.vm-tabs .tab-container.visually-hidden{display:none!important}
+/* Clicking a tab left a box drawn round the label. A focus ring is for
+   finding your place with the keyboard, not for confirming a mouse click, so
+   it is dropped for the pointer and kept for :focus-visible. */
+.vm-tabs button[role=tab]:focus:not(:focus-visible){outline:none!important;
+  box-shadow:none!important}
+.vm-tabs .tabitem{border:0!important;padding:0!important;background:transparent!important}
+
+/* ------------------------------------------------------- document type
+   The field chips show what will be asked for, so the analyst can see the
+   shape of the answer before running anything. */
+.gradio-container .block.vm-doctype{border:0!important;padding:0!important;
+  background:transparent!important;margin-bottom:10px}
+.vm-fields{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
+.vm-field{font-size:11px;padding:3px 9px;border-radius:20px;background:#eef4e6;
+  color:#2c4a36;font-weight:500}
+.vm-ok{font-size:11.5px;color:#2c6a4a;margin:8px 0 0;font-weight:500}
+.vm-warn{font-size:11.5px;color:#8a5a1e;margin:8px 0 0;font-weight:500;
+  background:#fdf6e8;border:1px solid #f0e3c6;border-radius:7px;padding:8px 10px}
+
+/* Field pickers sit inside the prompt card, so they carry no panel. */
+.gradio-container .block.vm-fieldpick,.gradio-container .block.vm-extra{
+  border:0!important;background:transparent!important;padding:0!important;
+  margin-bottom:10px}
+.vm-fieldpick .wrap{gap:6px!important;flex-wrap:wrap!important}
+.vm-fieldpick label{background:#f4f7ef!important;border:1px solid #e2e7df!important;
+  border-radius:20px!important;padding:4px 11px!important;font-size:11px!important;
+  font-weight:500!important;color:#3f4a45!important;margin:0!important}
+.vm-fieldpick label.selected{background:#eef4e6!important;
+  border-color:#cfe0bd!important;color:#2c4a36!important}
+
+/* The field results table. */
+.gradio-container .block.vm-fieldtable{padding:0!important;overflow:hidden}
+.vm-fieldtable table{font-size:12px}
+.vm-fieldtable th{background:#f4f7ef!important;font-weight:600!important;
+  color:#3f4a45!important;font-size:11px!important}
+.vm-fieldtable td{color:#1b2420}
+
+/* ---------------------------------------------------------- output panel
+   One surface for everything a run produces, so the page reads as "these are
+   the inputs, that is what came back" rather than as one long form. The
+   sections inside it keep their headings and lose their own edges -- a panel
+   inside a panel was what made the left column look so busy earlier. */
+.vm-inpanel,.vm-outpanel{background:#fff!important;border:1px solid #e2e7df!important;
+  border-radius:12px!important;padding:18px 20px 6px!important;
+  align-self:flex-start!important}
+.vm-inpanel .vm-sect,.vm-outpanel .vm-sect{margin-bottom:18px!important}
+.vm-inpanel .block,.vm-outpanel .block{border:0!important;background:transparent!important;
+  padding:0!important}
+/* The things you read out of, or type into, keep a surface of their own. */
+.vm-inpanel textarea,.vm-outpanel textarea{background:#fafbf7!important;border:1px solid #e6ebe0!important;
+  border-radius:8px!important;padding:11px 12px!important}
+.vm-outpanel .block.vm-fieldtable{border:1px solid #e6ebe0!important;
+  border-radius:8px!important;overflow:hidden}
+.vm-outpanel .image-container{border:1px solid #e6ebe0!important;
+  border-radius:8px!important;background:#fafbf7!important}
+.vm-outpanel .block.vm-dl{border:1px solid #e6ebe0!important;border-radius:8px!important;
+  background:#fafbf7!important;padding:8px 10px!important}
+.vm-panelhead,.vm-outhead{display:flex;align-items:baseline;gap:10px;padding-bottom:13px;
+  margin-bottom:16px;border-bottom:1px solid #eef1ea}
+.vm-panelhead b,.vm-outhead b{font-family:Georgia,'Times New Roman',serif;font-size:19px;
+  font-weight:400;color:#1b2420}
+.vm-panelhead span,.vm-outhead span{font-size:11px;color:#6b756f}
+
+/* The input side, matching the output side. The controls keep a surface so
+   they still read as things to fill in; the panel is the only border. */
+.vm-inpanel input:not([type=radio]):not([type=checkbox]),
+.vm-inpanel select,.vm-inpanel .wrap.center{
+  background:#fafbf7!important;border:1px solid #e6ebe0!important;
+  border-radius:8px!important}
+.vm-inpanel .image-container,.vm-inpanel .center.boundedheight{
+  border:1px dashed #cfd9c6!important;border-radius:8px!important;
+  background:#fafbf7!important}
+.vm-inpanel .vm-hint{margin:6px 2px 0}
+/* A slider is a control, not a box: it must not gain a field surface. */
+.vm-inpanel input[type=range]{background:transparent!important;border:0!important}
+
+/* ------------------------------------------------------------- composer
+   One box you type into, its controls along the bottom edge and a round send
+   button on the right. The text is the thing; everything else keeps out of
+   its way until it is wanted. */
+.vm-composer{margin-top:14px!important;background:#fff!important;
+  border:1px solid #dfe5d9!important;border-radius:24px!important;
+  padding:16px 18px 12px!important;gap:0!important;
+  box-shadow:0 1px 2px rgba(31,45,40,.04),0 8px 24px rgba(31,45,40,.05)!important}
+.vm-composer:focus-within{border-color:#b9cdb4!important;
+  box-shadow:0 1px 2px rgba(31,45,40,.05),0 10px 30px rgba(31,45,40,.08)!important}
+/* The field has no edge of its own: the composer is the edge. */
+.vm-composer .block,.vm-composer .form{background:transparent!important;
+  border:0!important;padding:0!important;box-shadow:none!important}
+.vm-composer textarea{background:transparent!important;border:0!important;
+  box-shadow:none!important;resize:none!important;padding:2px 4px!important;
+  font-size:14px!important;line-height:1.6!important;color:#1b2420!important}
+.vm-composer textarea::placeholder{color:#93a09a!important}
+.vm-composer textarea{min-height:46px!important;max-height:240px!important}
+.vm-composer textarea:focus{outline:none!important}
+
+.vm-composer-bar{margin-top:10px!important;align-items:center!important;
+  gap:10px!important;flex-wrap:nowrap!important}
+.vm-composer button.vm-send{margin-left:auto!important}
+/* The document type reads as a chip on the bar, not as a form field. */
+.vm-composer .vm-doctype input{background:#f3f7ee!important;
+  border:1px solid #e2e9da!important;border-radius:18px!important;
+  padding:7px 14px!important;font-size:12px!important;font-weight:500!important;
+  color:#2c4a36!important;cursor:pointer}
+.vm-composer .vm-doctype{flex:0 0 auto!important;width:232px!important}
+
+/* Send: round, and only as loud as it needs to be. */
+.vm-composer button.vm-send{width:40px!important;min-width:40px!important;
+  height:40px!important;min-height:40px!important;border-radius:50%!important;
+  padding:0!important;font-size:17px!important;line-height:1!important;
+  display:grid!important;place-items:center!important;flex:0 0 auto}
+.vm-composer button.vm-send::after{content:none!important}
+
+.vm-composer-note{margin-top:10px!important}
+.vm-composer-note .vm-hint,.vm-composer-note .vm-ok,.vm-composer-note .vm-warn{
+  margin-top:0}
 """
 
 
@@ -714,7 +962,9 @@ BRAND_HTML = """
 SIDEBAR_FOOT_HTML = """
 <div class="vm-foot">
   <div class="vm-status"><span class="vm-dot"></span>Running on this device
-    <small>RTX 5080 &middot; nothing leaves the machine</small></div>
+    <small>Nothing leaves the machine</small></div>
+  <div class="vm-profile"><span class="vm-avatar">GPU</span>
+    <div><strong>RTX 5080</strong><small>16GB &middot; one model at a time</small></div></div>
 </div>
 """
 
@@ -770,6 +1020,18 @@ def load_skills(directory=SKILL_DIR):
 SKILLS = load_skills()
 
 
+def doc_type_card(cfg):
+    """One document type: which reader it picks, and what it is read for."""
+    fields = cfg.get("fields") or []
+    chips = "".join(f'<span class="vm-field">{html.escape(f)}</span>' for f in fields)
+    body = (f'<div class="vm-fields">{chips}</div>' if chips else
+            '<p class="vm-snote">No fixed field list &mdash; the whole document '
+            'is transcribed.</p>')
+    return (f'<div class="vm-skill"><h3>{html.escape(cfg["name"])}</h3>'
+            f'<div class="vm-smodel">{html.escape(cfg["reader"])}</div>'
+            f'<p class="vm-snote">{html.escape(cfg.get("why", ""))}</p>{body}</div>')
+
+
 def skill_card(skill):
     """One card. Values come from the file, so they are escaped, not trusted."""
     rows = [("Takes", skill["takes"]),
@@ -784,6 +1046,109 @@ def skill_card(skill):
             f'<div class="vm-smodel">{html.escape(skill["model"])}</div>{body}</div>')
 
 
+
+# Signposting for the Dashboard. Nothing here changes what a run does; it
+# answers the questions the page could not previously answer on its own --
+# which of the two upload boxes to use, which controls the chosen model
+# actually reads, and why the first run takes a minute.
+EYEBROW_HTML = (
+    '<div class="vm-eyebrow">WORKSPACE &middot; LOCAL</div>'
+)
+
+def flat(markup):
+    """A heading or hint, drawn as itself rather than as a control."""
+    return gr.HTML(markup, elem_classes="vm-flat")
+
+
+def hint(text):
+    return f'<p class="vm-hint">{html.escape(text)}</p>'
+
+
+def step_head(number, title, sub="", note=""):
+    """A numbered section heading, with an optional note aligned right."""
+    tail = f'<small>{html.escape(sub)}</small>' if sub else ""
+    right = f'<span class="vm-cardnote">{html.escape(note)}</span>' if note else ""
+    return (f'<div class="vm-step"><span class="vm-stepn">{number:02d}</span>'
+            f'<div><b>{html.escape(title)}</b>{tail}</div>{right}</div>')
+
+
+DOC_TYPE_DIR = os.path.join(_here, "doc_types")
+FREE_FORM = "Anything else / write my own"
+
+
+def load_doc_types(directory=DOC_TYPE_DIR):
+    """Document types and the fields each one is usually read for."""
+    out = []
+    if not os.path.isdir(directory):
+        return out
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"doc types: skipping {name}: {type(e).__name__}: {e}", flush=True)
+            continue
+        if not cfg.get("name") or cfg.get("reader") not in MODELS:
+            print(f"doc types: skipping {name}, bad name or reader", flush=True)
+            continue
+        out.append(cfg)
+    return out
+
+
+DOC_TYPES = load_doc_types()
+
+
+def doc_type(name):
+    return next((d for d in DOC_TYPES if d["name"] == name), None)
+
+
+def split_fields(text):
+    """Free-typed extra fields: commas or newlines, blanks dropped."""
+    parts = (text or "").replace("\n", ",").split(",")
+    return [f.strip() for f in parts if f.strip()]
+
+
+def compose_prompt(cfg, fields=None, extra=""):
+    """Always empty: the reader is asked to transcribe, never to extract.
+
+    A field list was composed into the instruction here. On a scanned utility
+    bill that turned a 42-second, 1,451-character transcription into a
+    330-second, 35,505-character loop -- the model repeating itself until it
+    stopped. A bare comma-separated list produced 28 characters instead.
+    DeepSeek-OCR answers one short question about a page well; it does not
+    take a field list. The fields are kept in the type files as the statement
+    of what is wanted, for whatever does the extracting.
+    """
+    return ""
+
+
+def doc_type_note(type_name, model_label):
+    """One line: the reader in use, and any warning that it will ignore you.
+
+    Deliberately terse. The reasoning behind each type is on the Skills page;
+    under the composer only two things matter -- which reader is about to run,
+    and whether typing here will have any effect on it.
+    """
+    short = model_label.split(" (")[0]
+    cfg = doc_type(type_name)
+    if cfg is None:
+        if model_label.startswith("PaddleOCR"):
+            return ('<p class="vm-warn">PaddleOCR-VL runs a fixed pipeline and '
+                    'ignores what you type. Switch reader in step 01 to use an '
+                    'instruction.</p>')
+        return f'<p class="vm-hint">{html.escape(short)} will follow what you type.</p>'
+    wants = cfg["reader"]
+    fields = len(cfg.get("fields") or [])
+    if model_label != wants:
+        return (f'<p class="vm-warn">This type reads best with '
+                f'{html.escape(wants.split(" (")[0])}. Change the reader in step 01.</p>')
+    tail = f"{fields} fields ready for step 06" if fields else "whole page transcribed"
+    return (f'<p class="vm-hint">{html.escape(short)} &middot; '
+            f'{html.escape(tail)}</p>')
+
+
 def build_demo():
     """Construct the UI.
 
@@ -792,78 +1157,234 @@ def build_demo():
     and building Gradio components at import time blew up inside a live
     request from another app with 'Dropdown' object has no attribute '_id'.
     """
-    with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
+    # fill_width, because Gradio caps its own container at 1536px and that left
+    # a 229px dead strip on the right of a 1900px window. Gradio's own
+    # parameter rather than a CSS override, so it survives an upgrade.
+    with gr.Blocks(title="Local Vision Models - RTX 5080", fill_width=True) as demo:
         with gr.Sidebar(width=244, elem_classes="vm-side"):
-            gr.HTML(BRAND_HTML)
+            flat(BRAND_HTML)
             nav = gr.Radio(NAV_PAGES, value=NAV_PAGES[0], show_label=False,
                            container=False, elem_classes="vm-nav")
-            gr.HTML(SIDEBAR_FOOT_HTML)
+            flat(SIDEBAR_FOOT_HTML)
 
         # Every page is built, and the nav only changes which one is visible.
         # Nothing below is re-created on a click, so a run in progress is not
         # disturbed by looking at another page.
         with gr.Column(visible=True, elem_classes="vm-page") as page_dashboard:
+            flat(EYEBROW_HTML)
             gr.Markdown(
-                "# Local OCR / VLM\n"
-                "Runs entirely on your RTX 5080. Pick a model, upload an image **or a "
-                "PDF**, hit Run. PDFs are processed page by page and stream in live.\n"
-                "Switching models unloads the previous one to stay within 16GB VRAM."
+                "# Local Vision Models\n"
+                "Runs entirely on your RTX 5080 \u2014 nothing leaves the machine. "
+                "Say what kind of document it is, drop the file in, hit Run. "
+                "PDFs are read page by page and stream in live; step 06 then "
+                "searches that text for the fields you asked for.\n"
+                "Switching readers unloads the previous one to stay within 16GB VRAM."
             )
-            with gr.Row():
-                with gr.Column():
-                    model_dd = gr.Dropdown(
-                        choices=list(MODELS.keys()),
-                        value="PaddleOCR-VL (document OCR)",
-                        label="Model",
-                    )
-                    image_in = gr.Image(type="filepath", label="Upload image")
-                    pdf_in = gr.File(label="...or upload PDFs (several is fine)",
-                                     file_types=[".pdf"], file_count="multiple")
-                    with gr.Row():
-                        pages_in = gr.Textbox(label="Pages", value="",
-                                              placeholder="all, or 1-3 / 1,4,7", scale=1)
-                        dpi_in = gr.Slider(150, 600, value=300, step=50,
-                                           label="Render DPI", scale=2)
-                    batch_in = gr.Slider(1, 16, value=4, step=1,
-                                         label="Pages per vLLM batch (higher = faster, "
-                                               "coarser live updates)")
-                    with gr.Row():
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1, min_width=380, elem_classes="vm-inpanel"):
+                    flat('<div class="vm-panelhead"><b>Input</b><span>The document, and how to read it</span></div>')
+                   
+                    with gr.Column(elem_classes="vm-sect"):
+                        flat(step_head(1, "Choose a reader"))
+                        model_dd = gr.Dropdown(
+                            choices=list(MODELS.keys()),
+                            value="PaddleOCR-VL (document OCR)",
+                            label="Model",
+                            info="PaddleOCR-VL reads layout and tables and ignores "
+                                 "the prompt. DeepSeek-OCR follows the prompt and can "
+                                 "draw boxes, but reads tables less reliably.",
+                        )
+
+                    # Side by side. Stacked, these two ran to most of a screen on
+                    # their own, and the choice between them reads better as a
+                    # choice when they sit next to each other.
+                    with gr.Column(elem_classes="vm-sect"):
+                        flat(step_head(2, "Add your document"))
+                        with gr.Tabs(elem_classes="vm-tabs"):
+                            with gr.Tab("Image"):
+                                image_in = gr.Image(type="filepath",
+                                                    label="Upload image",
+                                                    elem_classes="vm-drop")
+                                flat(hint("A photo or scan \u2014 PNG, JPG or WEBP. "
+                                          "Read in one pass."))
+                            with gr.Tab("PDF"):
+                                pdf_in = gr.File(label="...or upload PDFs (several is fine)",
+                                                 file_types=[".pdf"], file_count="multiple",
+                                                 elem_classes="vm-drop")
+                                flat(hint("Several are fine. Each page is rendered at the "
+                                          "DPI below, then read; results stream in as they "
+                                          "finish. A PDF here takes precedence over an "
+                                          "image on the other tab."))
+
+                    with gr.Column(elem_classes="vm-sect"):
+                        flat(step_head(3, "Page options",
+                                       "PDFs only — ignored for an image."))
+                        with gr.Row():
+                            pages_in = gr.Textbox(label="Pages", value="",
+                                                  placeholder="all, or 1-3 / 1,4,7", scale=2)
+                            dpi_in = gr.Slider(150, 600, value=300, step=50,
+                                               label="Render DPI", scale=3)
+                        batch_in = gr.Slider(1, 16, value=4, step=1,
+                                             label="Pages per vLLM batch")
+                        flat(hint(
+                            "Pages — blank reads every page. "
+                            "Render DPI — higher is sharper and slower; 300 suits most "
+                            "scans. Batch — PaddleOCR-VL only, higher is faster with "
+                            "coarser updates; DeepSeek-OCR always reads one page at a time."))
+
+                with gr.Column(scale=1, min_width=380, elem_classes="vm-outpanel"):
+                    flat('<div class="vm-outhead"><b>Output</b><span>What the reader gave back</span></div>')
+                   
+                    with gr.Column(elem_classes="vm-sect"):
+                        flat(step_head(4, "Watch it run"))
+                        status_out = gr.Textbox(label="Progress (live)", lines=6,
+                                                max_lines=6, autoscroll=True,
+                                                placeholder="Nothing running yet. The first "
+                                                            "run after starting the app loads "
+                                                            "the model and can take around a "
+                                                            "minute before the first page "
+                                                            "appears. Later runs are seconds.")
+                        text_out = gr.Textbox(label="Result (raw)", lines=16,
+                                              placeholder="The transcribed text lands here, "
+                                                          "and can be copied straight out or "
+                                                          "saved as .md / .html / .xlsx.")
+                    with gr.Column(elem_classes="vm-sect"):
+                        img_out = gr.Image(label="Annotated output (OCR grounding, if produced)",
+                                           height=220, visible=False)
+                        flat(hint("Choose DeepSeek-OCR to also get the page back with "
+                                  "boxes drawn on it. PaddleOCR-VL does not produce one."))
+                        html_out = gr.HTML(label="Rendered table (PaddleOCR-VL)", visible=False)
+                    with gr.Column(elem_classes="vm-sect"):
+                        flat(step_head(5, "Keep the result",
+                                          "Available once a run has produced text."))
+                        # The downloads list appears under the button once there
+                        # is something in it. Empty, it was a third of a screen
+                        # of white reserved to hold nothing.
                         save_btn = gr.Button("Save output (.md / .html / .xlsx)")
-                    files_out = gr.File(label="Download", file_count="multiple")
-                with gr.Column():
-                    status_out = gr.Textbox(label="Progress (live)", lines=10,
-                                            max_lines=10, autoscroll=True)
-                    text_out = gr.Textbox(label="Result (raw)", lines=22)
-                    img_out = gr.Image(label="Annotated output (OCR grounding, if produced)")
-                    html_out = gr.HTML(label="Rendered table (PaddleOCR-VL)", visible=False)
+                        files_out = gr.File(label="Download", file_count="multiple",
+                                            visible=False, elem_classes="vm-dl")
+
+                    with gr.Column(elem_classes="vm-sect"):
+                        flat(step_head(6, "Pull out fields",
+                                       "Searches the text above for the labels "
+                                       "printed on the page.",
+                                       note="After a run"))
+                        fields_cb = gr.CheckboxGroup(
+                            choices=[], value=[], visible=False,
+                            label="Fields to look for",
+                            info="Set by the document type. Untick what you do not need.",
+                            elem_classes="vm-fieldpick",
+                        )
+                        extra_in = gr.Textbox(
+                            value="", visible=False, lines=1,
+                            label="Any other fields",
+                            placeholder="Comma separated, e.g. Tenant name, Lease expiry",
+                            elem_classes="vm-extra",
+                        )
+                        find_btn = gr.Button("Find these fields in the result")
+                        fields_out = gr.Dataframe(
+                            headers=["Field", "Value", "Looks right", "Found where"],
+                            datatype=["str", "str", "str", "str"],
+                            row_count=(0, "dynamic"), col_count=(4, "fixed"),
+                            interactive=False, wrap=True, visible=False,
+                            elem_classes="vm-fieldtable",
+                        )
+                        fields_note = gr.HTML(elem_classes="vm-flat")
 
             # The prompt and Run sit at the foot of the page, as one bar. The
             # handler is unchanged: what matters to it is the order of the
             # inputs list below, not where the boxes are drawn.
-            with gr.Row(elem_classes="vm-promptbar"):
+            with gr.Column(elem_classes="vm-composer"):
                 prompt_in = gr.Textbox(
                     value=DEFAULT_PROMPTS["paddleocr_vl"],
-                    label="Prompt / instruction",
-                    lines=3,
-                    scale=9,
+                    show_label=False,
+                    container=False,
+                    lines=2,
+                    max_lines=12,
+                    placeholder="What should the reader do with this document?",
+                    elem_classes="vm-prompt",
                 )
-                run_btn = gr.Button("Run", variant="primary", scale=1)
+                with gr.Row(elem_classes="vm-composer-bar"):
+                    doc_type_dd = gr.Dropdown(
+                        choices=[d["name"] for d in DOC_TYPES] + [FREE_FORM],
+                        value=FREE_FORM,
+                        label="Document type",
+                        show_label=False,
+                        container=False,
+                        scale=0,
+                        min_width=230,
+                        elem_classes="vm-doctype",
+                    )
 
+                    run_btn = gr.Button("\u2191", variant="primary", scale=0,
+                                        elem_classes="vm-send")
+                doc_note = gr.HTML(doc_type_note(FREE_FORM, "PaddleOCR-VL (document OCR)"),
+                                   elem_classes="vm-flat vm-composer-note")
         with gr.Column(visible=False, elem_classes="vm-page") as page_skills:
+            flat(EYEBROW_HTML)
             gr.Markdown(
-                "# Skills\n"
-                "Each skill is one reading model paired with the kind of file it "
-                "is for. Choosing one sets the Model and prompt on the Dashboard "
-                "and takes you there — the run, and everything it produces, is "
-                "unchanged."
+                elem_classes="vm-flat",
+                value=(
+                    "# Skills\n"
+                    "Three things make up a run. You pick the **document type**; "
+                    "it picks the reader for you. The reader **transcribes** the "
+                    "page. Step 06 then **searches that text** for the field "
+                    "labels printed on it.\n\n"
+                    "Fields are never asked of the reader. Asked for a nine-field "
+                    "list, one reader looped to 35,505 characters in five and a "
+                    "half minutes on a one-page bill; a bare list of names "
+                    "returned 28 characters. Reading and extracting are separate "
+                    "jobs here because measuring them together showed they have "
+                    "to be."
+                ),
             )
+
+            flat('<div class="vm-step vm-step-plain"><div><b>Document types</b>'
+                 '<small>What you choose on the Dashboard. Each one sets its '
+                 'reader, and names the fields step 06 will look for.</small>'
+                 '</div></div>')
+            for row_start in range(0, len(DOC_TYPES), 3):
+                with gr.Row():
+                    for cfg in DOC_TYPES[row_start:row_start + 3]:
+                        with gr.Column():
+                            gr.HTML(doc_type_card(cfg))
+
+            flat('<div class="vm-step vm-step-plain"><div><b>Readers</b>'
+                 '<small>The two models underneath, and what each is good and '
+                 'bad at. You do not normally choose these directly.</small>'
+                 '</div></div>')
             picks = []
             for row_start in (0, 2):
                 with gr.Row():
                     for skill in SKILLS[row_start:row_start + 2]:
                         with gr.Column():
                             gr.HTML(skill_card(skill))
-                            picks.append((skill, gr.Button("Use this skill")))
+                            picks.append((skill, gr.Button("Use this reader")))
+
+            flat('<div class="vm-step vm-step-plain"><div><b>Finding fields</b>'
+                 '<small>Step 06 on the Dashboard, once a run has produced '
+                 'text.</small></div></div>')
+            gr.Markdown(
+                elem_classes="vm-flat",
+                value=(
+                    "A field is found by the label **printed on the page**, not by "
+                    "a model, so nothing can be invented: a label that is not there "
+                    "is reported as not found.\n\n"
+                    "- Each field carries its other spellings, so a field called "
+                    "*Account number* still matches a bill that says *Account No.*, "
+                    "and you can add your own.\n"
+                    "- The value is looked for beside the label, to the right of it, "
+                    "beneath a column heading, and further down past any run of "
+                    "other labels — which covers bills that print all the labels "
+                    "first and all the values after.\n"
+                    "- Each field knows the shape its value should have. Given "
+                    "`Due Date | 171.73 | 09/28/2026` it takes the date, not the "
+                    "amount sitting closer.\n"
+                    "- A value found in the wrong shape is marked **CHECK** rather "
+                    "than accepted quietly. That is what a table which has slipped "
+                    "a row looks like."
+                ),
+            )
 
         nav.change(lambda choice: [gr.update(visible=(choice == name))
                                    for name in NAV_PAGES],
@@ -883,7 +1404,110 @@ def build_demo():
                 outputs=[model_dd, prompt_in, nav, page_dashboard, page_skills],
             )
 
-        model_dd.change(on_model_change, inputs=model_dd, outputs=[prompt_in, img_out, html_out])
+        # Choosing a document type writes the instruction and says whether the
+        # reader currently selected will actually read it. It deliberately does
+        # not change the Model: that control has its own handler which rewrites
+        # this box, and the two would race for the last word.
+        def on_doc_type(type_name, model_label):
+            """Choosing the document chooses the reader with it.
+
+            An analyst handed a PDF should not have to know that a rent roll
+            wants the table reader and an appraisal wants the promptable one.
+            Setting the Model here fires its own handler, which rewrites the
+            prompt box -- but that handler is chained to put the document
+            type's instruction back afterwards, so the order resolves itself
+            rather than racing.
+            """
+            cfg = doc_type(type_name)
+            if cfg is None:
+                return (gr.update(), doc_type_note(type_name, model_label), gr.update(),
+                        gr.update(choices=[], value=[], visible=False),
+                        gr.update(value="", visible=bool(known)))
+            wants = cfg["reader"]
+            known = cfg.get("fields") or []
+            composed = compose_prompt(cfg)
+            # A type with no field list wants the whole document, so there is
+            # nothing to tick and the pickers stay out of the way.
+            return (gr.update(value=composed or DEFAULT_PROMPTS[MODELS[wants]]),
+                    doc_type_note(type_name, wants),
+                    gr.update(value=wants),
+                    gr.update(choices=known, value=known, visible=bool(known)),
+                    gr.update(value="", visible=bool(known)))
+
+        def on_fields(type_name, fields, extra):
+            cfg = doc_type(type_name)
+            if cfg is None:
+                return gr.update()
+            return gr.update(value=compose_prompt(cfg, fields, extra))
+
+        doc_type_dd.change(on_doc_type, inputs=[doc_type_dd, model_dd],
+                           outputs=[prompt_in, doc_note, model_dd, fields_cb, extra_in])
+        fields_cb.change(on_fields, inputs=[doc_type_dd, fields_cb, extra_in],
+                         outputs=prompt_in)
+        extra_in.submit(on_fields, inputs=[doc_type_dd, fields_cb, extra_in],
+                        outputs=prompt_in)
+        extra_in.blur(on_fields, inputs=[doc_type_dd, fields_cb, extra_in],
+                      outputs=prompt_in)
+        # Changing the reader re-checks the advice, which may have just become
+        # right or wrong for the type already chosen.
+        model_dd.change(lambda t, m: doc_type_note(t, m),
+                        inputs=[doc_type_dd, model_dd], outputs=doc_note)
+        # on_model_change rewrites the prompt with the new model's default, which
+        # would throw away the instruction a document type had just written --
+        # and the advice above tells you to change the model, so that is the
+        # normal path, not an edge case. .then() runs after it on the same
+        # trigger, so the document type gets the last word deterministically.
+        def keep_doc_instruction(type_name, fields, extra):
+            cfg = doc_type(type_name)
+            composed = compose_prompt(cfg, fields, extra) if cfg else ""
+            return gr.update(value=composed) if composed else gr.update()
+
+        model_dd.change(on_model_change, inputs=model_dd,
+                        outputs=[prompt_in, img_out, html_out]).then(
+            keep_doc_instruction, inputs=[doc_type_dd, fields_cb, extra_in],
+            outputs=prompt_in)
+        def pull_fields(text, chosen, extra):
+            """Search the transcript for the chosen labels.
+
+            Nothing here calls a model. The value comes from the page or it is
+            reported missing, and every row says which label matched and where
+            the value sat relative to it -- so a wrong answer is visible as a
+            wrong answer rather than a confident number.
+            """
+            wanted = list(chosen or []) + split_fields(extra)
+            if not (text or "").strip():
+                return (gr.update(visible=False),
+                        hint("Run a document first: this searches the text in Result."))
+            if not wanted:
+                return (gr.update(visible=False),
+                        hint("Choose a document type, or type the field names you want."))
+            rows, missing, odd = [], 0, 0
+            for r in field_search.find_fields(text, wanted):
+                if not r["found"]:
+                    missing += 1
+                elif not r["shape_ok"]:
+                    odd += 1
+                where = r["evidence"].split("[")[-1].rstrip("]") if r["evidence"] else ""
+                if not r["found"]:
+                    verdict = ""
+                elif r.get("guessed"):
+                    verdict = "guess"
+                elif r["shape_ok"]:
+                    verdict = "yes"
+                else:
+                    verdict = "CHECK"
+                rows.append([r["field"], r["value"] or "not found", verdict, where])
+            parts = [f"{len(rows) - missing} of {len(rows)} found."]
+            if missing:
+                parts.append(f"{missing} label(s) not printed on the page.")
+            if odd:
+                parts.append(f"{odd} value(s) marked CHECK: found, but not the shape "
+                             f"the field expects — often a table that has slipped a row.")
+            return gr.update(value=rows, visible=True), hint(" ".join(parts))
+
+        find_btn.click(pull_fields, inputs=[text_out, fields_cb, extra_in],
+                       outputs=[fields_out, fields_note])
+
         save_btn.click(save_result, inputs=[text_out, pdf_in, image_in],
                        outputs=[files_out, status_out])
         run_btn.click(

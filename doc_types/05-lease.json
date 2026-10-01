@@ -1,0 +1,7 @@
+{
+  "name": "Lease document",
+  "reader": "PaddleOCR-VL (document OCR)",
+  "why": "No fixed field list — what matters varies by lease, so the whole document is transcribed and read afterwards.",
+  "fields": [],
+  "instruction": ""
+}

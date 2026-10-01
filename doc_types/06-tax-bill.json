@@ -1,0 +1,7 @@
+{
+  "name": "Tax bill",
+  "reader": "PaddleOCR-VL (document OCR)",
+  "why": "No fixed field list — formats vary by authority, so the whole document is transcribed.",
+  "fields": [],
+  "instruction": ""
+}

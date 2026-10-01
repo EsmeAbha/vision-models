@@ -82,3 +82,5 @@ if __name__ == "__main__":
         image_path, prompt, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
         text, img_out = run_one(image_path, prompt, out_dir)
         print("###RESULT_JSON###" + json.dumps({"text": text, "image": img_out}))
+
+

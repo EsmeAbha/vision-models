@@ -1,0 +1,18 @@
+{
+  "id": "extract-requested-fields",
+  "name": "Extract Requested Fields",
+  "version": "1.0.0",
+  "description": "Describe the fields or rows you need. The existing local models read each document and build a workbook with field-level source evidence.",
+  "owner": "Document operations",
+  "status": "Local",
+  "risk": "Medium",
+  "input": "PDF, PNG, JPG, WEBP",
+  "output": "XLSX + field evidence + QC reports",
+  "validation": "Source matching on every run; semantic review required",
+  "dependencies": ["Existing document readers", "Local vision service", "Existing structured extraction", "Workbook writer"],
+  "columns": [],
+  "required_fields": [],
+  "max_pages": 30,
+  "max_characters": 48000,
+  "adapter": "workspace_extraction"
+}

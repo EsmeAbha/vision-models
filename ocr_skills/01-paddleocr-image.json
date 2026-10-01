@@ -1,9 +1,9 @@
 {
   "name": "Document OCR — Image",
   "model": "PaddleOCR-VL (document OCR)",
-  "takes": "A photo or scan — PNG, JPG or WEBP — dropped into “Upload image”",
+  "takes": "A photo or scan — PNG, JPG or WEBP — dropped into the Image tab",
   "prompt_note": "Ignored — fixed layout and recognition pipeline",
   "gives": "Text, and tables in the rendered table panel",
   "speed": "~4s once loaded, ~70s on the first run",
-  "note": "The more accurate reader on printed documents."
+  "note": "The more accurate reader on printed documents: 18 of 23 fields right on a scanned bill, against 12 for the other. Drops handwriting and stamps."
 }
