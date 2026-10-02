@@ -33,6 +33,25 @@ function svg(name, size) {
 
 /* ------------------------------------------------------------------ state */
 
+/* Sidebar state belongs to the person, not to the page load: a section
+ * folded away should still be folded tomorrow. Wrapped because storage
+ * throws outright in a private window or with site data blocked, and a
+ * sidebar preference is not worth taking the page down for. */
+function recall(key, fallback) {
+  try {
+    const raw = localStorage.getItem(`lv-${key}`);
+    return raw === null ? fallback : JSON.parse(raw);
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function remember(key, value) {
+  try {
+    localStorage.setItem(`lv-${key}`, JSON.stringify(value));
+  } catch (e) { /* nothing to do about it, and nothing worth breaking for */ }
+}
+
 const S = {
   sidebar: window.innerWidth >= 900,
   models: [],
@@ -51,8 +70,8 @@ const S = {
   extra: '',       // extra field names typed in by hand
   templates: [],   // spreadsheets the found fields can be dropped into
   history: [],     // documents read in earlier sessions
-  expanded: [],    // rows opened to show their full detail
-  collapsed: [],   // sidebar groups folded shut
+  expanded: recall('expanded', []),   // rows opened to their detail
+  collapsed: recall('collapsed', []), // groups folded shut
   openRun: null,   // the run the thread is currently showing
   search: '',      // filter over the run list
   deals: [],       // deal workbooks on disk
@@ -381,6 +400,7 @@ const isFolded = (key) => S.collapsed.includes(key);
 function toggleGroup(key) {
   S.collapsed = isFolded(key) ? S.collapsed.filter((k) => k !== key)
                               : S.collapsed.concat([key]);
+  remember('collapsed', S.collapsed);
   render();
 }
 
@@ -404,6 +424,7 @@ function toggleExpanded(key, event) {
   if (event) event.stopPropagation();
   S.expanded = isOpen(key) ? S.expanded.filter((k) => k !== key)
                            : S.expanded.concat([key]);
+  remember('expanded', S.expanded);
   render();
 }
 

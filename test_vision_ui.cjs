@@ -156,27 +156,39 @@ async function main() {
   const byId = { app, toast };
 
   const root = new Node('html');
-  const sandbox = {
-    console, setTimeout, clearTimeout,
-    FormData, URL,
-    fetch: (url, opts) => {
-      seenBootCalls.push(url);
-      return fetch(url.startsWith('http') ? url : BASE + url, opts);
-    },
-    localStorage: { getItem: () => null, setItem() {} },
-    window: { innerWidth: 1440, addEventListener() {} },
-    navigator: {},
-    EventSource: class { constructor() { this.close = () => {}; } },
-    document: {
-      getElementById: (id) => byId[id] || null,
-      createElement: (tag) => new Node(tag),
-      addEventListener() {},
-      documentElement: root,
-      activeElement: null,
-      body: new Node('body'),
-    },
+  // A reload is a fresh context over the same storage, so the sandbox has to
+  // be buildable more than once.
+  const makeSandbox = (storage, byIdFor) => {
+    const s = {
+      console, setTimeout, clearTimeout,
+      FormData, URL,
+      fetch: (url, opts) => {
+        seenBootCalls.push(url);
+        return fetch(url.startsWith('http') ? url : BASE + url, opts);
+      },
+      localStorage: storage,
+      window: { innerWidth: 1440, addEventListener() {} },
+      navigator: {},
+      EventSource: class { constructor() { this.close = () => {}; } },
+      document: {
+        getElementById: (id) => byIdFor[id] || null,
+        createElement: (tag) => new Node(tag),
+        addEventListener() {},
+        documentElement: new Node('html'),
+        activeElement: null,
+        body: new Node('body'),
+      },
+    };
+    s.globalThis = s;
+    return s;
   };
-  sandbox.globalThis = sandbox;
+
+  const storage = {
+    _data: {},
+    getItem(k) { return k in this._data ? this._data[k] : null; },
+    setItem(k, v) { this._data[k] = String(v); },
+  };
+  const sandbox = makeSandbox(storage, byId);
   vm.createContext(sandbox);
 
   // Top-level const is script-scoped in a vm, so expose what the test drives.
@@ -185,7 +197,7 @@ async function main() {
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
     + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
-    + ' toggleGroup, isFolded, reopen, newRun };';
+    + ' toggleGroup, isFolded, reopen, newRun, recall, remember };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
   globalThis.__sel = () => `${t.S.model}|${t.S.skill}`;
@@ -335,6 +347,50 @@ async function main() {
                'the theme switcher is back');
   assert.ok(!seen.includes('Tideform') && !seen.includes('Teal'),
             'the theme buttons are still drawn');
+
+  // ---- what is folded stays folded next time ------------------------------
+  // Array.from on everything that crosses out of the vm: assert/strict
+  // compares prototypes, and an array built inside the context has a
+  // different Array.prototype than this realm's.
+  // A disclosure that springs back open on every reload is not a
+  // preference, it is a nuisance.
+  t.toggleGroup('skills');
+  assert.deepEqual(Array.from(t.recall('collapsed', null)), ['skills'],
+                   'folding a group was not remembered');
+  t.toggleExpanded('model:paddleocr_vl');
+  assert.deepEqual(Array.from(t.recall('expanded', null)), ['model:paddleocr_vl'],
+                   'opening a row was not remembered');
+
+  // A fresh page reads it back: a new context over the same storage.
+  const reloadApp = new Node('div');
+  reloadApp.id = 'app';
+  const reloadToast = new Node('div');
+  reloadToast.id = 'toast';
+  const second = makeSandbox(storage, { app: reloadApp, toast: reloadToast });
+  vm.createContext(second);
+  vm.runInContext(fs.readFileSync('vision_web/app.js', 'utf8')
+                  + ';globalThis.__again = { S };', second);
+  assert.deepEqual(Array.from(second.__again.S.collapsed), ['skills'],
+                   'a reload forgot which group was folded');
+  assert.deepEqual(Array.from(second.__again.S.expanded), ['model:paddleocr_vl'],
+                   'a reload forgot which row was open');
+
+  t.toggleGroup('skills');
+  t.toggleExpanded('model:paddleocr_vl');
+  assert.deepEqual(Array.from(t.recall('collapsed', null)), [],
+                   'unfolding was not remembered either');
+
+  // Storage can refuse outright; the sidebar must not care.
+  const realStore = sandbox.localStorage;
+  sandbox.localStorage = {
+    getItem() { throw new Error('blocked'); },
+    setItem() { throw new Error('blocked'); },
+  };
+  assert.deepEqual(Array.from(t.recall('collapsed', ['fallback'])), ['fallback'],
+                   'a blocked read did not fall back');
+  t.toggleGroup('models');
+  t.toggleGroup('models');
+  sandbox.localStorage = realStore;
 
   // ---- the run list behaves like a chat sidebar ---------------------------
   const now = new Date().toISOString();
