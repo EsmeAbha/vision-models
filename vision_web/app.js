@@ -53,6 +53,8 @@ const S = {
   history: [],     // documents read in earlier sessions
   expanded: [],    // rows opened to show their full detail
   collapsed: [],   // sidebar groups folded shut
+  openRun: null,   // the run the thread is currently showing
+  search: '',      // filter over the run list
   deals: [],       // deal workbooks on disk
   deal: null,      // the deal documents are being read into, if any
   newDeal: false,  // the new-deal form is open
@@ -175,7 +177,7 @@ async function loadHistory() {
   } catch (e) { /* the sidebar still works without it */ }
 }
 
-/* When a run happened is more useful than its exact timestamp. */
+/* When a run happened, in the buckets a chat sidebar uses. */
 function dayOf(at) {
   const when = new Date(at);
   if (Number.isNaN(when.getTime())) return 'Earlier';
@@ -184,35 +186,40 @@ function dayOf(at) {
   const days = Math.floor((midnight - when) / 86400000);
   if (days <= 0) return 'Today';
   if (days === 1) return 'Yesterday';
-  if (days < 7) return `${days + 1} days ago`;
-  return when.toLocaleDateString(undefined,
-                                 { day: 'numeric', month: 'short' });
+  if (days < 7) return 'Previous 7 days';
+  if (days < 30) return 'Previous 30 days';
+  return when.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
 }
 
 /* Reopen a document read in an earlier session. The transcript is kept, so
  * this costs nothing: re-running it would mean another model load. */
 async function reopen(id) {
+  if (S.openRun === id) return;
   try {
     const entry = await api(`/api/history/${id}`);
     const model = modelById(entry.model);
-    S.msgs.push({
-      role: 'you', text: '', file: { name: entry.file, pdf: false },
-    });
-    S.msgs.push({
-      role: 'run', runId: entry.id, model: entry.model,
-      modelName: entry.model_name || (model ? model.name : entry.model),
-      file: entry.file, status: 'done', steps: [], text: entry.text,
-      annotated: entry.annotated, error: null, elapsed: entry.elapsed,
-      saved: [], docType: null, docTypeName: '',
-      want: (entry.fields || []).length ? { fields: [], extra: '' } : null,
-      fieldRows: (entry.fields || []).length ? entry.fields : null,
-      fieldSummary: entry.field_summary || '',
-      fieldsBusy: false, fieldError: null, reopened: true,
-      tab: (entry.fields || []).length ? 'fields' : null,
-    });
+    // Replaces the thread rather than adding to it: picking one from the
+    // list is opening it, not stacking it on whatever was already there.
+    S.msgs = [
+      { role: 'you', text: '', file: { name: entry.file, pdf: false } },
+      {
+        role: 'run', runId: entry.id, model: entry.model,
+        modelName: entry.model_name || (model ? model.name : entry.model),
+        file: entry.file, status: 'done', steps: [], text: entry.text,
+        annotated: entry.annotated, error: null, elapsed: entry.elapsed,
+        saved: [], docType: null, docTypeName: '',
+        want: (entry.fields || []).length ? { fields: [], extra: '' } : null,
+        fieldRows: (entry.fields || []).length ? entry.fields : null,
+        fieldSummary: entry.field_summary || '',
+        fieldsBusy: false, fieldError: null, reopened: true,
+        tab: (entry.fields || []).length ? 'fields' : null,
+      },
+    ];
+    S.openRun = id;
+    S.file = null;
     render();
   } catch (e) {
-    toast(`Could not reopen that: ${e.message}`);
+    toast(`Could not open that: ${e.message}`);
   }
 }
 
@@ -221,6 +228,7 @@ async function forget(id, event) {
   try {
     await api(`/api/history/${id}`, { method: 'DELETE' });
     S.history = S.history.filter((h) => h.id !== id);
+    if (S.openRun === id) { S.msgs = []; S.openRun = null; }
     render();
   } catch (e) {
     toast(e.message);
@@ -520,6 +528,7 @@ function detach() {
 
 function newRun() {
   S.msgs = [];
+  S.openRun = null;
   S.file = null;
   S.prompt = promptFor(modelById(S.model));
   S.promptDirty = false;
@@ -569,6 +578,7 @@ async function run() {
 
   msg.runId = started.id;
   msg.steps = started.steps.map((name, i) => ({ i, name, state: 'wait', note: '' }));
+  S.openRun = started.id;
   render();
 
   const es = new EventSource(`/api/runs/${started.id}/events`);
@@ -616,6 +626,12 @@ async function loadResult(msg) {
     msg.error = e.message;
   }
   finish(msg);
+  // It is remembered now, so put it in the list rather than leaving the
+  // sidebar a refresh behind what the thread is showing.
+  if (msg.status === 'done') {
+    await loadHistory();
+    render();
+  }
   // Fields were asked for, so search the transcript now the read is done.
   if (msg.status === 'done' && msg.want) {
     extractFields(msg, msg.want.fields, msg.want.extra);
@@ -813,57 +829,46 @@ function sidebar() {
     node.append(kg);
   }
 
-  // Runs from this page, then everything read in earlier sessions. The
-  // first list is what you are working on; the second is why you do not
-  // have to read a document twice.
-  const runs = S.msgs.filter((m) => m.role === 'run' && !m.reopened);
-  if (runs.length) {
-    const hg = document.createElement('div');
-    hg.className = 'group';
-    hg.innerHTML = '<div class="group-label">This session</div>';
-    const list = document.createElement('div');
-    list.className = 'history';
-    runs.slice().reverse().forEach((r) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'history-item';
-      b.innerHTML = '<span class="dot"></span><span></span>';
-      b.querySelector('span:last-child').textContent =
-        `${r.file} to ${r.modelName}`;
-      b.title = b.querySelector('span:last-child').textContent;
-      b.onclick = () => {
-        const card = document.querySelector(`[data-run="${r.runId}"]`);
-        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      };
-      list.append(b);
-    });
-    hg.append(list);
-    node.append(hg);
+  // One list of runs, the way a chat sidebar lists conversations: newest
+  // first, bucketed by when, the open one marked, and a filter once there
+  // are enough of them to need one. A run joins it the moment it finishes.
+  const needle = S.search.trim().toLowerCase();
+  const matching = S.history.filter(
+    (h) => !needle || h.file.toLowerCase().includes(needle)
+           || (h.model_name || '').toLowerCase().includes(needle));
+
+  if (S.history.length > 6 || needle) {
+    const find = document.createElement('div');
+    find.className = 'find';
+    const input = document.createElement('input');
+    input.id = 'run-search';
+    input.type = 'search';
+    input.placeholder = 'Search runs';
+    input.value = S.search;
+    input.oninput = () => { S.search = input.value; render(); };
+    find.append(input);
+    node.append(find);
   }
 
-  const open = new Set(S.msgs.filter((m) => m.role === 'run')
-                             .map((m) => m.runId));
-  const earlier = S.history.filter((h) => !open.has(h.id));
-  if (earlier.length) {
-    const eg = document.createElement('div');
-    eg.className = 'group';
-    eg.innerHTML = '<div class="group-label">Earlier</div>';
-    let day = null;
-    earlier.forEach((h) => {
+  if (matching.length) {
+    const list = document.createElement('div');
+    list.className = 'group runs';
+    let bucket = null;
+    matching.forEach((h) => {
       const label = dayOf(h.at);
-      if (label !== day) {
-        day = label;
+      if (label !== bucket) {
+        bucket = label;
         const head = document.createElement('div');
-        head.className = 'history-day';
-        head.innerHTML = '<span class="dot"></span><span></span>';
-        head.querySelector('span:last-child').textContent = label;
-        eg.append(head);
+        head.className = 'run-bucket';
+        head.textContent = label;
+        list.append(head);
       }
       const row = document.createElement('div');
       row.className = 'past-row';
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'history-item past';
+      b.setAttribute('aria-current', String(S.openRun === h.id));
       b.innerHTML = '<span class="past-text"><span class="past-file"></span>'
         + '<span class="past-sub"></span></span>';
       b.querySelector('.past-file').textContent = h.file;
@@ -876,13 +881,18 @@ function sidebar() {
       const x = document.createElement('button');
       x.type = 'button';
       x.className = 'past-forget';
-      x.setAttribute('aria-label', `Forget ${h.file}`);
+      x.setAttribute('aria-label', `Delete ${h.file}`);
       x.innerHTML = svg('x', 13);
       x.onclick = (e) => forget(h.id, e);
       row.append(x);
-      eg.append(row);
+      list.append(row);
     });
-    node.append(eg);
+    node.append(list);
+  } else if (needle) {
+    const none = document.createElement('div');
+    none.className = 'muted-line no-runs';
+    none.textContent = `Nothing matching "${S.search.trim()}".`;
+    node.append(none);
   }
 
   const foot = document.createElement('div');

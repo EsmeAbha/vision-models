@@ -185,7 +185,7 @@ async function main() {
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
     + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
-    + ' toggleGroup, isFolded };';
+    + ' toggleGroup, isFolded, reopen, newRun };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
   globalThis.__sel = () => `${t.S.model}|${t.S.skill}`;
@@ -336,35 +336,90 @@ async function main() {
   assert.ok(!seen.includes('Tideform') && !seen.includes('Teal'),
             'the theme buttons are still drawn');
 
-  // ---- earlier sessions are listed and can be reopened -------------------
+  // ---- the run list behaves like a chat sidebar ---------------------------
+  const now = new Date().toISOString();
+  const old = new Date(Date.now() - 3 * 86400000).toISOString();
   t.S.history = [
     { id: 'aaaaaaaa11', file: 'utility_bill.pdf', model: 'paddleocr_vl',
-      model_name: 'PaddleOCR-VL', at: new Date().toISOString(),
-      elapsed: 71.4, chars: 1684, fields: 2 },
+      model_name: 'PaddleOCR-VL', at: now, elapsed: 71, chars: 1684, fields: 2 },
     { id: 'bbbbbbbb22', file: 'statement.pdf', model: 'paddleocr_vl',
-      model_name: 'PaddleOCR-VL', at: '2020-01-02T09:00:00', elapsed: 9,
-      chars: 21520, fields: 6 },
+      model_name: 'PaddleOCR-VL', at: old, elapsed: 9, chars: 21520, fields: 6 },
   ];
+  t.S.openRun = null;
+  t.S.search = '';
   t.render();
   seen = visible(app);
-  assert.match(seen, /Earlier/, 'no Earlier section');
-  assert.match(seen, /utility_bill\.pdf/, 'a remembered run is not listed');
+  assert.match(seen, /utility_bill\.pdf/, 'a run is not listed');
   assert.match(seen, /statement\.pdf/, 'an older run is not listed');
-  assert.match(seen, /Today/, 'runs are not grouped by day');
-  assert.equal(t.dayOf(new Date().toISOString()), 'Today');
-  assert.equal(app.querySelectorAll('.past-forget').length, 2,
-               'no way to forget a remembered run');
 
-  // A run already open in the thread is not offered again below it.
-  t.S.msgs.push({ role: 'run', runId: 'aaaaaaaa11', modelName: 'PaddleOCR-VL',
-                  file: 'utility_bill.pdf', status: 'done', steps: [],
-                  text: 'x', want: null, fieldRows: null, saved: [],
-                  elapsed: 1, error: null, annotated: null, tab: null,
-                  docTypeName: '', reopened: true });
+  // Bucketed by when, the way conversations are.
+  assert.equal(t.dayOf(now), 'Today');
+  assert.equal(t.dayOf(old), 'Previous 7 days');
+  assert.equal(t.dayOf(new Date(Date.now() - 40 * 86400000).toISOString())
+                 .match(/^[A-Z]/) !== null, true, 'an old run has no month label');
+  const buckets = app.querySelectorAll('.run-bucket').map((b) => visible(b));
+  assert.deepEqual(buckets, ['Today', 'Previous 7 days'], `buckets were ${buckets}`);
+
+  // There is one list, not a separate "this session" one beside it.
+  assert.ok(!seen.includes('This session'),
+            'the old second list is still drawn');
+
+  // The open run is marked, the way a selected conversation is.
+  const rows = () => app.querySelectorAll('.history-item.past');
+  assert.ok(rows().every((r) => r.getAttribute('aria-current') === 'false'),
+            'something is marked open before anything was opened');
+  t.S.openRun = 'bbbbbbbb22';
   t.render();
-  assert.equal(app.querySelectorAll('.past-row').length, 1,
-               'a run already open is still listed as earlier');
-  t.S.msgs.length = 0;
+  const marked = rows().filter((r) => r.getAttribute('aria-current') === 'true');
+  assert.equal(marked.length, 1, 'the open run is not marked');
+  assert.match(visible(marked[0]), /statement\.pdf/, 'the wrong run is marked');
+
+  // Opening replaces the thread rather than stacking onto it.
+  t.S.msgs = [{ role: 'you', text: 'leftover', file: null },
+              { role: 'run', runId: 'zzz', modelName: 'x', file: 'old.pdf',
+                status: 'done', steps: [], text: 'old', want: null,
+                fieldRows: null, saved: [], elapsed: 1, error: null,
+                annotated: null, tab: null, docTypeName: '' }];
+  const realFetch3 = sandbox.fetch;
+  sandbox.fetch = () => Promise.resolve({
+    ok: true, status: 200,
+    json: () => Promise.resolve({
+      id: 'aaaaaaaa11', file: 'utility_bill.pdf', model: 'paddleocr_vl',
+      model_name: 'PaddleOCR-VL', text: 'fresh transcript', annotated: null,
+      elapsed: 71, fields: [], field_summary: '' }),
+  });
+  await t.reopen('aaaaaaaa11');
+  sandbox.fetch = realFetch3;
+  assert.equal(t.S.openRun, 'aaaaaaaa11', 'opening did not mark the run');
+  assert.equal(t.S.msgs.length, 2, 'opening stacked onto the old thread');
+  assert.ok(!visible(app).includes('old.pdf'),
+            'the previous thread is still on screen');
+  // Fields leads the tabs, so the transcript is not the visible one. Assert
+  // the opened run is what the thread holds, and that its file is on screen.
+  assert.equal(t.S.msgs[1].text, 'fresh transcript',
+               'the opened run brought no transcript');
+  assert.equal(t.S.msgs[1].runId, 'aaaaaaaa11');
+  assert.match(visible(app), /utility_bill\.pdf/,
+               'the opened run is not shown in the thread');
+
+  // New run clears both.
+  t.newRun();
+  assert.equal(t.S.openRun, null, 'New run left a run marked open');
+  assert.equal(t.S.msgs.length, 0, 'New run left the thread behind');
+
+  // Searching filters the list.
+  t.S.history = t.S.history.concat(Array.from({ length: 6 }, (_, i) => ({
+    id: `cccccccc${i}0`, file: `other_${i}.pdf`, model: 'paddleocr_vl',
+    model_name: 'DeepSeek-OCR', at: now, elapsed: 1, chars: 10, fields: 0 })));
+  t.S.search = 'statement';
+  t.render();
+  assert.equal(app.querySelectorAll('.history-item.past').length, 1,
+               'the filter did not narrow the list');
+  assert.match(visible(app), /statement\.pdf/);
+  t.S.search = 'nothing here';
+  t.render();
+  assert.match(visible(app), /Nothing matching/, 'an empty filter says nothing');
+  t.S.search = '';
   t.S.history = [];
   t.render();
 

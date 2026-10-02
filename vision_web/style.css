@@ -416,6 +416,49 @@ svg { flex-shrink: 0; }
   white-space: nowrap;
 }
 
+/* The run list, laid out the way a chat sidebar lists conversations. */
+.find { padding: 2px 2px 8px; }
+
+.find input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--s-line-2);
+  border-radius: 9px;
+  background: var(--s-deep);
+  color: var(--s-text-2);
+  font-size: 12px;
+  outline: none;
+}
+
+.find input::placeholder { color: var(--s-faint); }
+.find input:focus { border-color: var(--accent); background: var(--s-bg); }
+
+.group.runs { gap: 1px; }
+
+.run-bucket {
+  padding: 12px 8px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--s-faint);
+}
+
+.run-bucket:first-child { padding-top: 2px; }
+
+/* The open run is marked the way a selected conversation is. */
+.history-item.past[aria-current="true"] {
+  background: var(--s-raise);
+  color: var(--s-text);
+}
+
+.history-item.past[aria-current="true"] .past-file {
+  color: var(--s-text);
+  font-weight: 500;
+}
+
+.no-runs { padding: 4px 8px; }
+
 /* Earlier sessions: a file name with its reader underneath, and a way to
  * forget one. The row is a hit target plus a small x, so the x cannot be
  * hit by accident while aiming at the file. */
