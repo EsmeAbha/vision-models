@@ -174,7 +174,8 @@ async function main() {
   const source = fs.readFileSync('vision_web/app.js', 'utf8')
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
-    + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted };';
+    + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
+    + ' extractFields };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
 
@@ -425,6 +426,59 @@ async function main() {
   t.S.deal = null;
   t.S.addField = '';
   t.S.addCell = '';
+  t.render();
+
+  // ---- reading a document into an open deal fills it ----------------------
+  // Confirming a mapping did nothing by itself, so a deal could sit at
+  // "0 of 3 cells filled" with a workbook that downloaded empty and no
+  // sign of what had been missed.
+  t.S.deal = {
+    id: 'sample', name: 'sample', confirmed: true, filled: {}, history: [],
+    mapping: [{ field: 'Account number', cell: 'D7', sheet: 'Utility Recon',
+                label_cell: 'D6', label_text: 'Account Number',
+                matched: 'account number', how: 'under the label' }],
+  };
+  t.render();
+  assert.match(visible(app), /Nothing read into it yet/,
+               'an empty deal does not say what to do about it');
+
+  const into = {
+    role: 'run', runId: 'into-deal', model: bank.reader,
+    modelName: 'PaddleOCR-VL', file: 'bill.pdf', status: 'done', steps: [],
+    text: '# bill', annotated: null, error: null, elapsed: 7, saved: [],
+    docType: null, docTypeName: '', want: null, fieldRows: null,
+    fieldSummary: '', fieldsBusy: false, fieldError: null, tab: null,
+  };
+  t.S.msgs.length = 0;
+  t.S.msgs.push(into);
+
+  const seenCalls = [];
+  const realFetch2 = sandbox.fetch;
+  sandbox.fetch = (url, opts) => {
+    seenCalls.push(url);
+    const body = url.endsWith('/fields')
+      ? { rows: [{ field: 'Account number', value: 'EL-88342710',
+                   verdict: 'yes', where: 'beside the label', evidence: 'x' }],
+          summary: '1 of 1 found.' }
+      : url.endsWith('/apply')
+        ? { written: [{ field: 'Account number', cell: 'D7',
+                        value: 'EL-88342710' }],
+            skipped: [], clashed: [], download: '/api/deals/sample/workbook' }
+        : { id: 'sample', name: 'sample', confirmed: true, mapping: [],
+            filled: { 'Account number': {} }, history: [{ source: 'bill.pdf' }] };
+    return Promise.resolve({ ok: true, status: 200,
+                             json: () => Promise.resolve(body) });
+  };
+  await t.extractFields(into, ['Account number'], '');
+  sandbox.fetch = realFetch2;
+
+  assert.ok(seenCalls.some((u) => u.endsWith('/fields')), 'nothing was extracted');
+  assert.ok(seenCalls.some((u) => u.endsWith('/apply')),
+            'the document was never put into the open deal');
+  assert.ok(into.dealResult, 'no record of what went into the deal');
+  assert.equal(into.dealResult.written[0].cell, 'D7');
+
+  t.S.deal = null;
   t.render();
 
   // ---- an error is shown as an error, not swallowed -----------------------

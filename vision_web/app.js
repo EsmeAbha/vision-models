@@ -366,6 +366,13 @@ async function extractFields(msg, wanted, extra) {
   }
   msg.fieldsBusy = false;
   render();
+
+  // A deal is open, so this document was read into it. Confirming a mapping
+  // used to do nothing by itself: you then had to find a button on the
+  // Fields tab, and skipping it left the workbook empty with no sign why.
+  if (S.deal && msg.fieldRows && msg.fieldRows.some((r) => r.value)) {
+    await addToDeal(msg);
+  }
 }
 
 async function attach(file) {
@@ -1228,10 +1235,14 @@ function dealPanel() {
   const title = document.createElement('div');
   title.innerHTML = '<strong></strong><small></small>';
   title.querySelector('strong').textContent = S.deal.name;
+  const done = Object.keys(S.deal.filled || {}).length;
+  const seen = (S.deal.history || []).length;
   title.querySelector('small').textContent = S.deal.confirmed
-    ? `${Object.keys(S.deal.filled || {}).length} of `
-      + `${S.deal.mapping.length} cells filled, from `
-      + `${(S.deal.history || []).length} document(s)`
+    ? (seen
+        ? `${done} of ${S.deal.mapping.length} cells filled, from `
+          + `${seen} document(s)`
+        : `Nothing read into it yet. Add a document below and run it: its `
+          + `fields land in these ${S.deal.mapping.length} cells.`)
     : 'Check where each field will go, correct anything wrong, then confirm.';
   head.append(title);
 
