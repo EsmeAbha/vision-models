@@ -52,6 +52,7 @@ const S = {
   templates: [],   // spreadsheets the found fields can be dropped into
   history: [],     // documents read in earlier sessions
   expanded: [],    // rows opened to show their full detail
+  collapsed: [],   // sidebar groups folded shut
   deals: [],       // deal workbooks on disk
   deal: null,      // the deal documents are being read into, if any
   newDeal: false,  // the new-deal form is open
@@ -368,6 +369,29 @@ function addMappingRow() {
 }
 
 const isOpen = (key) => S.expanded.includes(key);
+const isFolded = (key) => S.collapsed.includes(key);
+
+function toggleGroup(key) {
+  S.collapsed = isFolded(key) ? S.collapsed.filter((k) => k !== key)
+                              : S.collapsed.concat([key]);
+  render();
+}
+
+/* A group heading that folds its list away. The count stays visible when
+ * shut, so folding one does not hide that anything is there. */
+function groupHeader(key, label, count, icon) {
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'group-label';
+  head.setAttribute('aria-expanded', String(!isFolded(key)));
+  head.innerHTML = `<span class="fold">${svg('chev', 11)}</span>`
+    + (icon ? `<span class="spark">${svg(icon, 12)}</span>` : '')
+    + '<span class="group-name"></span><span class="group-count"></span>';
+  head.querySelector('.group-name').textContent = label;
+  head.querySelector('.group-count').textContent = count;
+  head.onclick = () => toggleGroup(key);
+  return head;
+}
 
 function toggleExpanded(key, event) {
   if (event) event.stopPropagation();
@@ -729,8 +753,8 @@ function sidebar() {
   // models
   const mg = document.createElement('div');
   mg.className = 'group';
-  mg.innerHTML = '<div class="group-label">Models</div>';
-  S.models.forEach((m) => {
+  mg.append(groupHeader('models', 'Models', S.models.length, null));
+  if (!isFolded('models')) S.models.forEach((m) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'pick model';
@@ -761,8 +785,8 @@ function sidebar() {
   if (S.skills.length) {
     const kg = document.createElement('div');
     kg.className = 'group';
-    kg.innerHTML = `<div class="group-label"><span class="spark">${svg('spark', 12)}</span>Skills</div>`;
-    S.skills.forEach((k) => {
+    kg.append(groupHeader('skills', 'Skills', S.skills.length, 'spark'));
+    if (!isFolded('skills')) S.skills.forEach((k) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'pick skill';
@@ -879,20 +903,6 @@ function hello() {
     + '<p>Add an image or a PDF, pick a skill or a model, and run it. '
     + 'The models sit on your own GPU, and the first switch to one takes '
     + 'about 10 to 20 seconds while its weights load.</p>';
-  const row = document.createElement('div');
-  row.className = 'starters';
-  S.skills.slice(0, 4).forEach((k) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'starter';
-    b.innerHTML = `<span class="pick-icon" style="width:28px;height:28px;border-radius:7px">${svg(k.icon, 15)}</span>`
-      + '<span><b></b><small></small></span>';
-    b.querySelector('b').textContent = k.name;
-    b.querySelector('small').textContent = k.model_short;
-    b.onclick = () => pickSkill(k.id);
-    row.append(b);
-  });
-  if (row.children.length) d.append(row);
   return d;
 }
 

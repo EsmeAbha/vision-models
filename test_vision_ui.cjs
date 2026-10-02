@@ -179,7 +179,8 @@ async function main() {
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
     + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
-    + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen };';
+    + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
+    + ' toggleGroup, isFolded };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
   globalThis.__sel = () => `${t.S.model}|${t.S.skill}`;
@@ -225,6 +226,53 @@ async function main() {
             'rows are not laid out as a head plus a detail line');
   assert.equal(app.querySelectorAll('.pick-aside').length, 0,
                'a detail is still hung off the right edge');
+
+  // ---- a group heading folds its list away --------------------------------
+  assert.ok(!t.isFolded('models'), 'Models starts folded');
+  assert.equal(app.querySelectorAll('.pick.model').length, t.S.models.length,
+               'the models are not all listed');
+
+  t.toggleGroup('models');
+  seen = visible(app);
+  assert.ok(t.isFolded('models'), 'Models did not fold');
+  assert.equal(app.querySelectorAll('.pick.model').length, 0,
+               'folding Models left its rows on screen');
+  // The heading and its count stay, so a folded group does not read as
+  // empty. Scoped to the heading: a bare "2" appears elsewhere on the page.
+  const heading = (name) => app.querySelectorAll('.group-label')
+    .find((h) => visible(h.querySelector('.group-name')) === name);
+  const modelsHead = heading('Models');
+  assert.ok(modelsHead, 'the heading went with the rows');
+  assert.equal(modelsHead.getAttribute('aria-expanded'), 'false',
+               'a folded heading does not say it is folded');
+  assert.equal(visible(modelsHead.querySelector('.group-count')),
+               String(t.S.models.length),
+               'a folded group does not say how many it holds');
+  // Folding one must not fold the other.
+  assert.equal(app.querySelectorAll('.pick.skill').length, t.S.skills.length,
+               'folding Models also folded Skills');
+
+  t.toggleGroup('models');
+  assert.equal(app.querySelectorAll('.pick.model').length, t.S.models.length,
+               'Models did not come back');
+
+  t.toggleGroup('skills');
+  assert.equal(app.querySelectorAll('.pick.skill').length, 0,
+               'folding Skills left its rows on screen');
+  assert.equal(app.querySelectorAll('.pick.model').length, t.S.models.length,
+               'folding Skills also folded Models');
+  t.toggleGroup('skills');
+
+  // ---- the empty state no longer repeats the skills -----------------------
+  // Four buttons there duplicated the sidebar list for no gain.
+  t.S.msgs.length = 0;
+  t.render();
+  seen = visible(app);
+  assert.match(seen, /Read a document, locally/, 'the empty state is gone');
+  assert.equal(app.querySelectorAll('.starters').length, 0,
+               'the starter buttons are back');
+  assert.equal(app.querySelectorAll('.starter').length, 0,
+               'a starter button is still drawn');
 
   // ---- a row opens to show what is clipped --------------------------------
   // The sidebar is narrow, so a closed row clips both the name and the

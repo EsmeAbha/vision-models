@@ -159,16 +159,38 @@ svg { flex-shrink: 0; }
 
 .group { display: flex; flex-direction: column; gap: 6px; }
 
+/* The heading is the fold control, so it is a button the full width of
+ * the group rather than a label with a target tucked beside it. */
 .group-label {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 6px 4px;
+  width: 100%;
+  padding: 4px 6px;
+  border-radius: 7px;
   font-size: 11px;
   font-weight: 500;
   letter-spacing: .08em;
   text-transform: uppercase;
   color: var(--s-dim);
+  text-align: left;
+}
+
+.group-label:hover { background: var(--s-deep); color: var(--s-text-2); }
+
+.group-name { flex-grow: 1; }
+
+.fold { display: flex; color: var(--s-faint); }
+.fold svg { transition: transform .15s; }
+.group-label[aria-expanded="true"] .fold svg { transform: rotate(90deg); }
+
+.group-count {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--s-deep);
+  color: var(--s-dim);
+  font-size: 10px;
+  letter-spacing: 0;
 }
 
 .group-label .spark { display: flex; color: var(--accent); }
@@ -551,30 +573,6 @@ svg { flex-shrink: 0; }
   line-height: 1.65;
   color: var(--m-dim);
 }
-
-.starters {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  justify-content: center;
-  margin-top: 26px;
-}
-
-.starter {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 14px;
-  border: 1px solid var(--m-line-2);
-  border-radius: 10px;
-  background: var(--m-card);
-  color: var(--m-text-2);
-  font-size: 13px;
-  text-align: left;
-}
-
-.starter:hover { border-color: var(--accent); }
-.starter small { display: block; color: var(--m-dim); font-size: 11px; }
 
 .msg { display: flex; flex-direction: column; gap: 10px; }
 .msg.you { align-items: flex-end; }
