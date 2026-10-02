@@ -4,6 +4,7 @@ import html
 import json
 import itertools
 import collections
+import shlex
 import time
 import atexit
 import shutil
@@ -48,10 +49,23 @@ OCR_WORKERS = {
         "wsl": False,
     },
     "paddleocr_vl": {
+        # CUDA_VISIBLE_DEVICES='' keeps paddle off the card, and it has to.
+        # vLLM already holds a CUDA context there with pinned memory (WSL2
+        # needs that for UVA, and the server will not start without it).
+        # Paddle opening a SECOND context for PP-DocLayoutV3 takes the whole
+        # WSL session down: the worker dies with no traceback and no
+        # faulthandler dump, vLLM dies in the same instant, and the only
+        # symptom upstream is "OCR worker exited unexpectedly".
+        #
+        # So layout detection runs on CPU. Recognition was always the vLLM
+        # server's job, so only the layout pass pays for it; output is
+        # byte-identical either way.
         "cmd": [
-            "wsl.exe", "-e", WSL_PADDLE_PYTHON, "-u",
-            pdf_pages.win_to_wsl(os.path.join(_here, "paddleocr_worker.py")),
-            "--serve",
+            "wsl.exe", "-e", "bash", "-lc",
+            "CUDA_VISIBLE_DEVICES='' " + shlex.quote(WSL_PADDLE_PYTHON)
+            + " -u " + shlex.quote(
+                pdf_pages.win_to_wsl(os.path.join(_here, "paddleocr_worker.py")))
+            + " --serve",
         ],
         "wsl": True,
     },
