@@ -51,6 +51,7 @@ const S = {
   extra: '',       // extra field names typed in by hand
   templates: [],   // spreadsheets the found fields can be dropped into
   history: [],     // documents read in earlier sessions
+  expanded: [],    // rows opened to show their full detail
   deals: [],       // deal workbooks on disk
   deal: null,      // the deal documents are being read into, if any
   newDeal: false,  // the new-deal form is open
@@ -364,6 +365,55 @@ function addMappingRow() {
   S.addField = '';
   S.addCell = '';
   render();
+}
+
+const isOpen = (key) => S.expanded.includes(key);
+
+function toggleExpanded(key, event) {
+  if (event) event.stopPropagation();
+  S.expanded = isOpen(key) ? S.expanded.filter((k) => k !== key)
+                           : S.expanded.concat([key]);
+  render();
+}
+
+/* A row plus its disclosure. The row itself is a button, so the toggle
+ * cannot live inside it: a button inside a button is not valid markup and
+ * browsers disagree about which one a click reaches. */
+function expandable(button, key, detail) {
+  const wrap = document.createElement('div');
+  wrap.className = 'pick-wrap';
+  const row = document.createElement('div');
+  row.className = 'pick-row';
+  row.append(button);
+
+  const more = document.createElement('button');
+  more.type = 'button';
+  more.className = 'pick-more';
+  more.setAttribute('aria-expanded', String(isOpen(key)));
+  more.setAttribute('aria-label', isOpen(key) ? 'Show less' : 'Show more');
+  more.innerHTML = svg('chev', 15);
+  more.onclick = (e) => toggleExpanded(key, e);
+  row.append(more);
+  wrap.append(row);
+
+  if (isOpen(key)) {
+    button.classList.add('open');
+    const box = document.createElement('div');
+    box.className = 'pick-detail';
+    detail.filter(([, v]) => v).forEach(([label, value]) => {
+      const line = document.createElement('div');
+      line.className = 'detail-line';
+      const k = document.createElement('span');
+      k.className = 'detail-key';
+      k.textContent = label;
+      const v = document.createElement('span');
+      v.textContent = value;
+      line.append(k, v);
+      box.append(line);
+    });
+    wrap.append(box);
+  }
+  return wrap;
 }
 
 const templatesFor = (docTypeName) =>
@@ -695,11 +745,15 @@ function sidebar() {
     b.querySelector('.pick-name').textContent = m.name;
     if (m.tag) b.querySelector('.pick-tag').textContent = m.tag;
     b.querySelector('.pick-sub').textContent = m.sub;
-    b.title = m.takes_prompt
-      ? `${m.sub}. Takes a prompt.`
-      : `${m.sub}. Runs a fixed pipeline and takes no prompt.`;
     b.onclick = () => pickModel(m.id);
-    mg.append(b);
+    mg.append(expandable(b, `model:${m.id}`, [
+      ['Does', m.sub],
+      ['Gives', m.tabs.map(([, label]) => label).join(', ')],
+      ['Prompt', m.takes_prompt
+        ? 'Takes one. The skill or document type fills it in.'
+        : 'None. It runs a fixed layout pipeline.'],
+      ['Called', m.label],
+    ]));
   });
   node.append(mg);
 
@@ -716,7 +770,6 @@ function sidebar() {
       // The reader and the speed are the two things worth knowing before
       // picking one, so they read on their own line underneath rather than
       // only in a tooltip nobody hovers.
-      b.title = [k.takes, k.gives, k.speed, k.note].filter(Boolean).join('. ');
       b.innerHTML = `<span class="pick-icon">${svg(k.icon, 15)}</span>`
         + '<span class="pick-text">'
         + '<span class="pick-head"><span class="pick-name"></span>'
@@ -726,7 +779,13 @@ function sidebar() {
       b.querySelector('.pick-tag').textContent = k.model_short;
       b.querySelector('.pick-sub').textContent = k.gives || k.takes || '';
       b.onclick = () => pickSkill(k.id);
-      kg.append(b);
+      kg.append(expandable(b, `skill:${k.id}`, [
+        ['Reader', k.model_short],
+        ['Takes', k.takes],
+        ['Gives', k.gives],
+        ['Speed', k.speed],
+        ['Note', k.note],
+      ]));
     });
     node.append(kg);
   }

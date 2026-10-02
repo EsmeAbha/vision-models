@@ -283,6 +283,61 @@ svg { flex-shrink: 0; }
   white-space: nowrap;
 }
 
+/* A row and its disclosure. The toggle sits outside the row's button,
+ * because a button inside a button is not valid markup. */
+.pick-wrap { display: flex; flex-direction: column; }
+
+.pick-row { display: flex; align-items: stretch; gap: 2px; }
+
+.pick-row .pick { flex: 1 1 auto; min-width: 0; }
+
+.pick-more {
+  flex: 0 0 26px;
+  border-radius: 8px;
+  color: var(--s-faint);
+  display: grid;
+  place-items: center;
+}
+
+.pick-more svg { transition: transform .15s; }
+.pick-more[aria-expanded="true"] svg { transform: rotate(90deg); }
+.pick-more:hover { background: var(--s-deep); color: var(--s-text); }
+
+/* Open, the name is allowed the room it needs. Clipping is only there to
+ * stop a long name pushing a closed row to three lines. */
+.pick.open .pick-name,
+.pick.open .pick-sub {
+  overflow: visible;
+  white-space: normal;
+}
+
+.pick.open .pick-head { flex-wrap: wrap; }
+
+.pick-detail {
+  margin: 2px 0 6px 42px;
+  padding: 9px 11px;
+  border-left: 2px solid var(--s-line-2);
+  border-radius: 0 8px 8px 0;
+  background: var(--s-deep);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.detail-line {
+  display: flex;
+  gap: 9px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--s-dim-2);
+}
+
+.detail-key {
+  flex: 0 0 48px;
+  color: var(--s-dim);
+  font-weight: 500;
+}
+
 /* session history, with the timeline spine the canvas draws */
 .history { position: relative; display: flex; flex-direction: column; gap: 2px; }
 

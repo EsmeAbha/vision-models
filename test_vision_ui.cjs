@@ -144,6 +144,8 @@ function visible(node) {
   return node.textContent.replace(/\s+/g, ' ').trim();
 }
 
+const S_selected = () => globalThis.__sel ? globalThis.__sel() : null;
+
 async function main() {
   const app = new Node('div');
   app.id = 'app';
@@ -177,9 +179,10 @@ async function main() {
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
     + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
-    + ' extractFields, dayOf, loadHistory };';
+    + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
+  globalThis.__sel = () => `${t.S.model}|${t.S.skill}`;
 
   // boot() is already running; wait for the three catalogues to arrive.
   for (let i = 0; i < 100 && !t.S.models.length; i++) {
@@ -222,6 +225,49 @@ async function main() {
             'rows are not laid out as a head plus a detail line');
   assert.equal(app.querySelectorAll('.pick-aside').length, 0,
                'a detail is still hung off the right edge');
+
+  // ---- a row opens to show what is clipped --------------------------------
+  // The sidebar is narrow, so a closed row clips both the name and the
+  // detail. Nothing should be reachable only by reading a tooltip.
+  const skill = t.S.skills[0];
+  const key = `skill:${skill.id}`;
+  assert.ok(!t.isOpen(key), 'a row starts open');
+  assert.equal(app.querySelectorAll('.pick-detail').length, 0,
+               'a detail is showing before anything was opened');
+
+  const toggles = app.querySelectorAll('.pick-more');
+  assert.equal(toggles.length, t.S.models.length + t.S.skills.length,
+               'not every row has a disclosure');
+
+  const before = S_selected();
+  t.toggleExpanded(key);
+  seen = visible(app);
+  assert.ok(t.isOpen(key), 'the row did not open');
+  assert.equal(app.querySelectorAll('.pick-detail').length, 1,
+               'opening showed no detail');
+  for (const [label, value] of [['Takes', skill.takes], ['Gives', skill.gives],
+                                ['Speed', skill.speed], ['Note', skill.note]]) {
+    if (!value) continue;
+    assert.ok(seen.includes(label), `the open row has no ${label} line`);
+    assert.ok(seen.includes(value.slice(0, 40)),
+              `${label} is still truncated when open`);
+  }
+  // Opening must not also pick the skill: the toggle is its own control.
+  assert.equal(S_selected(), before,
+               'opening a row changed what was selected');
+
+  t.toggleExpanded(key);
+  assert.ok(!t.isOpen(key), 'the row did not close again');
+  assert.equal(app.querySelectorAll('.pick-detail').length, 0,
+               'the detail stayed after closing');
+
+  // Models open too, and say what they give back.
+  const model = t.S.models[0];
+  t.toggleExpanded(`model:${model.id}`);
+  seen = visible(app);
+  assert.match(seen, /Prompt/, 'an open model does not say whether it takes one');
+  assert.ok(seen.includes(model.label), 'an open model does not give its full name');
+  t.toggleExpanded(`model:${model.id}`);
 
   // ---- no theme switcher, and only one palette ---------------------------
   assert.equal(app.querySelectorAll('.theme-row').length, 0,
