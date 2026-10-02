@@ -1,0 +1,20 @@
+{
+  "name": "Bank statement summary",
+  "doc_type": "Bank statement",
+  "workbook": "bank-statement.xlsx",
+  "sheet": "Summary",
+  "cells": {
+    "Account number": "B4",
+    "Statement date": "B5",
+    "Starting balance": "B6",
+    "Ending balance": "B7",
+    "Total debits": "B8",
+    "Total credits": "B9"
+  },
+  "as_number": [
+    "Starting balance",
+    "Ending balance",
+    "Total debits",
+    "Total credits"
+  ]
+}

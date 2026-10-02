@@ -1,0 +1,20 @@
+{
+  "name": "Utility bill summary",
+  "doc_type": "Utility bill",
+  "workbook": "utility-bill.xlsx",
+  "sheet": "Summary",
+  "cells": {
+    "Provider name": "B4",
+    "Account number": "B5",
+    "Billing date": "B6",
+    "Due date": "B7",
+    "Service period": "B8",
+    "Total charges": "B9",
+    "Meter reading": "B10",
+    "Usage": "B11"
+  },
+  "as_number": [
+    "Total charges",
+    "Usage"
+  ]
+}
