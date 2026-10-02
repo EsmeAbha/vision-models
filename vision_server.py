@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -72,6 +73,61 @@ MODEL_META = {
 _runs: dict = {}
 _uploads: dict = {}
 _state_lock = threading.Lock()
+
+# Both of these used to grow for as long as the server ran. An upload keeps a
+# temp folder on disk and a run keeps its whole transcript in memory, so a
+# long session leaked both. Finished runs are on disk in run_history/ and are
+# re-read from there when one is reopened, so dropping them here costs
+# nothing. 642 stale upload folders, 642MB, were sitting in Temp before this.
+MAX_UPLOADS = 40
+MAX_RUNS = 100
+# Anything older than this in Temp is from a previous run of the server.
+STALE_HOURS = 6
+
+
+def _evict_uploads():
+    """Drop the oldest uploads and delete their folders.
+
+    An upload a run is still reading is left alone, however old it is.
+    """
+    busy = {r.get("upload") for r in _runs.values()
+            if r.get("status") == "running"}
+    for fid in list(_uploads)[:-MAX_UPLOADS or None]:
+        if len(_uploads) <= MAX_UPLOADS or fid in busy:
+            continue
+        entry = _uploads.pop(fid)
+        shutil.rmtree(entry.get("folder", ""), ignore_errors=True)
+
+
+def _evict_runs():
+    for rid in list(_runs)[:-MAX_RUNS or None]:
+        if len(_runs) <= MAX_RUNS:
+            break
+        if _runs[rid].get("status") == "running":
+            continue
+        _runs.pop(rid, None)
+
+
+def sweep_temp(hours=STALE_HOURS):
+    """Remove upload and page-render folders left by an earlier server.
+
+    Nothing here survives a restart: an upload is only useful while the run
+    that reads it is alive, and rendered pages only until they are read.
+    """
+    cutoff = time.time() - hours * 3600
+    root = tempfile.gettempdir()
+    removed = 0
+    for name in os.listdir(root):
+        if not name.startswith(("vision_up_", "vision_pdf_")):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 app = FastAPI(docs_url=None, redoc_url=None)
 app.mount("/assets", StaticFiles(directory=WEB), name="assets")
@@ -183,6 +239,7 @@ async def api_upload(file: UploadFile = File(...)):
              "folder": str(folder), "pdf": is_pdf, "pages": pages}
     with _state_lock:
         _uploads[fid] = entry
+        _evict_uploads()
     return {"id": fid, "name": name, "pdf": is_pdf, "pages": pages,
             "preview": None if is_pdf else f"/api/files/{fid}/preview"}
 
@@ -221,8 +278,10 @@ def api_run(req: RunReq):
            "error": None, "started": time.time(), "elapsed": None,
            "events": queue.Queue(), "saved": [],
            "fields": [], "field_summary": "", "filled": None}
+    run["upload"] = req.file_id
     with _state_lock:
         _runs[rid] = run
+        _evict_runs()
 
     threading.Thread(target=_do_run, args=(rid, upload, req),
                      daemon=True).start()
@@ -242,6 +301,7 @@ def _do_run(rid, upload, req):
         run["steps"].sort(key=lambda s: s["i"])
         run["events"].put({"type": "step", **entry})
 
+    page_dir = None
     try:
         # Rasterise the PDF BEFORE the model loads, and outside the lock since
         # it needs no GPU. Loading paddle pushes system commit to its ceiling
@@ -250,7 +310,8 @@ def _do_run(rid, upload, req):
         # MemoryError while Windows is still growing a lazily-sized page file.
         # Rendering first keeps that allocation out of the spike, which is the
         # difference between the first run working and needing a retry.
-        pages = _render_pdf_pages(upload, req) if upload["pdf"] else None
+        pages, page_dir = (_render_pdf_pages(upload, req) if upload["pdf"]
+                           else (None, None))
 
         # Serialises runs started here -- one GPU, one at a time. It does NOT
         # reach a separate app.py process: a threading.Lock is per-process, so
@@ -286,6 +347,8 @@ def _do_run(rid, upload, req):
         traceback.print_exc()
         run["events"].put({"type": "error", "error": run["error"]})
     finally:
+        if page_dir:
+            shutil.rmtree(page_dir, ignore_errors=True)
         run["events"].put({"type": "end"})
 
 
@@ -297,11 +360,18 @@ def _render_pdf_pages(upload, req):
     well would hand it a list where it expects '1-3'.
     """
     out_dir = tempfile.mkdtemp(prefix="vision_pdf_")
-    rendered = list(pdf_pages.render_pdf(upload["path"], out_dir,
-                                         dpi=req.dpi, pages=req.pages))
+    try:
+        rendered = list(pdf_pages.render_pdf(upload["path"], out_dir,
+                                             dpi=req.dpi, pages=req.pages))
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
     if not rendered:
+        shutil.rmtree(out_dir, ignore_errors=True)
         raise RuntimeError("that PDF rendered no pages")
-    return [(n, p) for n, p, _ in rendered]
+    # The caller deletes out_dir once the pages have been read; they are only
+    # the way in, and 45 of these folders had been left behind in Temp.
+    return [(n, p) for n, p, _ in rendered], out_dir
 
 
 def _read_pages(pages, req, kind):
@@ -692,6 +762,9 @@ def _gradio_is_serving(timeout=1.5):
 
 if __name__ == "__main__":
     import uvicorn
+    swept = sweep_temp()
+    if swept:
+        print(f"removed {swept} stale upload/page folder(s) from Temp")
     if _gradio_is_serving():
         # Both front ends load weights onto the same card and both manage the
         # same WSL vLLM server, and nothing coordinates them across processes.

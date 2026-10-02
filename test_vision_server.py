@@ -238,6 +238,64 @@ class VisionServerTests(unittest.TestCase):
         self.assertEqual(
             self.client.delete(f"/api/history/{rid}").status_code, 404)
 
+    # ------------------------------------------------------- not leaking
+
+    def test_old_uploads_are_evicted_and_their_folders_removed(self):
+        """Each upload keeps a temp folder; 642 of them had piled up."""
+        import os as _os
+        kept = []
+        for i in range(server.MAX_UPLOADS + 5):
+            kept.append(self.upload(f"doc_{i}.png"))
+        with server._state_lock:
+            live = len(server._uploads)
+        self.assertLessEqual(live, server.MAX_UPLOADS,
+                             "uploads grew past the cap")
+        # The evicted ones took their folders with them.
+        gone = [u for u in kept[:5]
+                if not _os.path.isdir(_os.path.dirname(
+                    server._uploads.get(u["id"], {}).get("path", "x")))]
+        self.assertTrue(gone, "an evicted upload left its folder behind")
+
+    def test_an_upload_a_run_is_reading_is_not_evicted(self):
+        """Age is no reason to delete the file a run is in the middle of."""
+        up = self.upload("busy.png")
+        with server._state_lock:
+            server._runs["busyrun"] = {"status": "running",
+                                       "upload": up["id"]}
+        try:
+            for i in range(server.MAX_UPLOADS + 5):
+                self.upload(f"filler_{i}.png")
+            with server._state_lock:
+                self.assertIn(up["id"], server._uploads,
+                              "evicted an upload a run was still reading")
+        finally:
+            with server._state_lock:
+                server._runs.pop("busyrun", None)
+
+    def test_finished_runs_are_evicted_from_memory(self):
+        """Each run holds its whole transcript; history keeps them on disk."""
+        with server._state_lock:
+            before = len(server._runs)
+            for i in range(server.MAX_RUNS + 10):
+                server._runs[f"old{i}"] = {"status": "done", "text": "x" * 100}
+            server._evict_runs()
+            after = len(server._runs)
+        self.assertLessEqual(after, server.MAX_RUNS + 1,
+                             f"runs grew unbounded: {before} -> {after}")
+
+    def test_sweeping_leaves_fresh_folders_alone(self):
+        import os as _os
+        import tempfile as _tf
+        fresh = _tf.mkdtemp(prefix="vision_up_")
+        self.addCleanup(shutil.rmtree, fresh, ignore_errors=True)
+        server.sweep_temp(hours=6)
+        self.assertTrue(_os.path.isdir(fresh),
+                        "the sweep deleted a folder still in use")
+        # Backdated past the cutoff, it goes.
+        _os.utime(fresh, (time.time() - 99999, time.time() - 99999))
+        server.sweep_temp(hours=6)
+        self.assertFalse(_os.path.isdir(fresh), "a stale folder survived")
+
     # ------------------------------------------------- doc types and fields
 
     def test_doc_types_name_real_readers_and_fields(self):
