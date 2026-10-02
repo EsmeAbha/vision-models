@@ -237,5 +237,99 @@ class PropertyIsTheServiceAddress(unittest.TestCase):
         self.assertNotIn("\\", value)
         self.assertEqual(value, "1450 Birch Street Columbus, OH 43215")
 
+class ColumnHeadings(unittest.TestCase):
+    """A heading row must not be read sideways for a value.
+
+    On a real bank statement, asking for "credits" matched the heading row
+    "Date | Description | Debits | Credits | Balance" and returned the next
+    heading along, "Balance", graded as a good answer.
+    """
+
+    STATEMENT = (
+        "STATEMENT OF ACCOUNT\n"
+        "Account Number  BK-7741209\n"
+        "Statement Date  08/31/2026\n"
+        "Date\tDescription\tDebits\tCredits\tBalance\n"
+        "08/02/2026\tCard payment\t45.10\t\t1,204.90\n"
+        "08/09/2026\tSalary\t\t2,300.00\t3,504.90\n"
+        "Total Debits  1,245.10\n"
+        "Total Credits  2,300.00\n"
+    )
+
+    def test_a_heading_is_never_the_value_beside_another_heading(self):
+        for field in ("credits", "debits"):
+            value = fs.find_field(self.STATEMENT, field)[0]
+            self.assertNotIn(value, ("Balance", "Credits", "Debits",
+                                     "Description", "Date"),
+                             f"{field} picked up a column heading")
+
+    def test_bare_credits_and_debits_are_money(self):
+        self.assertEqual(fs.shape_of("credits"), "money")
+        self.assertEqual(fs.shape_of("debits"), "money")
+        self.assertEqual(fs.shape_of("Total charges"), "money")
+
+    def test_the_totals_are_found_either_way_you_name_them(self):
+        for field in ("credits", "Total credits"):
+            self.assertEqual(fs.find_field(self.STATEMENT, field)[0], "2,300.00")
+        for field in ("debits", "Total debits"):
+            self.assertEqual(fs.find_field(self.STATEMENT, field)[0], "1,245.10")
+
+    def test_two_cells_still_read_sideways(self):
+        """The guard is for heading rows, not for every wordy line.
+
+        "Appraiser  Jane Okafor" has no digits either, and its value is the
+        cell beside the label.
+        """
+        value, _, _ = fs.find_field("Appraiser  Jane Okafor\n", "Appraiser")
+        self.assertEqual(value, "Jane Okafor")
+
+    DETAIL = (
+        "TRANSACTION DETAIL\n"
+        "Date\tDescription\tCheck/Ref\tDebits\tCredits\tBalance\n"
+        "08/01\tACH DEBIT MAPLE RENT\t\t1,450.00\t\t2,800.75\n"
+        "08/31\tENDING BALANCE\t\t3,880.32\t5,569.77\t5,940.20\n"
+    )
+
+    def test_a_labelled_row_is_read_under_the_column_that_names_it(self):
+        """The row reads 3,880.32 | 5,569.77 | 5,940.20 under Debits,
+        Credits, Balance. The balance is the last of those, not the first
+        number after the label."""
+        value, evidence, _ = fs.find_field(self.DETAIL, "Ending balance")
+        self.assertEqual(value, "5,940.20")
+        self.assertIn("Balance column", evidence)
+
+    def test_empty_cells_do_not_shift_the_columns(self):
+        """Check/Ref is blank on that row, so counting from the left lands a
+        column early. Counting from the right is what keeps it honest."""
+        self.assertNotEqual(fs.find_field(self.DETAIL, "Ending balance")[0],
+                            "3,880.32")
+
+    SUMMARY = (
+        "ACCOUNT SUMMARY\n"
+        "Beginning Balance on 08/01/2026\t$4,250.75\n"
+        "Deposits and Other Credits (6)\t+ $5,569.77\n"
+        "Withdrawals and Other Debits (29)\t- $3,880.32\n"
+        "Ending Balance on 08/31/2026\t$5,940.20\n"
+    )
+
+    def test_a_count_in_brackets_does_not_hide_the_amount(self):
+        """"Deposits and Other Credits (6)" put a bracket where the
+        separator was expected, so the amount beside it was never reached."""
+        self.assertIn("5,569.77", fs.find_field(self.SUMMARY, "Total credits")[0])
+        self.assertIn("3,880.32", fs.find_field(self.SUMMARY, "Total debits")[0])
+
+    def test_the_separator_rule_still_rejects_a_heading(self):
+        """Stepping over a bracket must not weaken the rule it sits in:
+        "Meter Reading Information" is a heading, not a value."""
+        text = "Meter Reading Information\nMeter No  MTR-5520918\n"
+        self.assertEqual(fs.find_field(text, "Meter reading")[0], "MTR-5520918")
+
+    def test_a_heading_row_is_still_read_downwards(self):
+        """Dropping the sideways move must not lose the column below it."""
+        text = ("Meter\tReading\tUsage\n"
+                "MTR-5520918\t41230\t675\n")
+        self.assertEqual(fs.find_field(text, "Usage")[0], "675")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

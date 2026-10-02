@@ -132,6 +132,13 @@ def _value_on_line(line, label_key):
     if not match:
         return ""
     rest = line[match.end():]
+    # A statement often prints a count straight after the label: "Deposits
+    # and Other Credits (6)   + $5,569.77". Step over the bracket so the
+    # separator rule below still applies to what follows, instead of failing
+    # on the "(" and losing the amount entirely.
+    bracket = re.match(r"\s*\([^)]{0,24}\)", rest)
+    if bracket:
+        rest = rest[bracket.end():]
     separator = re.match(r"\s*[:\-\u2013\u2014]\s*|\t+|\s{2,}", rest)
     if not separator:
         return ""
@@ -198,8 +205,15 @@ def shape_of(field):
     if field in SHAPES:
         return SHAPES[field]
     low = field.lower()
+    # Plurals are listed out rather than stemmed: the match below is on whole
+    # words, so "charge" never covers "charges". A bare "credits" with no
+    # shape at all was the bug that put a column heading in a value cell.
     for word, shape in (("date", "date"), ("balance", "money"), ("amount", "money"),
-                        ("charge", "money"), ("value", "money"), ("total", "money"),
+                        ("charge", "money"), ("charges", "money"),
+                        ("credit", "money"), ("credits", "money"),
+                        ("debit", "money"), ("debits", "money"),
+                        ("payment", "money"), ("payments", "money"),
+                        ("value", "money"), ("total", "money"),
                         ("rate", "rate"), ("number", "code"), ("no", "code")):
         if word in low.split() or low.endswith(" " + word):
             return shape
@@ -222,6 +236,35 @@ def _is_label_like(line, all_keys):
     return not any(c.isdigit() for c in line) and len(flat.split()) <= 6
 
 
+def _header_above(lines, index, want):
+    """The nearest row of column headings above this one, if there is one.
+
+    A heading row carries no digits and at least as many cells as the row it
+    heads -- empty cells are dropped when splitting, so a data row is often
+    the shorter of the two.
+    """
+    for back in range(1, 41):
+        at = index - back
+        if at < 0:
+            return None
+        cells = _cells(lines[at])
+        if len(cells) < 3 or any(c.isdigit() for c in lines[at]):
+            continue
+        return cells if len(cells) >= want else None
+    return None
+
+
+def _align_right(head, row):
+    """Pair a data row with its headings, counting from the right.
+
+    Dropped empty cells shift everything left, so counting from the left
+    misreads a ragged row. On a statement the trailing money columns are the
+    ones that are always filled, and those are the ones being asked for.
+    """
+    pairs = list(zip(reversed(head), reversed(row)))
+    return [(h, c) for h, c in reversed(pairs)]
+
+
 def _candidates(lines, index, key, all_keys):
     """Everywhere the value for this label might have ended up.
 
@@ -233,16 +276,43 @@ def _candidates(lines, index, key, all_keys):
     pattern = _label_pattern(key)
     cells = _cells(line)
 
+    # Three or more cells with no digits anywhere is a row of column headings,
+    # not data: the cell beside "Credits" is "Balance", the next heading
+    # along. Reading sideways here is the confident wrong answer. Reading
+    # DOWN from it is still right, so only the sideways moves are dropped.
+    # Two cells are left alone, since "Appraiser  Jane Okafor" looks the same
+    # by this test and is a real value.
+    header_row = len(cells) >= 3 and not any(c.isdigit() for c in line)
+
     same = _value_on_line(line, key)
-    if same:
+    if same and not header_row:
         out.append((same, "beside the label", 0))
 
     if len(cells) > 1:
+        key_words = set(_key(key).split())
         for column, cell in enumerate(cells):
             if not pattern.fullmatch(cell.strip(" .:")):
                 continue
-            for step, other in enumerate(cells[column + 1:][:3], start=1):
-                out.append((other, "same row, %d cell(s) right" % step, step))
+
+            # A labelled row inside a table: the right value is the one under
+            # the heading that names it. "ENDING BALANCE" sits in a row whose
+            # columns are Debits, Credits, Balance -- the first number along
+            # is the debits total, not the balance. Matching the heading is
+            # the difference between 5,940.20 and a confident 3,880.32.
+            head = _header_above(lines, index, len(cells))
+            if head and not header_row:
+                for heading, value in _align_right(head, cells):
+                    if value == cell or not value:
+                        continue
+                    if set(_key(heading).split()) & key_words:
+                        # Ranked ahead of "beside the label": a column that
+                        # names the field beats the first number along.
+                        out.append((value, "under the %s column"
+                                    % heading.strip(" .:"), -1))
+
+            if not header_row:
+                for step, other in enumerate(cells[column + 1:][:3], start=1):
+                    out.append((other, "same row, %d cell(s) right" % step, step))
             for down in (1, 2):
                 if index + down < len(lines):
                     below = _cells(lines[index + down])
