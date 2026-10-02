@@ -268,7 +268,6 @@ async function startDeal(file) {
     S.newDeal = false;
     S.menu = null;
     await loadDeals();
-    await loadHistory();
     toast(`${S.deal.name}: ${S.deal.mapping.length} field(s) located`);
   } catch (e) {
     S.dealError = e.message;
@@ -1947,6 +1946,7 @@ document.addEventListener('paste', (e) => {
     S.docTypes = docTypes;
     S.templates = templates;
     await loadDeals();
+    await loadHistory();
     if (models.length) {
       S.model = models[0].id;
       S.prompt = promptFor(models[0]);

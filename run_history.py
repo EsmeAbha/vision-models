@@ -42,6 +42,10 @@ def record(run, model_name=""):
         "model": run.get("model", ""),
         "model_name": model_name or run.get("model", ""),
         "at": run.get("at") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+        # `at` is for reading and only resolves to the second, so two runs
+        # started in the same second sort by whatever order the directory
+        # happens to list them in. `seq` is what the order actually uses.
+        "seq": time.time(),
         "elapsed": run.get("elapsed"),
         "text": run.get("text") or "",
         "annotated": run.get("annotated") or None,
@@ -53,6 +57,7 @@ def record(run, model_name=""):
     existing = load(rid)
     if existing:
         entry["at"] = existing.get("at", entry["at"])
+        entry["seq"] = existing.get("seq", entry["seq"])
 
     with open(_path(rid), "w", encoding="utf-8") as fh:
         json.dump(entry, fh, indent=2)
@@ -90,11 +95,12 @@ def summaries(limit=60):
         out.append({
             "id": entry["id"], "file": entry["file"],
             "model": entry["model"], "model_name": entry["model_name"],
-            "at": entry["at"], "elapsed": entry.get("elapsed"),
+            "at": entry["at"], "seq": entry.get("seq", 0),
+            "elapsed": entry.get("elapsed"),
             "chars": len(entry.get("text") or ""),
             "fields": len(entry.get("fields") or []),
         })
-    out.sort(key=lambda e: e["at"], reverse=True)
+    out.sort(key=lambda e: (e.get("seq") or 0, e["at"]), reverse=True)
     return out[:limit]
 
 

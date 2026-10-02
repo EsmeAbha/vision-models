@@ -12,6 +12,8 @@ server -- including one a running Gradio page was using. Restart that page's
 model, or just run these when nothing else is mid-read.
 """
 import json
+import shutil
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -40,6 +42,14 @@ def wait_for(client, rid, timeout=10):
 class VisionServerTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(server.app)
+        # Runs are remembered on disk, and these tests do dozens of them.
+        # Without this they pile fixtures called doc.png and scan.pdf into
+        # the history a person actually reads.
+        self.history = tempfile.mkdtemp(prefix="hist_")
+        self.addCleanup(shutil.rmtree, self.history, ignore_errors=True)
+        patcher = patch.object(server.run_history, "HISTORY_DIR", self.history)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def upload(self, name="doc.png", data=PNG):
         r = self.client.post("/api/upload", files={"file": (name, data)})
@@ -188,6 +198,45 @@ class VisionServerTests(unittest.TestCase):
                                  files={"file": ("broken.pdf", b"nope")})
         self.assertEqual(r.status_code, 400)
         self.assertIn("unreadable PDF", r.json()["detail"])
+
+    def test_a_finished_run_is_remembered(self):
+        body = chr(10).join(['# a heading', '', 'body'])
+        rid = self.finished_run(body)
+        remembered = self.client.get('/api/history').json()
+        self.assertEqual([h['id'] for h in remembered], [rid])
+        self.assertEqual(remembered[0]['file'], 'doc.png')
+        self.assertEqual(remembered[0]['model_name'], 'DeepSeek-OCR')
+
+        full = self.client.get(f'/api/history/{rid}').json()
+        self.assertEqual(full['text'], body)
+
+    def test_a_failed_run_is_not_remembered(self):
+        """Nothing was read, so there is nothing to come back to."""
+        up = self.upload()
+        with patch.object(server.vision, "ensure_model"),              patch.object(server.vision, "_run_one",
+                          side_effect=RuntimeError("worker died")):
+            started = self.client.post("/api/run", json={
+                "file_id": up["id"], "model": "deepseek_ocr",
+            }).json()
+            wait_for(self.client, started["id"])
+        self.assertEqual(self.client.get("/api/history").json(), [])
+
+    def test_pulling_fields_does_not_reorder_the_history(self):
+        """Refreshing a record must not float it back to the top."""
+        first = self.finished_run('Account Number  A-1')
+        second = self.finished_run('Account Number  B-2')
+        self.client.post(f"/api/runs/{first}/fields",
+                         json={"fields": ["Account number"]})
+        order = [h["id"] for h in self.client.get("/api/history").json()]
+        self.assertEqual(order[0], second, "an older run jumped to the top")
+
+    def test_a_remembered_run_can_be_forgotten(self):
+        rid = self.finished_run("text")
+        self.assertEqual(
+            self.client.delete(f"/api/history/{rid}").status_code, 200)
+        self.assertEqual(self.client.get("/api/history").json(), [])
+        self.assertEqual(
+            self.client.delete(f"/api/history/{rid}").status_code, 404)
 
     # ------------------------------------------------- doc types and fields
 

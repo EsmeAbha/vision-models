@@ -146,6 +146,8 @@ function visible(node) {
 
 const S_selected = () => globalThis.__sel ? globalThis.__sel() : null;
 
+const seenBootCalls = [];
+
 async function main() {
   const app = new Node('div');
   app.id = 'app';
@@ -157,7 +159,10 @@ async function main() {
   const sandbox = {
     console, setTimeout, clearTimeout,
     FormData, URL,
-    fetch: (url, opts) => fetch(url.startsWith('http') ? url : BASE + url, opts),
+    fetch: (url, opts) => {
+      seenBootCalls.push(url);
+      return fetch(url.startsWith('http') ? url : BASE + url, opts);
+    },
     localStorage: { getItem: () => null, setItem() {} },
     window: { innerWidth: 1440, addEventListener() {} },
     navigator: {},
@@ -226,6 +231,14 @@ async function main() {
             'rows are not laid out as a head plus a detail line');
   assert.equal(app.querySelectorAll('.pick-aside').length, 0,
                'a detail is still hung off the right edge');
+
+  // ---- boot fetches the history ------------------------------------------
+  // loadHistory() was inserted into startDeal() by mistake, so it only ran
+  // when a deal was created and the Earlier section never appeared.
+  assert.ok(Array.isArray(t.S.history),
+            'boot never fetched the history at all');
+  assert.ok(seenBootCalls.some((u) => u.includes('/api/history')),
+            'boot did not ask the server for the history');
 
   // ---- a group heading folds its list away --------------------------------
   assert.ok(!t.isFolded('models'), 'Models starts folded');
