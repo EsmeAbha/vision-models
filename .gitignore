@@ -38,3 +38,7 @@ prompt i gave.txt
 
 # Confidential client test documents - never committed
 test_files/
+
+# A deal holds the workbook and the data read into it, which belong to
+# whoever is doing the deal, not in the repository.
+deals/
