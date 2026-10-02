@@ -1,8 +1,8 @@
 {
-  "name": "Document OCR — PDF",
+  "name": "Document OCR: PDF",
   "model": "PaddleOCR-VL (document OCR)",
   "takes": "One or more PDFs, dropped into the PDF tab",
-  "prompt_note": "Ignored — the batch path sends no prompt at all",
+  "prompt_note": "Ignored: the batch path sends no prompt at all",
   "gives": "Text per page with page markers, and the rendered table panel",
   "speed": "~2.4s a page, several pages per batch",
   "note": "The only one that batches, so much faster on long documents. Best default for rent rolls and anything table-heavy."

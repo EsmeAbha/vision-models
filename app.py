@@ -1232,7 +1232,7 @@ def build_demo():
 
                     with gr.Column(elem_classes="vm-sect"):
                         flat(step_head(3, "Page options",
-                                       "PDFs only — ignored for an image."))
+                                       "PDFs only, ignored for an image."))
                         with gr.Row():
                             pages_in = gr.Textbox(label="Pages", value="",
                                                   placeholder="all, or 1-3 / 1,4,7", scale=2)
@@ -1241,9 +1241,9 @@ def build_demo():
                         batch_in = gr.Slider(1, 16, value=4, step=1,
                                              label="Pages per vLLM batch")
                         flat(hint(
-                            "Pages — blank reads every page. "
-                            "Render DPI — higher is sharper and slower; 300 suits most "
-                            "scans. Batch — PaddleOCR-VL only, higher is faster with "
+                            "Pages: blank reads every page. "
+                            "Render DPI: higher is sharper and slower; 300 suits most "
+                            "scans. Batch: PaddleOCR-VL only, higher is faster with "
                             "coarser updates; DeepSeek-OCR always reads one page at a time."))
 
                 with gr.Column(scale=1, min_width=380, elem_classes="vm-outpanel"):
@@ -1389,7 +1389,7 @@ def build_demo():
                     "and you can add your own.\n"
                     "- The value is looked for beside the label, to the right of it, "
                     "beneath a column heading, and further down past any run of "
-                    "other labels — which covers bills that print all the labels "
+                    "other labels, which covers bills that print all the labels "
                     "first and all the values after.\n"
                     "- Each field knows the shape its value should have. Given "
                     "`Due Date | 171.73 | 09/28/2026` it takes the date, not the "
@@ -1516,7 +1516,7 @@ def build_demo():
                 parts.append(f"{missing} label(s) not printed on the page.")
             if odd:
                 parts.append(f"{odd} value(s) marked CHECK: found, but not the shape "
-                             f"the field expects — often a table that has slipped a row.")
+                             f"the field expects, often a table that has slipped a row.")
             return gr.update(value=rows, visible=True), hint(" ".join(parts))
 
         find_btn.click(pull_fields, inputs=[text_out, fields_cb, extra_in],

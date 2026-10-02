@@ -1,9 +1,9 @@
 {
-  "name": "Prompted OCR — Image",
+  "name": "Prompted OCR: Image",
   "model": "DeepSeek-OCR (document OCR)",
-  "takes": "A photo or scan — PNG, JPG or WEBP — dropped into the Image tab",
-  "prompt_note": "Used, but only for one short question — a field list breaks it",
+  "takes": "A photo or scan (PNG, JPG or WEBP) dropped into the Image tab",
+  "prompt_note": "Used, but only for one short question; a field list breaks it",
   "gives": "Text, and an annotated image when it grounds",
-  "speed": "~40–60s a page, ~60s more on the first run",
+  "speed": "~40-60s a page, ~60s more on the first run",
   "note": "Reads handwriting the other model misses, but shifts table rows. Asked for a list of fields it looped to 35,505 characters in 5½ minutes; use step 06 for fields instead."
 }

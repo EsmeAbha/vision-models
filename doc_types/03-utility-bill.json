@@ -1,7 +1,7 @@
 {
   "name": "Utility bill",
   "reader": "PaddleOCR-VL (document OCR)",
-  "why": "A fixed set of named fields on a printed bill. Measured on a scanned bill it found 6 of 8 checkable fields against 5 for the other reader, which dropped the whole header table. It does not see handwriting or stamps — switch readers if those matter.",
+  "why": "A fixed set of named fields on a printed bill. Measured on a scanned bill it found 6 of 8 checkable fields against 5 for the other reader, which dropped the whole header table. It does not see handwriting or stamps, so switch readers if those matter.",
   "fields": ["Provider name", "Property name", "Account number", "Due date",
              "Billing date", "Service period", "Total charges", "Meter reading", "Usage"],
   "instruction": ""

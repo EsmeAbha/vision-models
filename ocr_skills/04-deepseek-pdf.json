@@ -1,9 +1,9 @@
 {
-  "name": "Prompted OCR — PDF",
+  "name": "Prompted OCR: PDF",
   "model": "DeepSeek-OCR (document OCR)",
   "takes": "One or more PDFs, dropped into the PDF tab",
-  "prompt_note": "Used, but only for one short question — a field list breaks it",
+  "prompt_note": "Used, but only for one short question; a field list breaks it",
   "gives": "Text per page, and the annotated image of the last page",
-  "speed": "~40–60s a page, one page at a time",
+  "speed": "~40-60s a page, one page at a time",
   "note": "No batching, so slow on long documents. Picks up handwritten notes and stamps; check any table it returns against the page."
 }
