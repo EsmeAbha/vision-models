@@ -63,13 +63,15 @@ class Node {
   }
 
   matches(sel) {
-    if (sel.startsWith('.')) return this._classes().includes(sel.slice(1));
     if (sel.startsWith('#')) return this.id === sel.slice(1);
-    const [tag, rest] = sel.split('.');
-    if (rest) {
-      return this.tagName === tag.toUpperCase() && this._classes().includes(rest);
-    }
-    return this.tagName === sel.toUpperCase();
+    // ".a", ".a.b", "tag", "tag.a". Two classes used to fall through to a
+    // lookup for the literal class "pick.skill" and match nothing, which
+    // read as the app drawing no rows.
+    const parts = sel.split('.');
+    const tag = parts.shift();
+    if (tag && this.tagName !== tag.toUpperCase()) return false;
+    const mine = this._classes();
+    return parts.every((c) => mine.includes(c));
   }
 
   querySelector(sel) {
@@ -175,7 +177,7 @@ async function main() {
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
     + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
-    + ' extractFields };';
+    + ' extractFields, dayOf, loadHistory };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
 
@@ -199,6 +201,65 @@ async function main() {
   for (const skill of t.S.skills) {
     assert.ok(seen.includes(skill.name), `sidebar is missing ${skill.name}`);
   }
+
+  // ---- the detail for a model or a skill is inside its row ---------------
+  // It used to hang off the right edge, which wrapped the names onto two
+  // lines and left the detail only in a tooltip.
+  for (const m of t.S.models) {
+    assert.ok(seen.includes(m.sub), `${m.name} does not show what it does`);
+  }
+  // Scoped to the skill rows: the reader names also appear under Models, so
+  // searching the whole page would pass with the skill rows empty.
+  const skillRows = app.querySelectorAll('.pick.skill');
+  assert.equal(skillRows.length, t.S.skills.length, 'skills are not all drawn');
+  skillRows.forEach((row, i) => {
+    const tag = row.querySelector('.pick-tag');
+    assert.ok(tag && visible(tag), `skill ${i} shows no reader`);
+    assert.equal(visible(tag), t.S.skills[i].model_short,
+                 `skill ${i} names the wrong reader`);
+  });
+  assert.ok(app.querySelectorAll('.pick-head').length >= t.S.models.length,
+            'rows are not laid out as a head plus a detail line');
+  assert.equal(app.querySelectorAll('.pick-aside').length, 0,
+               'a detail is still hung off the right edge');
+
+  // ---- no theme switcher, and only one palette ---------------------------
+  assert.equal(app.querySelectorAll('.theme-row').length, 0,
+               'the theme switcher is back');
+  assert.ok(!seen.includes('Tideform') && !seen.includes('Teal'),
+            'the theme buttons are still drawn');
+
+  // ---- earlier sessions are listed and can be reopened -------------------
+  t.S.history = [
+    { id: 'aaaaaaaa11', file: 'utility_bill.pdf', model: 'paddleocr_vl',
+      model_name: 'PaddleOCR-VL', at: new Date().toISOString(),
+      elapsed: 71.4, chars: 1684, fields: 2 },
+    { id: 'bbbbbbbb22', file: 'statement.pdf', model: 'paddleocr_vl',
+      model_name: 'PaddleOCR-VL', at: '2020-01-02T09:00:00', elapsed: 9,
+      chars: 21520, fields: 6 },
+  ];
+  t.render();
+  seen = visible(app);
+  assert.match(seen, /Earlier/, 'no Earlier section');
+  assert.match(seen, /utility_bill\.pdf/, 'a remembered run is not listed');
+  assert.match(seen, /statement\.pdf/, 'an older run is not listed');
+  assert.match(seen, /Today/, 'runs are not grouped by day');
+  assert.equal(t.dayOf(new Date().toISOString()), 'Today');
+  assert.equal(app.querySelectorAll('.past-forget').length, 2,
+               'no way to forget a remembered run');
+
+  // A run already open in the thread is not offered again below it.
+  t.S.msgs.push({ role: 'run', runId: 'aaaaaaaa11', modelName: 'PaddleOCR-VL',
+                  file: 'utility_bill.pdf', status: 'done', steps: [],
+                  text: 'x', want: null, fieldRows: null, saved: [],
+                  elapsed: 1, error: null, annotated: null, tab: null,
+                  docTypeName: '', reopened: true });
+  t.render();
+  assert.equal(app.querySelectorAll('.past-row').length, 1,
+               'a run already open is still listed as earlier');
+  t.S.msgs.length = 0;
+  t.S.history = [];
+  t.render();
 
   // ---- a document type opens the field picker -----------------------------
   const bill = t.S.docTypes.find((d) => d.name === 'Utility bill');
@@ -488,26 +549,23 @@ async function main() {
   t.render();
   assert.match(visible(app), /OCR worker exited unexpectedly/);
 
-  // ---- both themes define every token the stylesheet uses -----------------
+  // ---- the one palette defines every token the stylesheet uses -----------
   const css = await fetch(BASE + '/assets/style.css');
   assert.equal(css.status, 200);
   const sheet = await css.text();
+  assert.ok(!/\[data-theme="teal"\]/.test(sheet), 'the teal palette is back');
   const used = new Set([...sheet.matchAll(/var\((--[\w-]+)\)/g)].map((m) => m[1]));
-  for (const theme of ['tideform', 'teal']) {
-    const block = new RegExp(`\\[data-theme="${theme}"\\]\\s*\\{([^}]*)\\}`)
-      .exec(sheet);
-    assert.ok(block, `no ${theme} palette`);
-    const defined = new Set(
-      [...block[1].matchAll(/(--[\w-]+)\s*:/g)].map((m) => m[1]));
-    const missing = [...used].filter(
-      (v) => !defined.has(v) && !['--sans', '--mono', '--serif'].includes(v));
-    assert.equal(missing.length, 0,
-                 `${theme} never defines ${missing.join(', ')}`);
-  }
+  const block = /:root\s*\{([^}]*)\}/.exec(sheet);
+  assert.ok(block, 'no palette');
+  const defined = new Set(
+    [...block[1].matchAll(/(--[\w-]+)\s*:/g)].map((m) => m[1]));
+  const missing = [...used].filter(
+    (v) => !defined.has(v) && !['--sans', '--mono', '--serif'].includes(v));
+  assert.equal(missing.length, 0, `the palette never defines ${missing.join(', ')}`);
 
   console.log(`PASS: live bootstrap, ${t.S.models.length} models, `
     + `${t.S.skills.length} skills, ${t.S.docTypes.length} document types, `
-    + 'field picker, fields result, template bar, error state, both palettes.');
+    + 'field picker, fields result, template bar, error state, one palette.');
   console.log('Visual browser verification remains unavailable in this environment.');
 }
 

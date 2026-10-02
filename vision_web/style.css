@@ -1,9 +1,9 @@
 /* Local Vision: the Tideform look from the design canvas.
  *
- * Two palettes, exactly the two the canvas component carries: `tideform`
- * (navy sidebar, cream workspace, peach accent) and `teal` (the dark teal
- * shell with a lime accent, which sits closer to app.py's green). Switch with
- * data-theme on <html>; everything below reads tokens only.
+ * One palette: navy sidebar, cream workspace, peach accent. The canvas
+ * carried a second, dark teal one; it was dropped rather than kept as a
+ * switch nobody asked for. Everything below reads tokens, so the palette is
+ * still one block to change.
  *
  * No webfont is fetched. The canvas asks for Geist and Newsreader from Google
  * Fonts, but this page is served on a machine whose whole point is that
@@ -11,7 +11,7 @@
  * installed and fall back to what Windows already has.
  */
 
-:root[data-theme="tideform"] {
+:root {
   --s-bg: #1F4E6B;        /* sidebar ground */
   --s-deep: #163B52;      /* recessed wells inside it */
   --s-raise: #2A5F80;     /* raised buttons */
@@ -43,40 +43,6 @@
   --box-1: #F6A97B;
   --box-2: #4FB8A6;
   --box-3: #E9C23B;
-}
-
-:root[data-theme="teal"] {
-  --s-bg: #0B3232;
-  --s-deep: #0A2E2E;
-  --s-raise: #164A4A;
-  --s-line: #1E5252;
-  --s-line-2: #245858;
-  --s-rail: #2A5E5E;
-  --s-text: #EEF1E4;
-  --s-text-2: #DCE2C8;
-  --s-dim: #8FAB9E;
-  --s-dim-2: #9FB5A8;
-  --s-faint: #4F7A72;
-
-  --m-bg: #0F3F3F;
-  --m-bg-2: #0A2E2E;
-  --m-card: #124545;
-  --m-raise: #164A4A;
-  --m-line: #1E5252;
-  --m-line-2: #245858;
-  --m-text: #EEF1E4;
-  --m-text-2: #DCE2C8;
-  --m-dim: #9FB5A8;
-  --m-faint: #7F9C92;
-
-  --accent: #B6D298;
-  --on-accent: #0F3F3F;
-  --accent-ink: #B6D298;
-  --mint: #9FD3C7;
-  --danger: #F59E8B;
-  --box-1: #E8C07D;
-  --box-2: #9FD3C7;
-  --box-3: #B6D298;
 }
 
 :root {
@@ -230,7 +196,7 @@ svg { flex-shrink: 0; }
 }
 
 .pick.model { min-height: 54px; }
-.pick.skill { min-height: 44px; padding: 6px 10px; }
+.pick.skill { min-height: 48px; padding: 7px 10px; }
 
 /* The glowing rail on the selected row. -12px is exactly the sidebar's own
  * padding, so the rail sits flush against its left edge -- any further out
@@ -274,9 +240,48 @@ svg { flex-shrink: 0; }
   gap: 2px;
 }
 
-.pick-name { font-size: 14px; font-weight: 500; }
-.pick-sub { font-size: 12px; color: var(--s-dim); }
-.pick-aside { font-size: 11px; color: var(--s-dim); white-space: nowrap; }
+/* Name and its tag on one line, the detail underneath. Both lines clip
+ * rather than wrap, so a long skill name cannot push the row to three
+ * lines the way a right-hung label used to. */
+.pick-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.pick-name {
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pick-tag {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--s-deep);
+  color: var(--s-dim);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.pick[aria-pressed="true"] .pick-tag {
+  background: var(--s-bg);
+  color: var(--s-text-2);
+}
+
+.pick-sub {
+  font-size: 11px;
+  color: var(--s-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* session history, with the timeline spine the canvas draws */
 .history { position: relative; display: flex; flex-direction: column; gap: 2px; }
@@ -334,6 +339,62 @@ svg { flex-shrink: 0; }
   white-space: nowrap;
 }
 
+/* Earlier sessions: a file name with its reader underneath, and a way to
+ * forget one. The row is a hit target plus a small x, so the x cannot be
+ * hit by accident while aiming at the file. */
+.past-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.history-item.past {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: flex-start;
+  padding: 7px 8px;
+}
+
+.past-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  text-align: left;
+}
+
+.past-file {
+  font-size: 12px;
+  color: var(--s-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.past-sub {
+  font-size: 10px;
+  color: var(--s-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item.past:hover .past-file { color: var(--s-text); }
+
+.past-forget {
+  flex: 0 0 26px;
+  border-radius: 7px;
+  color: var(--s-faint);
+  display: grid;
+  place-items: center;
+  opacity: 0;
+}
+
+.past-row:hover .past-forget,
+.past-forget:focus-visible { opacity: 1; }
+.past-forget:hover { background: var(--s-deep); color: var(--s-text); }
+
 .side-foot {
   margin-top: auto;
   padding: 12px 10px 4px;
@@ -344,25 +405,6 @@ svg { flex-shrink: 0; }
 }
 
 .side-foot b { color: var(--s-text-2); font-weight: 500; }
-
-.theme-row { display: flex; gap: 6px; margin-top: 10px; }
-
-.theme-row button {
-  flex: 1;
-  padding: 7px 8px;
-  border-radius: 7px;
-  border: 1px solid var(--s-line-2);
-  background: var(--s-deep);
-  color: var(--s-dim-2);
-  font-size: 11px;
-}
-
-.theme-row button[aria-pressed="true"] {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
-  font-weight: 600;
-}
 
 /* ------------------------------------------------------------------- main */
 

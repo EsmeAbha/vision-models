@@ -42,3 +42,6 @@ test_files/
 # A deal holds the workbook and the data read into it, which belong to
 # whoever is doing the deal, not in the repository.
 deals/
+
+# Transcripts of documents that were read, which are the documents.
+run_history/

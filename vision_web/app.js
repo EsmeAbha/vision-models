@@ -34,7 +34,6 @@ function svg(name, size) {
 /* ------------------------------------------------------------------ state */
 
 const S = {
-  theme: localStorage.getItem('lv-theme') || 'tideform',
   sidebar: window.innerWidth >= 900,
   models: [],
   skills: [],
@@ -51,6 +50,7 @@ const S = {
   chosen: [],      // field names ticked in the picker
   extra: '',       // extra field names typed in by hand
   templates: [],   // spreadsheets the found fields can be dropped into
+  history: [],     // documents read in earlier sessions
   deals: [],       // deal workbooks on disk
   deal: null,      // the deal documents are being read into, if any
   newDeal: false,  // the new-deal form is open
@@ -83,13 +83,6 @@ async function api(path, opts) {
 }
 
 /* ---------------------------------------------------------------- actions */
-
-function setTheme(name) {
-  S.theme = name;
-  localStorage.setItem('lv-theme', name);
-  document.documentElement.dataset.theme = name;
-  render();
-}
 
 /* A model that runs a fixed pipeline has a stand-in string where its prompt
  * would be ("(no prompt needed ...)"). That belongs in the placeholder, not
@@ -174,6 +167,64 @@ function fieldsWanted() {
 
 /* ------------------------------------------------------------------- deals */
 
+async function loadHistory() {
+  try {
+    S.history = await api('/api/history');
+  } catch (e) { /* the sidebar still works without it */ }
+}
+
+/* When a run happened is more useful than its exact timestamp. */
+function dayOf(at) {
+  const when = new Date(at);
+  if (Number.isNaN(when.getTime())) return 'Earlier';
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  const days = Math.floor((midnight - when) / 86400000);
+  if (days <= 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return `${days + 1} days ago`;
+  return when.toLocaleDateString(undefined,
+                                 { day: 'numeric', month: 'short' });
+}
+
+/* Reopen a document read in an earlier session. The transcript is kept, so
+ * this costs nothing: re-running it would mean another model load. */
+async function reopen(id) {
+  try {
+    const entry = await api(`/api/history/${id}`);
+    const model = modelById(entry.model);
+    S.msgs.push({
+      role: 'you', text: '', file: { name: entry.file, pdf: false },
+    });
+    S.msgs.push({
+      role: 'run', runId: entry.id, model: entry.model,
+      modelName: entry.model_name || (model ? model.name : entry.model),
+      file: entry.file, status: 'done', steps: [], text: entry.text,
+      annotated: entry.annotated, error: null, elapsed: entry.elapsed,
+      saved: [], docType: null, docTypeName: '',
+      want: (entry.fields || []).length ? { fields: [], extra: '' } : null,
+      fieldRows: (entry.fields || []).length ? entry.fields : null,
+      fieldSummary: entry.field_summary || '',
+      fieldsBusy: false, fieldError: null, reopened: true,
+      tab: (entry.fields || []).length ? 'fields' : null,
+    });
+    render();
+  } catch (e) {
+    toast(`Could not reopen that: ${e.message}`);
+  }
+}
+
+async function forget(id, event) {
+  event.stopPropagation();
+  try {
+    await api(`/api/history/${id}`, { method: 'DELETE' });
+    S.history = S.history.filter((h) => h.id !== id);
+    render();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 async function loadDeals() {
   try {
     S.deals = await api('/api/deals');
@@ -215,6 +266,7 @@ async function startDeal(file) {
     S.newDeal = false;
     S.menu = null;
     await loadDeals();
+    await loadHistory();
     toast(`${S.deal.name}: ${S.deal.mapping.length} field(s) located`);
   } catch (e) {
     S.dealError = e.message;
@@ -633,12 +685,19 @@ function sidebar() {
     b.type = 'button';
     b.className = 'pick model';
     b.setAttribute('aria-pressed', String(m.id === S.model));
+    // Everything about the model sits inside the row. Hanging a label off
+    // the right edge is what wrapped these names onto two lines.
     b.innerHTML = `<span class="pick-icon">${svg(m.icon, 16)}</span>`
-      + `<span class="pick-text"><span class="pick-name"></span>`
-      + `<span class="pick-sub"></span></span>`
-      + (m.id === S.model ? svg('chev', 16) : '');
+      + '<span class="pick-text">'
+      + '<span class="pick-head"><span class="pick-name"></span>'
+      + (m.tag ? '<span class="pick-tag"></span>' : '') + '</span>'
+      + '<span class="pick-sub"></span></span>';
     b.querySelector('.pick-name').textContent = m.name;
+    if (m.tag) b.querySelector('.pick-tag').textContent = m.tag;
     b.querySelector('.pick-sub').textContent = m.sub;
+    b.title = m.takes_prompt
+      ? `${m.sub}. Takes a prompt.`
+      : `${m.sub}. Runs a fixed pipeline and takes no prompt.`;
     b.onclick = () => pickModel(m.id);
     mg.append(b);
   });
@@ -654,33 +713,42 @@ function sidebar() {
       b.type = 'button';
       b.className = 'pick skill';
       b.setAttribute('aria-pressed', String(k.id === S.skill));
-      b.title = [k.takes, k.gives, k.speed].filter(Boolean).join(' · ');
+      // The reader and the speed are the two things worth knowing before
+      // picking one, so they read on their own line underneath rather than
+      // only in a tooltip nobody hovers.
+      b.title = [k.takes, k.gives, k.speed, k.note].filter(Boolean).join('. ');
       b.innerHTML = `<span class="pick-icon">${svg(k.icon, 15)}</span>`
-        + '<span class="pick-text"><span class="pick-name"></span></span>'
-        + '<span class="pick-aside"></span>';
+        + '<span class="pick-text">'
+        + '<span class="pick-head"><span class="pick-name"></span>'
+        + '<span class="pick-tag"></span></span>'
+        + '<span class="pick-sub"></span></span>';
       b.querySelector('.pick-name').textContent = k.name;
-      b.querySelector('.pick-aside').textContent = k.model_short;
+      b.querySelector('.pick-tag').textContent = k.model_short;
+      b.querySelector('.pick-sub').textContent = k.gives || k.takes || '';
       b.onclick = () => pickSkill(k.id);
       kg.append(b);
     });
     node.append(kg);
   }
 
-  // this session
-  const runs = S.msgs.filter((m) => m.role === 'run');
+  // Runs from this page, then everything read in earlier sessions. The
+  // first list is what you are working on; the second is why you do not
+  // have to read a document twice.
+  const runs = S.msgs.filter((m) => m.role === 'run' && !m.reopened);
   if (runs.length) {
     const hg = document.createElement('div');
     hg.className = 'group';
     hg.innerHTML = '<div class="group-label">This session</div>';
     const list = document.createElement('div');
     list.className = 'history';
-    list.innerHTML = '<div class="history-day"><span class="dot"></span><span>Today</span></div>';
     runs.slice().reverse().forEach((r) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'history-item';
       b.innerHTML = '<span class="dot"></span><span></span>';
-      b.querySelector('span:last-child').textContent = `${r.file} → ${r.modelName}`;
+      b.querySelector('span:last-child').textContent =
+        `${r.file} to ${r.modelName}`;
+      b.title = b.querySelector('span:last-child').textContent;
       b.onclick = () => {
         const card = document.querySelector(`[data-run="${r.runId}"]`);
         if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -691,21 +759,54 @@ function sidebar() {
     node.append(hg);
   }
 
+  const open = new Set(S.msgs.filter((m) => m.role === 'run')
+                             .map((m) => m.runId));
+  const earlier = S.history.filter((h) => !open.has(h.id));
+  if (earlier.length) {
+    const eg = document.createElement('div');
+    eg.className = 'group';
+    eg.innerHTML = '<div class="group-label">Earlier</div>';
+    let day = null;
+    earlier.forEach((h) => {
+      const label = dayOf(h.at);
+      if (label !== day) {
+        day = label;
+        const head = document.createElement('div');
+        head.className = 'history-day';
+        head.innerHTML = '<span class="dot"></span><span></span>';
+        head.querySelector('span:last-child').textContent = label;
+        eg.append(head);
+      }
+      const row = document.createElement('div');
+      row.className = 'past-row';
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'history-item past';
+      b.innerHTML = '<span class="past-text"><span class="past-file"></span>'
+        + '<span class="past-sub"></span></span>';
+      b.querySelector('.past-file').textContent = h.file;
+      b.querySelector('.past-sub').textContent =
+        `${h.model_name}${h.fields ? `, ${h.fields} fields` : ''}`;
+      b.title = `${h.file}, read with ${h.model_name}`
+        + (h.chars ? `, ${h.chars} characters` : '');
+      b.onclick = () => reopen(h.id);
+      row.append(b);
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'past-forget';
+      x.setAttribute('aria-label', `Forget ${h.file}`);
+      x.innerHTML = svg('x', 13);
+      x.onclick = (e) => forget(h.id, e);
+      row.append(x);
+      eg.append(row);
+    });
+    node.append(eg);
+  }
+
   const foot = document.createElement('div');
   foot.className = 'side-foot';
   foot.innerHTML = '<div><b>Everything runs here.</b> No image and no text '
     + 'leaves this machine.</div>';
-  const themes = document.createElement('div');
-  themes.className = 'theme-row';
-  [['tideform', 'Tideform'], ['teal', 'Teal']].forEach(([id, label]) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = label;
-    b.setAttribute('aria-pressed', String(S.theme === id));
-    b.onclick = () => setTheme(id);
-    themes.append(b);
-  });
-  foot.append(themes);
   node.append(foot);
   return node;
 }
@@ -1766,7 +1867,6 @@ document.addEventListener('paste', (e) => {
 });
 
 (async function boot() {
-  document.documentElement.dataset.theme = S.theme;
   render();
   try {
     const [models, skills, docTypes, templates] = await Promise.all([

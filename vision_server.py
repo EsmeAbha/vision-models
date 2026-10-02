@@ -39,6 +39,7 @@ import deal_book
 import field_search
 import fill_template
 import pdf_pages
+import run_history
 import save_output
 
 ROOT = Path(__file__).resolve().parent
@@ -277,6 +278,7 @@ def _do_run(rid, upload, req):
 
         run["status"] = "done"
         run["elapsed"] = time.time() - run["started"]
+        run_history.record(run, MODEL_META.get(kind, {}).get("name", kind))
         run["events"].put({"type": "done", "elapsed": run["elapsed"]})
     except Exception as e:
         run["status"] = "error"
@@ -421,6 +423,7 @@ def api_fields(rid: str, req: FieldsReq):
 
     run["fields"] = rows
     run["field_summary"] = summary
+    run_history.record(run, MODEL_META.get(run["model"], {}).get("name", ""))
     return {"rows": rows, "summary": summary}
 
 
@@ -501,6 +504,48 @@ def _all_fields():
                 seen.add(field)
                 out.append(field)
     return out
+
+
+@app.get("/api/history")
+def api_history(limit: int = 60):
+    """Documents read in earlier sessions, newest first."""
+    return run_history.summaries(limit=max(1, min(limit, 200)))
+
+
+@app.get("/api/history/{rid}")
+def api_history_one(rid: str):
+    """One remembered run, transcript and all.
+
+    Reopening reads from here rather than re-running: the text was already
+    paid for with a model load, and the upload it came from is long gone.
+    """
+    entry = run_history.load(rid)
+    if entry is None:
+        raise HTTPException(404, "that run is not remembered")
+    # Put it back in the live table so the fields and template actions on it
+    # work exactly as they do for a run from this session.
+    with _state_lock:
+        if rid not in _runs:
+            _runs[rid] = {
+                "id": rid, "model": entry["model"], "file": entry["file"],
+                "status": "done", "steps": [], "text": entry["text"],
+                "annotated": entry.get("annotated"), "error": None,
+                "started": 0, "elapsed": entry.get("elapsed"),
+                "events": queue.Queue(), "saved": [],
+                "fields": entry.get("fields") or [],
+                "field_summary": entry.get("field_summary", ""),
+                "filled": None,
+            }
+    entry["annotated"] = (f"/api/runs/{rid}/annotated"
+                          if entry.get("annotated") else None)
+    return entry
+
+
+@app.delete("/api/history/{rid}")
+def api_forget(rid: str):
+    if not run_history.forget(rid):
+        raise HTTPException(404, "that run is not remembered")
+    return {"forgotten": rid}
 
 
 @app.get("/api/deals")
