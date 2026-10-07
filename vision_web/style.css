@@ -957,6 +957,13 @@ svg { flex-shrink: 0; }
   text-align: center;
 }
 
+/* Said when someone typed but attached nothing. Warmer than an error -- they
+   have not done anything wrong, the tool just needs a document. */
+.composer-hint.needs-file {
+  color: var(--m-text-2);
+  font-weight: 500;
+}
+
 /* ----------------------------------------------------------- field picker */
 
 .picker {
@@ -1024,6 +1031,37 @@ svg { flex-shrink: 0; }
   font-weight: 500;
   color: var(--m-dim);
 }
+
+/* A field added by hand. Same chip as the ticked ones so the two lists read
+   as one set, with a cross because this one is removable and those are not. */
+.field-chip.added {
+  cursor: default;
+  border-color: var(--accent);
+  font-weight: 500;
+  padding-right: 5px;
+}
+
+.chip-x {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--m-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chip-x:hover { background: var(--m-raise); color: var(--m-text); }
+
+.add-field-row { display: flex; gap: 7px; align-items: stretch; }
+.add-field-row input { flex: 1 1 auto; }
+.add-field-row .btn { flex: 0 0 auto; }
+
+.picker-extra .field-grid { margin-bottom: 8px; }
 
 .picker-extra input {
   width: 100%;
@@ -1109,77 +1147,6 @@ table.fields td.where { color: var(--m-dim); font-size: 11px; white-space: nowra
 
 .filled .muted-line { margin: 0; flex: 1 1 220px; }
 
-/* ------------------------------------------------------ deal cell mapping */
-
-.map-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 260px;
-  overflow: hidden auto;
-}
-
-.map-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 8px;
-  border-radius: 8px;
-  background: var(--m-card);
-  border: 1px solid var(--m-line);
-  font-size: 12px;
-}
-
-.map-field { font-weight: 500; flex: 0 0 160px; }
-
-.map-how {
-  flex: 1 1 auto;
-  min-width: 0;
-  color: var(--m-dim);
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.map-cell {
-  flex: 0 0 72px;
-  padding: 6px 8px;
-  border: 1px solid var(--m-line-2);
-  border-radius: 7px;
-  background: var(--m-raise);
-  font-family: var(--mono);
-  font-size: 12px;
-  text-align: center;
-  text-transform: uppercase;
-  outline: none;
-}
-
-.map-cell:focus { border-color: var(--accent); background: var(--m-card); }
-
-.map-add {
-  margin-top: 8px;
-  border-style: dashed;
-  background: var(--m-raise);
-}
-
-.map-field-input {
-  flex: 1 1 170px;
-  min-width: 0;
-  padding: 6px 9px;
-  border: 1px solid var(--m-line-2);
-  border-radius: 7px;
-  background: var(--m-card);
-  font-size: 12px;
-  outline: none;
-}
-
-.map-field-input:focus { border-color: var(--accent); }
-
-@media (max-width: 700px) {
-  .map-row { flex-wrap: wrap; }
-  .map-field { flex-basis: 100%; }
-}
 
 /* popover menus above the composer */
 .menu {
@@ -1237,6 +1204,96 @@ table.fields td.where { color: var(--m-dim); font-size: 11px; white-space: nowra
 
 .menu button:hover .mi { background: var(--accent); color: var(--on-accent); }
 .menu button small { display: block; font-size: 11px; color: var(--m-dim); font-weight: 400; }
+
+/* A plain answer. Flat, no card chrome: a run card means something was read
+   off a page and this was not, so the two must not look alike. */
+.bubble.answer {
+  max-width: 760px;
+  padding: 13px 15px;
+  border: 1px solid var(--m-line);
+  /* Square the bottom-right: .bubble's radius is shaped for the user's
+     right-aligned message, and an answer sits on the left. */
+  border-radius: 12px;
+  background: var(--m-card);
+  /* .bubble carries the light text that reads on the dark user bubble. On
+     this white card that was near-invisible -- the answer was there and you
+     could not read it. The background was overridden and the colour was not. */
+  color: var(--m-text);
+}
+
+.answer-body {
+  font-size: 13.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: var(--m-text);
+}
+
+/* Waiting on the model. Long enough that a still frame looks like a hang. */
+
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--m-dim);
+}
+
+.thinking-dots { display: inline-flex; gap: 5px; }
+
+.thinking-dots i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: .25;
+  animation: think 1.25s ease-in-out infinite;
+}
+
+.thinking-dots i:nth-child(2) { animation-delay: .18s; }
+.thinking-dots i:nth-child(3) { animation-delay: .36s; }
+
+@keyframes think {
+  0%, 70%, 100% { opacity: .22; transform: translateY(0) scale(.85); }
+  35%           { opacity: 1;   transform: translateY(-4px) scale(1); }
+}
+
+/* The word itself breathes, so the line reads as working rather than stuck
+   even if the dots are off. */
+.thinking-word {
+  background: linear-gradient(90deg,
+    var(--m-dim) 0%, var(--m-dim) 40%,
+    var(--accent) 50%,
+    var(--m-dim) 60%, var(--m-dim) 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: sweep 2.4s linear infinite;
+}
+
+@keyframes sweep {
+  from { background-position: 120% 0; }
+  to   { background-position: -40% 0; }
+}
+
+.thinking-clock {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--m-faint);
+}
+
+/* Motion is decoration here: the clock already says it is working, so a
+   reader who asked for less movement loses nothing by stopping it. */
+@media (prefers-reduced-motion: reduce) {
+  .thinking-dots i { animation: none; opacity: .6; }
+  .thinking-word {
+    animation: none;
+    color: var(--m-dim);
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
 
 /* ------------------------------------------------------------------ toast */
 

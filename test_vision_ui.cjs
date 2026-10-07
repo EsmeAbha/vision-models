@@ -53,6 +53,8 @@ class Node {
   }
 
   getAttribute(k) { return this.attrs[k]; }
+
+  contains() { return false; }
   removeAttribute(k) { delete this.attrs[k]; }
   remove() {}
   focus() {}
@@ -160,7 +162,7 @@ async function main() {
   // be buildable more than once.
   const makeSandbox = (storage, byIdFor) => {
     const s = {
-      console, setTimeout, clearTimeout,
+      console, setTimeout, clearTimeout, setInterval, clearInterval,
       FormData, URL,
       fetch: (url, opts) => {
         seenBootCalls.push(url);
@@ -195,7 +197,7 @@ async function main() {
   const source = fs.readFileSync('vision_web/app.js', 'utf8')
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
-    + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
+    + ' knownFields, fieldsWanted, run, ask,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
     + ' toggleGroup, isFolded, reopen, newRun, recall, remember };';
   vm.runInContext(source, sandbox);
@@ -621,151 +623,44 @@ async function main() {
   assert.equal(plain.docTypeName, bank.name,
                'the type was not recorded on the run, so no template matches');
 
-  // ---- the new-deal form survives being clicked ---------------------------
-  // It used to live on S.menu, and the global click handler clears S.menu on
-  // any click, so clicking into the name box destroyed the form before a
-  // character could be typed.
-  t.S.newDeal = true;
-  t.S.dealName = '';
-  t.render();
-  seen = visible(app);
-  assert.match(seen, /New deal/, 'the new-deal form did not render');
-  assert.match(seen, /Name the deal, then choose its workbook/,
-               'no hint that the name comes first');
-
-  const chooser = () => app.querySelectorAll('.btn')
-    .find((b) => visible(b).includes('Choose workbook'));
-  assert.ok(chooser(), 'no workbook button');
-  assert.equal(chooser().disabled, true,
-               'offered to take a workbook before the deal was named');
-
-  // A click anywhere closes menus. The form has to still be there.
-  t.S.menu = 'deal';
-  t.S.menu = null;
-  t.render();
-  assert.ok(visible(app).includes('New deal'),
-            'the form vanished when a menu was closed');
-
-  // Typing a name enables the button.
-  const nameBox = app.querySelector('#deal-name');
-  assert.ok(nameBox, 'no name field');
-  nameBox.value = 'Maple Avenue';
-  nameBox.oninput();
-  assert.equal(t.S.dealName, 'Maple Avenue', 'the name was not captured');
-  assert.equal(chooser().disabled, false,
-               'the button stayed disabled after naming the deal');
-
-  t.S.newDeal = false;
-  t.S.dealName = '';
-  t.render();
-
-  // ---- a mapping row can be added by hand ---------------------------------
-  // The scan knows only the names the document types list, so a template
-  // with its own labels is unusable without this.
-  t.S.deal = {
-    id: 'sample', name: 'sample', confirmed: false, filled: {}, history: [],
-    mapping: [{ field: 'Account number', cell: 'D7', sheet: 'Utility Recon',
-                label_cell: 'D6', label_text: 'Account Number',
-                matched: 'account number', how: 'under the label' }],
-  };
-  t.render();
-  seen = visible(app);
-  assert.match(seen, /sample/, 'the deal panel did not render');
-  assert.match(seen, /Account Number/, 'the matched label is not shown');
-  assert.ok(t.knownFields().length > 10, 'no suggestions to offer');
-
-  const fieldBox = app.querySelector('#add-field');
-  const cellBox = app.querySelector('#add-cell');
-  assert.ok(fieldBox && cellBox, 'no row for adding a field by hand');
-
-  // A name the vocabulary has never heard of still has to be accepted.
-  fieldBox.value = 'Meter number';
-  fieldBox.oninput();
-  cellBox.value = 'c18';
-  cellBox.oninput();
-  t.addMappingRow();
-  assert.equal(t.S.deal.mapping.length, 2, 'the row was not added');
-  const added = t.S.deal.mapping[1];
-  assert.equal(added.field, 'Meter number');
-  assert.equal(added.cell, 'C18', 'the cell was not normalised to upper case');
-  assert.equal(added.how, 'set by hand');
-
-  // Nonsense is refused rather than stored.
-  fieldBox.value = 'Tariff';
-  fieldBox.oninput();
-  cellBox.value = 'over there';
-  cellBox.oninput();
-  t.addMappingRow();
-  assert.equal(t.S.deal.mapping.length, 2, 'a bad cell reference was accepted');
-
-  // And the added field is actually looked for, or it could never fill.
-  assert.ok(t.fieldsWanted().includes('Meter number'),
-            'a hand-added field is not searched for');
-
-  t.S.deal = null;
-  t.S.addField = '';
-  t.S.addCell = '';
-  t.render();
-
-  // ---- reading a document into an open deal fills it ----------------------
-  // Confirming a mapping did nothing by itself, so a deal could sit at
-  // "0 of 3 cells filled" with a workbook that downloaded empty and no
-  // sign of what had been missed.
-  t.S.deal = {
-    id: 'sample', name: 'sample', confirmed: true, filled: {}, history: [],
-    mapping: [{ field: 'Account number', cell: 'D7', sheet: 'Utility Recon',
-                label_cell: 'D6', label_text: 'Account Number',
-                matched: 'account number', how: 'under the label' }],
-  };
-  t.render();
-  assert.match(visible(app), /Nothing read into it yet/,
-               'an empty deal does not say what to do about it');
-
-  const into = {
-    role: 'run', runId: 'into-deal', model: bank.reader,
-    modelName: 'PaddleOCR-VL', file: 'bill.pdf', status: 'done', steps: [],
-    text: '# bill', annotated: null, error: null, elapsed: 7, saved: [],
-    docType: null, docTypeName: '', want: null, fieldRows: null,
-    fieldSummary: '', fieldsBusy: false, fieldError: null, tab: null,
-  };
-  t.S.msgs.length = 0;
-  t.S.msgs.push(into);
-
-  const seenCalls = [];
-  const realFetch2 = sandbox.fetch;
-  sandbox.fetch = (url, opts) => {
-    seenCalls.push(url);
-    const body = url.endsWith('/fields')
-      ? { rows: [{ field: 'Account number', value: 'EL-88342710',
-                   verdict: 'yes', where: 'beside the label', evidence: 'x' }],
-          summary: '1 of 1 found.' }
-      : url.endsWith('/apply')
-        ? { written: [{ field: 'Account number', cell: 'D7',
-                        value: 'EL-88342710' }],
-            skipped: [], clashed: [], download: '/api/deals/sample/workbook' }
-        : { id: 'sample', name: 'sample', confirmed: true, mapping: [],
-            filled: { 'Account number': {} }, history: [{ source: 'bill.pdf' }] };
-    return Promise.resolve({ ok: true, status: 200,
-                             json: () => Promise.resolve(body) });
-  };
-  await t.extractFields(into, ['Account number'], '');
-  sandbox.fetch = realFetch2;
-
-  assert.ok(seenCalls.some((u) => u.endsWith('/fields')), 'nothing was extracted');
-  assert.ok(seenCalls.some((u) => u.endsWith('/apply')),
-            'the document was never put into the open deal');
-  assert.ok(into.dealResult, 'no record of what went into the deal');
-  assert.equal(into.dealResult.written[0].cell, 'D7');
-
-  t.S.deal = null;
-  t.render();
-
   // ---- an error is shown as an error, not swallowed -----------------------
   const last = t.S.msgs[t.S.msgs.length - 1];
   last.status = 'error';
   last.error = 'RuntimeError: OCR worker exited unexpectedly.';
   t.render();
   assert.match(visible(app), /OCR worker exited unexpectedly/);
+
+  // ---- each document read starts its own chat -----------------------------
+  // The sidebar lists one row per run, and reopening a row replaces the
+  // thread. A thread that had accumulated two documents could not be any one
+  // of those rows, so reading a second document starts a fresh chat. A typed
+  // question still belongs to the document above it.
+  t.S.msgs = [];
+  t.S.busy = false;
+  t.S.openRun = 'a-previous-run';
+  t.S.model = t.S.models[0].id;
+  t.S.file = { id: 'no-such-upload', name: 'first.pdf', pdf: false };
+  await t.run();
+  assert.equal(t.S.msgs.length, 2, 'a read should leave one exchange in the thread');
+  assert.equal(t.S.msgs[1].file, 'first.pdf');
+  assert.notEqual(t.S.openRun, 'a-previous-run',
+                  'the sidebar still points at the run before this one');
+
+  t.S.busy = false;
+  t.S.file = null;
+  t.S.prompt = 'what is the total?';
+  await t.ask();
+  assert.equal(t.S.msgs.length, 4, 'a question should join the chat, not replace it');
+  assert.equal(t.S.msgs[1].file, 'first.pdf', 'the document left the thread');
+
+  t.S.busy = false;
+  t.S.file = { id: 'no-such-upload-2', name: 'second.pdf', pdf: false };
+  await t.run();
+  assert.equal(t.S.msgs.length, 2,
+               'the second document stacked instead of starting its own chat');
+  assert.equal(t.S.msgs[1].file, 'second.pdf');
+  assert.ok(!t.S.msgs.some((m) => m.file === 'first.pdf' || m.role === 'chat'),
+            'the previous chat is still in the thread');
 
   // ---- the one palette defines every token the stylesheet uses -----------
   const css = await fetch(BASE + '/assets/style.css');
@@ -783,7 +678,7 @@ async function main() {
 
   console.log(`PASS: live bootstrap, ${t.S.models.length} models, `
     + `${t.S.skills.length} skills, ${t.S.docTypes.length} document types, `
-    + 'field picker, fields result, template bar, error state, one palette.');
+    + 'field picker, fields result, template bar, error state, one chat per read, one palette.');
   console.log('Visual browser verification remains unavailable in this environment.');
 }
 

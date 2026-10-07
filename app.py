@@ -174,10 +174,42 @@ def _stop_ocr_worker():
     _state["ocr_proc"] = None
 
 
+def release_wsl():
+    """Shut the WSL VM down so the commit it reserved returns to Windows.
+
+    Stopping vLLM hands back the card but not the commit: the VM keeps that
+    until it exits. Measured on a switch away from PaddleOCR-VL: 19.9GB free
+    before, 29.2GB two seconds after. That is the difference between
+    DeepSeek-OCR's ~21GB load fitting and dying with "the paging file is too
+    small", which is how this looked from the outside for days.
+
+    It stops every distro, not only the one holding vLLM. That is the same
+    bargain start_vllm already makes by owning the distro's lifetime.
+    """
+    try:
+        subprocess.run(["wsl.exe", "--shutdown"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=120)
+    except Exception as e:
+        print(f"wsl shutdown failed: {type(e).__name__}: {e}", flush=True)
+
+
 def unload_current():
+    outgoing = _state.get("kind")
     if _state["model"] is not None:
         del _state["model"]
     _stop_ocr_worker()
+    # Stopping the worker is only half of unloading a WSL-backed model: vLLM
+    # is a separate server and keeps the card until it is told otherwise.
+    # Leaving it up made PaddleOCR-VL -> DeepSeek-OCR fail every time, because
+    # 10.4GB stayed reserved and DeepSeek wants 14.7GB of a 16GB card. It
+    # read as an intermittent fault for days; it is deterministic.
+    #
+    # Only on a real switch. The branch above clears `kind` first when a
+    # worker has died, so restarting a dead PaddleOCR-VL worker leaves a
+    # healthy vLLM alone, which is what start_vllm would reuse anyway.
+    if outgoing and OCR_WORKERS.get(outgoing, {}).get("wsl"):
+        stop_vllm()
+        release_wsl()
     _state["kind"] = None
     _state["model"] = None
     _state["processor"] = None
@@ -214,7 +246,17 @@ def load_ocr_worker(kind):
     _state.update(kind=kind, ocr_proc=proc, stderr_tail=tail)
     # Warm the model now so the first real request isn't slower than the rest.
     warmup_prompt = DEFAULT_PROMPTS[kind]
-    _ocr_request(_here + "\\test_document.png", warmup_prompt, warmup=True)
+    try:
+        _ocr_request(_here + "\\test_document.png", warmup_prompt, warmup=True)
+    except Exception:
+        # A worker that could not warm up is not usable, and it does
+        # not let go: a DeepSeek-OCR worker that died part-way through
+        # loading sat on 15.4GB of commit afterwards. Leaving it there
+        # is why the retry failed too, short of the memory the broken
+        # one was still holding.
+        _stop_ocr_worker()
+        _state["kind"] = None
+        raise
 
 
 def ensure_model(kind, progress=None):

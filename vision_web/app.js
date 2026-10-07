@@ -67,21 +67,15 @@ const S = {
   docTypes: [],
   docType: null,   // id of the chosen type, or null for a plain read
   chosen: [],      // field names ticked in the picker
-  extra: '',       // extra field names typed in by hand
+  extras: [],      // extra field names, added one at a time
+  typing: '',      // what is half-typed in the add box
   templates: [],   // spreadsheets the found fields can be dropped into
   history: [],     // documents read in earlier sessions
   expanded: recall('expanded', []),   // rows opened to their detail
   collapsed: recall('collapsed', []), // groups folded shut
   openRun: null,   // the run the thread is currently showing
   search: '',      // filter over the run list
-  deals: [],       // deal workbooks on disk
-  deal: null,      // the deal documents are being read into, if any
-  newDeal: false,  // the new-deal form is open
-  dealName: '',    // what is typed into the new-deal form
-  addField: '',    // a mapping row being added by hand
-  addCell: '',
-  dealBusy: false,
-  dealError: null,
+  chatModel: null, // the local model that answers typed questions
 };
 
 const el = (id) => document.getElementById(id);
@@ -159,7 +153,8 @@ function pickDocType(id) {
 function clearDocType() {
   S.docType = null;
   S.chosen = [];
-  S.extra = '';
+  S.extras = [];
+  S.typing = '';
   S.menu = null;
   render();
 }
@@ -172,23 +167,25 @@ function toggleField(name) {
 }
 
 function wantsFields() {
-  return S.chosen.length > 0 || S.extra.trim().length > 0
-         || dealFields().length > 0;
+  return S.chosen.length > 0 || S.extras.length > 0;
 }
 
-/* Everything to search this transcript for: the ticked boxes, anything typed
- * in, and whatever the open deal's workbook has room for. Without the last
- * of those, a row added to the mapping by hand would never be filled,
- * because nothing would have looked for it. */
+/* Everything to search this transcript for: the ticked boxes and anything
+ * typed in. */
 function fieldsWanted() {
   const out = [];
-  S.chosen.concat(dealFields()).forEach((f) => {
+  S.chosen.forEach((f) => {
     if (f && !out.includes(f)) out.push(f);
   });
   return out;
 }
 
-/* ------------------------------------------------------------------- deals */
+
+async function loadChatModel() {
+  try {
+    S.chatModel = await api('/api/chat_model');
+  } catch (e) { /* the footer falls back to the general claim */ }
+}
 
 async function loadHistory() {
   try {
@@ -254,112 +251,6 @@ async function forget(id, event) {
   }
 }
 
-async function loadDeals() {
-  try {
-    S.deals = await api('/api/deals');
-  } catch (e) { /* the list is a convenience; the rest of the page still works */ }
-}
-
-async function openDeal(id) {
-  S.menu = null;
-  S.dealError = null;
-  try {
-    S.deal = await api(`/api/deals/${id}`);
-  } catch (e) {
-    S.dealError = e.message;
-  }
-  render();
-}
-
-function closeDeal() {
-  S.deal = null;
-  S.menu = null;
-  render();
-}
-
-/* Create a deal from a workbook you supply. Nothing is written to it: the
- * reply is a proposed mapping to check before anything lands. */
-async function startDeal(file) {
-  const name = S.dealName.trim();
-  if (!name) { toast('Give the deal a name first.'); return; }
-  if (!file) return;
-  S.dealBusy = true;
-  S.dealError = null;
-  render();
-  try {
-    const body = new FormData();
-    body.append('name', name);
-    body.append('file', file, file.name);
-    S.deal = await api('/api/deals', { method: 'POST', body });
-    S.dealName = '';
-    S.newDeal = false;
-    S.menu = null;
-    await loadDeals();
-    toast(`${S.deal.name}: ${S.deal.mapping.length} field(s) located`);
-  } catch (e) {
-    S.dealError = e.message;
-  }
-  S.dealBusy = false;
-  render();
-}
-
-function chooseWorkbook() {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = '.xlsx,.xlsm';
-  input.onchange = () => startDeal(input.files[0]);
-  input.click();
-}
-
-function setCell(field, cell) {
-  const row = S.deal.mapping.find((r) => r.field === field);
-  if (row) row.cell = cell.toUpperCase();
-}
-
-function dropFromMapping(field) {
-  S.deal.mapping = S.deal.mapping.filter((r) => r.field !== field);
-  render();
-}
-
-async function confirmMapping() {
-  S.dealBusy = true;
-  S.dealError = null;
-  render();
-  try {
-    S.deal = await api(`/api/deals/${S.deal.id}/mapping`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mapping: S.deal.mapping }),
-    });
-    toast('Mapping saved. Later documents will reuse it.');
-  } catch (e) {
-    S.dealError = e.message;
-  }
-  S.dealBusy = false;
-  render();
-}
-
-/* Put this document's fields into the deal's workbook. */
-async function addToDeal(msg) {
-  msg.dealBusy = true;
-  msg.dealError = null;
-  render();
-  try {
-    msg.dealResult = await api(`/api/deals/${S.deal.id}/apply`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run: msg.runId }),
-    });
-    S.deal = await api(`/api/deals/${S.deal.id}`);
-    const n = msg.dealResult.written.length;
-    toast(n ? `Wrote ${n} cell(s) into ${S.deal.name}`
-            : 'Nothing new for this deal.');
-  } catch (e) {
-    msg.dealError = e.message;
-  }
-  msg.dealBusy = false;
-  render();
-}
 
 /* Every field name the scan can recognise, for the suggestion list. The
  * vocabulary is small, which is why a template with its own labels needs
@@ -372,27 +263,6 @@ function knownFields() {
   return seen;
 }
 
-const dealFields = () =>
-  (S.deal && S.deal.mapping) ? S.deal.mapping.map((r) => r.field) : [];
-
-function addMappingRow() {
-  const field = S.addField.trim();
-  const cell = S.addCell.trim().toUpperCase();
-  if (!field) { toast('Name the field first.'); return; }
-  if (!/^[A-Z]{1,3}[1-9][0-9]*$/.test(cell)) {
-    toast(`${cell || 'That'} is not a cell reference, for example B7.`);
-    return;
-  }
-  if (S.deal.mapping.some((r) => r.field.toLowerCase() === field.toLowerCase())) {
-    toast(`${field} is already mapped.`);
-    return;
-  }
-  S.deal.mapping.push({ field, cell, sheet: '', label_cell: '',
-                        label_text: '', matched: '', how: 'set by hand' });
-  S.addField = '';
-  S.addCell = '';
-  render();
-}
 
 const isOpen = (key) => S.expanded.includes(key);
 const isFolded = (key) => S.collapsed.includes(key);
@@ -496,7 +366,7 @@ async function fillTemplate(msg, templateId) {
 async function extractNow(msg) {
   const type = docTypeById(S.docType);
   msg.docTypeName = type ? type.name : '';
-  msg.want = { fields: fieldsWanted(), extra: S.extra };
+  msg.want = { fields: fieldsWanted(), extra: S.extras.join(', ') };
   await extractFields(msg, msg.want.fields, msg.want.extra);
 }
 
@@ -521,12 +391,6 @@ async function extractFields(msg, wanted, extra) {
   msg.fieldsBusy = false;
   render();
 
-  // A deal is open, so this document was read into it. Confirming a mapping
-  // used to do nothing by itself: you then had to find a button on the
-  // Fields tab, and skipping it left the workbook empty with no sign why.
-  if (S.deal && msg.fieldRows && msg.fieldRows.some((r) => r.value)) {
-    await addToDeal(msg);
-  }
 }
 
 async function attach(file) {
@@ -557,12 +421,86 @@ function newRun() {
   render();
 }
 
+/* Whether there is anything to send: a document, or a typed question. */
+function canSend() {
+  if (S.busy) return false;
+  if (S.file) return true;
+  const ta = el('prompt-box');
+  const typed = ta ? ta.value : (S.prompt || '');
+  return typed.trim().length > 0;
+}
+
+/* Keep the Run button in step with the box without redrawing the composer. */
+function syncSend() {
+  const btn = document.querySelector('.composer .run');
+  if (btn) btn.disabled = !canSend();
+  const hint = document.querySelector('.composer-hint');
+  if (hint) hint.classList.toggle('needs-file', !S.file && canSend());
+}
+
+/* A typed question, answered by the local text model. Kept apart from run()
+ * on purpose: that one reads a document and reports what it found on the
+ * page, and the two must never be mistaken for each other in the thread. */
+async function ask() {
+  const text = (S.prompt || '').trim();
+  if (!text) return;
+
+  S.msgs.push({ role: 'you', text, file: null });
+  const msg = { role: 'chat', question: text, answer: '', model: '',
+                busy: true, error: null, startedAt: Date.now() };
+  S.msgs.push(msg);
+  S.busy = true;
+  S.prompt = '';
+  S.promptDirty = false;
+  render();
+
+  // Only the plain exchanges go back as history: a document run's transcript
+  // belongs to that document, not to this conversation.
+  const history = [];
+  S.msgs.forEach((m) => {
+    if (m.role === 'chat' && m.answer) {
+      history.push({ role: 'user', content: m.question });
+      history.push({ role: 'assistant', content: m.answer });
+    }
+  });
+
+  try {
+    const out = await api('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: text, history: history.slice(0, -2) }),
+    });
+    msg.answer = out.answer;
+    msg.model = out.model;
+  } catch (e) {
+    msg.error = e.message;
+  }
+  msg.busy = false;
+  S.busy = false;
+  render();
+}
+
 async function run() {
   if (S.busy) return;
-  if (!S.file) { toast('Add an image or a PDF first.'); return; }
+  if (!S.file) {
+    // No document: this is a plain question. The OCR models cannot answer
+    // one, so it goes to the local text model instead of being refused.
+    if ((S.prompt || '').trim()) return ask();
+    toast('Add an image or a PDF first.');
+    return;
+  }
   const m = modelById(S.model);
   if (!m) { toast('No model is available.'); return; }
 
+  // A document read starts its own chat rather than stacking under the last
+  // one, which is what the sidebar has always claimed: it lists runs, one row
+  // each, and reopening a row replaces the thread. A thread that accumulated
+  // three documents could not be any one of those rows, so the open entry and
+  // what was on screen disagreed as soon as you read a second document.
+  // Typed questions still append -- a chat is one document plus whatever was
+  // asked about it.
+  S.msgs = [];
+  S.openRun = null;
   S.msgs.push({ role: 'you', text: m.takes_prompt ? S.prompt : '', file: S.file });
   const msg = {
     role: 'run', model: m.id, modelName: m.name, file: S.file.name,
@@ -572,7 +510,8 @@ async function run() {
     // run was asked for.
     docType: S.docType,
     docTypeName: docTypeById(S.docType) ? docTypeById(S.docType).name : '',
-    want: wantsFields() ? { fields: fieldsWanted(), extra: S.extra } : null,
+    want: wantsFields() ? { fields: fieldsWanted(),
+                            extra: S.extras.join(', ') } : null,
     fieldRows: null, fieldSummary: '', fieldsBusy: false, fieldError: null,
   };
   S.msgs.push(msg);
@@ -587,6 +526,7 @@ async function run() {
       body: JSON.stringify({
         file_id: S.file.id, model: m.id,
         prompt: m.takes_prompt ? S.prompt : '', pages: S.pages, dpi: 300,
+        doc_type: S.docType || '',
       }),
     });
   } catch (e) {
@@ -918,8 +858,29 @@ function sidebar() {
 
   const foot = document.createElement('div');
   foot.className = 'side-foot';
-  foot.innerHTML = '<div><b>Everything runs here.</b> No image and no text '
-    + 'leaves this machine.</div>';
+  // The claim was written when this page only read documents. It is still
+  // true of the questions added since -- they go to a model on this machine
+  // -- but a reader cannot tell that from "no image and no text leaves",
+  // so the model answering them is named. If it is not running, say that
+  // instead of promising a privacy property for something that will fail.
+  const line = document.createElement('div');
+  const b = document.createElement('b');
+  b.textContent = 'Everything runs here.';
+  line.append(b);
+  const rest = document.createElement('span');
+  const cm = S.chatModel;
+  if (cm && cm.available) {
+    rest.textContent = ` Documents are read on this GPU and questions are `
+      + `answered by ${cm.model}, also on this machine. No image and no text `
+      + `leaves it.`;
+  } else if (cm) {
+    rest.textContent = ' No image and no text leaves this machine. Typed '
+      + `questions need ${cm.model}, which is not running.`;
+  } else {
+    rest.textContent = ' No image and no text leaves this machine.';
+  }
+  line.append(rest);
+  foot.append(line);
   node.append(foot);
   return node;
 }
@@ -933,6 +894,65 @@ function hello() {
     + '<p>Add an image or a PDF, pick a skill or a model, and run it. '
     + 'The models sit on your own GPU, and the first switch to one takes '
     + 'about 10 to 20 seconds while its weights load.</p>';
+  return d;
+}
+
+/* An answer from the local text model. Deliberately plainer than a run card:
+ * nothing here was read off a page, so it carries no evidence, no tabs and
+ * nothing to download. */
+function chatMsg(m) {
+  const d = document.createElement('div');
+  d.className = 'msg';
+  const b = document.createElement('div');
+  b.className = 'bubble answer';
+  if (m.busy) {
+    // A 13GB model on a shared card takes 20-60 seconds, and a motionless
+    // "Thinking..." for that long reads as a hang. The dots prove the page
+    // is alive and the clock proves the model is, so nobody reloads at 40s
+    // believing it died.
+    const wait = document.createElement('div');
+    wait.className = 'thinking';
+
+    const dots = document.createElement('span');
+    dots.className = 'thinking-dots';
+    dots.setAttribute('aria-hidden', 'true');
+    for (let i = 0; i < 3; i += 1) dots.append(document.createElement('i'));
+
+    const word = document.createElement('span');
+    word.className = 'thinking-word';
+    word.textContent = 'Thinking';
+
+    const clock = document.createElement('span');
+    clock.className = 'thinking-clock';
+    const since = m.startedAt || Date.now();
+    const tick = () => {
+      const secs = Math.round((Date.now() - since) / 1000);
+      clock.textContent = secs >= 1 ? `${secs}s` : '';
+      // The model is cold on the first question of a session and the wait is
+      // long enough to look broken. Say why rather than let it be a mystery.
+      if (secs === 12) word.textContent = 'Thinking — loading the model';
+      if (secs === 45) word.textContent = 'Thinking — still going';
+    };
+    tick();
+    const timer = setInterval(() => {
+      if (!document.body.contains(clock)) { clearInterval(timer); return; }
+      tick();
+    }, 1000);
+
+    wait.append(dots, word, clock);
+    b.append(wait);
+  } else if (m.error) {
+    const p = document.createElement('div');
+    p.className = 'fail';
+    p.textContent = m.error;
+    b.append(p);
+  } else {
+    const body = document.createElement('div');
+    body.className = 'answer-body';
+    body.textContent = m.answer;
+    b.append(body);
+  }
+  d.append(b);
   return d;
 }
 
@@ -1094,6 +1114,26 @@ function runMsg(m) {
     copy.onclick = () => copyOut(m);
     foot.append(copy);
 
+    // The two workbooks, side by side, because they answer different
+    // questions: the fields one is the values another tool reads, the table
+    // one is the document as it was rendered. Fields only appears once the
+    // fields have actually been pulled -- an empty workbook is worse than no
+    // button, since it looks like the read found nothing.
+    if (m.fieldRows && m.fieldRows.length) {
+      const fx = document.createElement('a');
+      fx.className = 'btn';
+      fx.href = `/api/runs/${m.runId}/export/fields`;
+      fx.innerHTML = `${svg('down', 14)}<span>Fields (XLSX)</span>`;
+      foot.append(fx);
+    }
+    if ((m.text || '').includes('<table')) {
+      const tx = document.createElement('a');
+      tx.className = 'btn';
+      tx.href = `/api/runs/${m.runId}/export/tables`;
+      tx.innerHTML = `${svg('down', 14)}<span>Table (XLSX)</span>`;
+      foot.append(tx);
+    }
+
     if (m.saved.length) {
       m.saved.forEach((f) => {
         const a = document.createElement('a');
@@ -1160,9 +1200,6 @@ function composer() {
     box.append(row);
   }
 
-  const deal = dealPanel();
-  if (deal) box.append(deal);
-
   const picker = fieldPicker();
   if (picker) box.append(picker);
 
@@ -1171,11 +1208,30 @@ function composer() {
   ta.id = 'prompt-box';
   ta.rows = 2;
   ta.value = S.prompt;
-  ta.placeholder = model && !model.takes_prompt
-    ? `${model.name} takes no prompt. It runs a fixed layout pipeline.`
-    : 'Tell the model what to read, or leave its default prompt as it is…';
-  ta.disabled = !!(model && !model.takes_prompt);
-  ta.oninput = () => { S.prompt = ta.value; S.promptDirty = true; };
+  // Whether the box is usable depends on whether a document is attached, not
+  // on the reader. With a file, this is the instruction for reading it, and a
+  // fixed-pipeline reader has no use for one. With no file it is a question
+  // for the text model, which every reader is irrelevant to -- and disabling
+  // it then left nowhere to type at all.
+  const fixedReader = !!(model && !model.takes_prompt);
+  ta.disabled = !!S.file && fixedReader;
+  if (S.file) {
+    ta.placeholder = fixedReader
+      ? `${model.name} takes no prompt. It runs a fixed layout pipeline.`
+      : 'Tell the model what to read, or leave its default prompt as it is…';
+  } else {
+    ta.placeholder = 'Ask a question, or attach a document to read…';
+  }
+  ta.oninput = () => {
+    S.prompt = ta.value;
+    S.promptDirty = true;
+    // The Run button's disabled state depends on this text, and typing used
+    // to change the state without redrawing anything -- so the button stayed
+    // greyed out however much you typed, and the page looked broken. Updated
+    // here rather than by a full render(), which would rebuild the textarea
+    // under the cursor on every keystroke.
+    syncSend();
+  };
   ta.onkeydown = (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); }
   };
@@ -1234,29 +1290,14 @@ function composer() {
   };
   row.append(dt);
 
-  const dealBtn = document.createElement('button');
-  dealBtn.type = 'button';
-  dealBtn.className = 'model-btn';
-  dealBtn.setAttribute('aria-expanded', String(S.menu === 'deal'));
-  dealBtn.innerHTML = `${svg('table', 14)}<span></span>`
-    + (S.deal ? '<span class="tag"></span>' : '');
-  dealBtn.querySelector('span').textContent = S.deal ? S.deal.name : 'Deal';
-  if (S.deal) {
-    dealBtn.querySelector('.tag').textContent =
-      `${Object.keys(S.deal.filled || {}).length}/${S.deal.mapping.length}`;
-  }
-  dealBtn.onclick = (e) => {
-    e.stopPropagation();
-    S.menu = S.menu === 'deal' ? null : 'deal';
-    render();
-  };
-  row.append(dealBtn);
 
   const go = document.createElement('button');
   go.type = 'button';
   go.className = 'run';
   go.setAttribute('aria-label', 'Run');
-  go.disabled = S.busy || !S.file;
+  // A question with nothing attached is a legitimate thing to send, so the
+  // button is live for that too. Same rule the keystroke handler uses.
+  go.disabled = !canSend();
   go.innerHTML = svg('send', 18);
   go.onclick = run;
   row.append(go);
@@ -1265,14 +1306,30 @@ function composer() {
   if (S.menu === 'attach') box.append(attachMenu());
   if (S.menu === 'model') box.append(modelMenu());
   if (S.menu === 'doctype') box.append(docTypeMenu());
-  if (S.menu === 'deal') box.append(dealMenu());
 
   wrap.append(box);
   const hint = document.createElement('div');
   hint.className = 'composer-hint';
-  hint.textContent = S.busy
-    ? 'Running. The Run button comes back when it finishes.'
-    : 'Ctrl+Enter runs · Ctrl+V pastes an image · drop a file anywhere on the box';
+  // Typing with nothing attached used to do nothing at all: the Run button
+  // greyed itself out and said why only in a toast that a disabled button
+  // never fires. These models read documents -- they do not converse -- so
+  // the box has to say that rather than leave someone waiting for a reply.
+  const typedOnly = !S.busy && !S.file && (S.prompt || '').trim().length > 0;
+  if (S.busy) {
+    hint.textContent = 'Running. The Run button comes back when it finishes.';
+  } else if (typedOnly) {
+    hint.classList.add('needs-file');
+    const m = modelById(S.model);
+    hint.textContent = m && m.takes_prompt
+      ? `${m.name} reads a document — it does not answer on its own. `
+        + 'Attach an image or PDF and this becomes the instruction for '
+        + 'reading it.'
+      : `${m ? m.name : 'This model'} reads a document. Attach an image or a `
+        + 'PDF to run it.';
+  } else {
+    hint.textContent =
+      'Ctrl+Enter runs · Ctrl+V pastes an image · drop a file anywhere on the box';
+  }
   wrap.append(hint);
   return wrap;
 }
@@ -1330,269 +1387,6 @@ function docTypeMenu() {
   return m;
 }
 
-function dealMenu() {
-  const m = document.createElement('div');
-  m.className = 'menu right';
-  m.onclick = (e) => e.stopPropagation();
-  m.innerHTML = '<div class="menu-label">Deal workbook</div>';
-  S.deals.forEach((d) => {
-    const b = menuItem('table', d.name,
-                       `${d.filled} of ${d.mapped} filled, `
-                       + `${d.documents} document(s)`,
-                       () => openDeal(d.id), S.deal && S.deal.id === d.id);
-    m.append(b);
-  });
-  m.append(menuItem('plus', 'New deal', 'From a workbook you supply', () => {
-    // Not S.menu: the global click handler closes a menu on the next click
-    // anywhere, which killed this form the moment the name box was clicked.
-    S.newDeal = true;
-    S.menu = null;
-    render();
-  }));
-  if (S.deal) {
-    m.append(menuItem('x', 'Work without a deal',
-                      'Read documents on their own', closeDeal, false));
-  }
-  return m;
-}
-
-/* The new-deal form and the mapping review, both shown in the composer. */
-function dealPanel() {
-  if (S.newDeal) {
-    const panel = document.createElement('div');
-    panel.className = 'picker';
-    const head = document.createElement('div');
-    head.className = 'picker-head';
-    const title = document.createElement('div');
-    title.innerHTML = '<strong>New deal</strong><small></small>';
-    title.querySelector('small').textContent =
-      'Supply the workbook for this deal. It is copied, never written to.';
-    head.append(title);
-    const cancel = document.createElement('button');
-    cancel.type = 'button';
-    cancel.className = 'link';
-    cancel.textContent = 'Cancel';
-    cancel.onclick = () => {
-      S.newDeal = false;
-      S.dealError = null;
-      render();
-    };
-    head.append(cancel);
-    panel.append(head);
-
-    const row = document.createElement('div');
-    row.className = 'picker-extra';
-    const lab = document.createElement('label');
-    lab.htmlFor = 'deal-name';
-    lab.textContent = 'Deal name';
-    const input = document.createElement('input');
-    input.id = 'deal-name';
-    input.type = 'text';
-    input.placeholder = 'for example Maple Avenue acquisition';
-    input.value = S.dealName;
-    // Re-render so the button below follows what is typed. The caret is
-    // restored by id, so this does not interrupt typing.
-    input.oninput = () => { S.dealName = input.value; render(); };
-    row.append(lab, input);
-    panel.append(row);
-
-    const bar = document.createElement('div');
-    bar.className = 'template-bar';
-    const pick = document.createElement('button');
-    pick.type = 'button';
-    pick.className = 'btn primary';
-    const named = S.dealName.trim().length > 0;
-    pick.disabled = S.dealBusy || !named;
-    pick.innerHTML = `${svg('table', 14)}<span></span>`;
-    pick.querySelector('span').textContent =
-      S.dealBusy ? 'Reading the workbook...' : 'Choose workbook';
-    pick.title = named ? 'Pick the .xlsx for this deal'
-                       : 'Name the deal first';
-    pick.onclick = chooseWorkbook;
-    bar.append(pick);
-    if (!named) {
-      const hint = document.createElement('span');
-      hint.className = 'muted-line';
-      hint.textContent = 'Name the deal, then choose its workbook.';
-      bar.append(hint);
-    }
-    panel.append(bar);
-    if (S.dealError) {
-      const f = document.createElement('div');
-      f.className = 'fail';
-      f.textContent = S.dealError;
-      panel.append(f);
-    }
-    return panel;
-  }
-
-  if (!S.deal) return null;
-
-  const panel = document.createElement('div');
-  panel.className = 'picker';
-  const head = document.createElement('div');
-  head.className = 'picker-head';
-  const title = document.createElement('div');
-  title.innerHTML = '<strong></strong><small></small>';
-  title.querySelector('strong').textContent = S.deal.name;
-  const done = Object.keys(S.deal.filled || {}).length;
-  const seen = (S.deal.history || []).length;
-  title.querySelector('small').textContent = S.deal.confirmed
-    ? (seen
-        ? `${done} of ${S.deal.mapping.length} cells filled, from `
-          + `${seen} document(s)`
-        : `Nothing read into it yet. Add a document below and run it: its `
-          + `fields land in these ${S.deal.mapping.length} cells.`)
-    : 'Check where each field will go, correct anything wrong, then confirm.';
-  head.append(title);
-
-  const grab = document.createElement('a');
-  grab.className = 'link';
-  grab.href = `/api/deals/${S.deal.id}/workbook`;
-  grab.textContent = 'Download';
-  head.append(grab);
-  const shut = document.createElement('button');
-  shut.type = 'button';
-  shut.className = 'link';
-  shut.textContent = 'Close';
-  shut.onclick = closeDeal;
-  head.append(shut);
-  panel.append(head);
-
-  if (!S.deal.mapping.length) {
-    const none = document.createElement('div');
-    none.className = 'muted-line';
-    none.textContent = 'No field names were recognised in that workbook. '
-      + 'Label the cells with field names and start the deal again.';
-    panel.append(none);
-    return panel;
-  }
-
-  // Only the proposal is editable. Once confirmed it reads as a summary.
-  const list = document.createElement('div');
-  list.className = 'map-list';
-  S.deal.mapping.forEach((row) => {
-    const line = document.createElement('div');
-    line.className = 'map-row';
-
-    const name = document.createElement('span');
-    name.className = 'map-field';
-    name.textContent = row.field;
-    line.append(name);
-
-    const found = document.createElement('span');
-    found.className = 'map-how';
-    found.textContent = row.label_text
-      ? `"${row.label_text}" at ${row.sheet ? row.sheet + '!' : ''}${row.label_cell}`
-      : (row.how || '');
-    line.append(found);
-
-    if (S.deal.confirmed) {
-      const at = document.createElement('span');
-      at.className = 'verdict ok';
-      at.textContent = row.cell;
-      line.append(at);
-    } else {
-      const cell = document.createElement('input');
-      cell.className = 'map-cell';
-      cell.id = `map-${row.field.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
-      cell.type = 'text';
-      cell.value = row.cell;
-      cell.oninput = () => setCell(row.field, cell.value);
-      line.append(cell);
-      const drop = document.createElement('button');
-      drop.type = 'button';
-      drop.className = 'link';
-      drop.textContent = 'Remove';
-      drop.onclick = () => dropFromMapping(row.field);
-      line.append(drop);
-    }
-    list.append(line);
-  });
-  panel.append(list);
-
-  if (!S.deal.confirmed) {
-    // The scan only knows the names the document types list, so a template
-    // with its own labels needs rows added here.
-    const add = document.createElement('div');
-    add.className = 'map-row map-add';
-
-    const list = document.createElement('datalist');
-    list.id = 'known-fields';
-    knownFields().forEach((f) => {
-      const option = document.createElement('option');
-      option.value = f;
-      list.append(option);
-    });
-    add.append(list);
-
-    const field = document.createElement('input');
-    field.id = 'add-field';
-    field.className = 'map-field-input';
-    field.type = 'text';
-    field.setAttribute('list', 'known-fields');
-    field.placeholder = 'Field name, for example Meter number';
-    field.value = S.addField;
-    field.oninput = () => { S.addField = field.value; };
-    add.append(field);
-
-    const cell = document.createElement('input');
-    cell.id = 'add-cell';
-    cell.className = 'map-cell';
-    cell.type = 'text';
-    cell.placeholder = 'B7';
-    cell.value = S.addCell;
-    cell.oninput = () => { S.addCell = cell.value; };
-    cell.onkeydown = (e) => { if (e.key === 'Enter') addMappingRow(); };
-    add.append(cell);
-
-    const plus = document.createElement('button');
-    plus.type = 'button';
-    plus.className = 'link';
-    plus.textContent = 'Add';
-    plus.onclick = addMappingRow;
-    add.append(plus);
-    panel.append(add);
-
-    const note = document.createElement('div');
-    note.className = 'muted-line';
-    note.textContent = 'Any name works, not only the suggested ones. '
-      + 'Whatever is mapped here is what gets looked for in each document.';
-    panel.append(note);
-
-    const bar = document.createElement('div');
-    bar.className = 'template-bar';
-    const ok = document.createElement('button');
-    ok.type = 'button';
-    ok.className = 'btn primary';
-    ok.disabled = S.dealBusy;
-    ok.innerHTML = `${svg('fields', 14)}<span></span>`;
-    ok.querySelector('span').textContent =
-      S.dealBusy ? 'Saving...' : 'Confirm mapping';
-    ok.onclick = confirmMapping;
-    bar.append(ok);
-    panel.append(bar);
-  }
-  else {
-    const bar = document.createElement('div');
-    bar.className = 'template-bar';
-    const edit = document.createElement('button');
-    edit.type = 'button';
-    edit.className = 'btn';
-    edit.innerHTML = `${svg('fields', 14)}<span>Edit mapping</span>`;
-    edit.title = 'Add more fields, or move one to another cell';
-    edit.onclick = () => { S.deal.confirmed = false; render(); };
-    bar.append(edit);
-    panel.append(bar);
-  }
-  if (S.dealError) {
-    const f = document.createElement('div');
-    f.className = 'fail';
-    f.textContent = S.dealError;
-    panel.append(f);
-  }
-  return panel;
-}
 
 /* The field checklist, shown inside the composer once a type is chosen. */
 function fieldPicker() {
@@ -1666,13 +1460,76 @@ function fieldPicker() {
   const lab = document.createElement('label');
   lab.htmlFor = 'extra-fields';
   lab.textContent = d.fields.length ? 'Other fields' : 'Fields to find';
+  extra.append(lab);
+
+  // One field at a time, each its own chip. A comma-separated box asked the
+  // reader to do the parsing: you could not see where one field ended and
+  // the next began, could not remove the middle one without re-typing the
+  // line, and a stray comma silently became two fields or none.
+  if (S.extras.length) {
+    const added = document.createElement('div');
+    added.className = 'field-grid';
+    S.extras.forEach((name) => {
+      const chip = document.createElement('span');
+      chip.className = 'field-chip added';
+      const txt = document.createElement('span');
+      txt.textContent = name;
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'chip-x';
+      x.setAttribute('aria-label', `Remove ${name}`);
+      x.textContent = '×';
+      x.onclick = () => {
+        S.extras = S.extras.filter((f) => f !== name);
+        render();
+      };
+      chip.append(txt, x);
+      added.append(chip);
+    });
+    extra.append(added);
+  }
+
+  const row = document.createElement('div');
+  row.className = 'add-field-row';
   const inp = document.createElement('input');
   inp.id = 'extra-fields';
   inp.type = 'text';
-  inp.placeholder = 'Comma separated, for example Meter number, Tariff';
-  inp.value = S.extra;
-  inp.oninput = () => { S.extra = inp.value; };
-  extra.append(lab, inp);
+  inp.placeholder = d.fields.length
+    ? 'Add a field, for example Meter number'
+    : 'Name a field to find, for example Tenant name';
+  inp.value = S.typing;
+  inp.oninput = () => { S.typing = inp.value; };
+
+  const addNow = () => {
+    // Accept a pasted list too: someone used to typing commas should not be
+    // punished for it, they just get one chip per name.
+    const names = inp.value.split(',').map((t) => t.trim()).filter(Boolean);
+    let added = 0;
+    names.forEach((n) => {
+      if (!S.extras.includes(n) && !S.chosen.includes(n)) {
+        S.extras.push(n);
+        added += 1;
+      }
+    });
+    S.typing = '';
+    if (!added && names.length) toast('Already on the list.');
+    render();
+    const again = el('extra-fields');
+    if (again) again.focus();
+  };
+
+  inp.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addNow(); }
+  };
+
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'btn';
+  add.textContent = 'Add';
+  add.onclick = addNow;
+
+  row.append(inp, add);
+  extra.append(row);
   panel.append(extra);
   return panel;
 }
@@ -1703,7 +1560,7 @@ function fieldsTable(m) {
     p.className = 'muted-line';
     p.textContent = type
       ? `${type.name}: ${S.chosen.length} field(s) ticked`
-        + (S.extra.trim() ? ` plus ${S.extra.trim()}` : '')
+        + (S.extras.length ? ` plus ${S.extras.join(', ')}` : '')
       : 'Choose a document type with the Fields button below, or type the '
         + 'field names you want, then pull them out of this transcript.';
     wrap.append(p);
@@ -1803,51 +1660,8 @@ function fieldsTable(m) {
       bar.append(b);
     });
   }
-  if (S.deal) {
-    const add = document.createElement('button');
-    add.type = 'button';
-    add.className = 'btn primary';
-    add.disabled = !!m.dealBusy;
-    add.innerHTML = `${svg('table', 14)}<span></span>`;
-    add.querySelector('span').textContent = m.dealBusy
-      ? 'Adding...' : `Add to ${S.deal.name}`;
-    add.title = 'Write these fields into the deal workbook';
-    add.onclick = () => addToDeal(m);
-    bar.append(add);
-  }
   // Appended either way: a type with no template still gets Extract again.
   wrap.append(bar);
-
-  if (m.dealError) {
-    const f = document.createElement('div');
-    f.className = 'fail';
-    f.textContent = m.dealError;
-    wrap.append(f);
-  }
-
-  if (m.dealResult) {
-    const done = document.createElement('div');
-    done.className = 'filled';
-    const line = document.createElement('div');
-    line.className = 'muted-line';
-    const bits = [`${m.dealResult.written.length} cell(s) written`];
-    if (m.dealResult.clashed.length) {
-      bits.push('kept the earlier answer for '
-        + m.dealResult.clashed.map((c) => `${c.field} (${c.kept}, from `
-            + `${c.from}; this document said ${c.offered})`).join('; '));
-    }
-    if (m.dealResult.skipped.length) {
-      bits.push(`${m.dealResult.skipped.length} field(s) this document did `
-        + 'not carry');
-    }
-    line.textContent = bits.join('. ') + '.';
-    const a = document.createElement('a');
-    a.className = 'btn primary';
-    a.href = m.dealResult.download;
-    a.innerHTML = `${svg('down', 14)}<span>Workbook</span>`;
-    done.append(a, line);
-    wrap.append(done);
-  }
 
   if (m.fillError) {
     const f = document.createElement('div');
@@ -1928,7 +1742,11 @@ function render() {
   const inner = document.createElement('div');
   inner.className = 'thread-inner';
   if (!S.msgs.length) inner.append(hello());
-  S.msgs.forEach((m) => inner.append(m.role === 'you' ? youMsg(m) : runMsg(m)));
+  S.msgs.forEach((m) => {
+    if (m.role === 'you') inner.append(youMsg(m));
+    else if (m.role === 'chat') inner.append(chatMsg(m));
+    else inner.append(runMsg(m));
+  });
   thread.append(inner);
   main.append(thread);
 
@@ -1976,8 +1794,10 @@ document.addEventListener('paste', (e) => {
     S.skills = skills;
     S.docTypes = docTypes;
     S.templates = templates;
-    await loadDeals();
     await loadHistory();
+    // Not in the Promise.all above: this one reaches out to the model
+    // service, and the page should still come up if that is down.
+    await loadChatModel();
     if (models.length) {
       S.model = models[0].id;
       S.prompt = promptFor(models[0]);
