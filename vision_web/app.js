@@ -21,6 +21,7 @@ const ICON = {
   copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   down: '<path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M4 21h16"/>',
   x: '<path d="M18 6L6 18"/><path d="M6 6l12 12"/>',
+  pop: '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5"/>',
   chev: '<path d="M9 6l6 6-6 6"/>',
   fields: '<rect x="3" y="4" width="5" height="5" rx="1"/><rect x="3" y="15" width="5" height="5" rx="1"/><path d="M11 6.5h10"/><path d="M11 17.5h10"/>',
 };
@@ -76,6 +77,15 @@ const S = {
   openRun: null,   // the run the thread is currently showing
   search: '',      // filter over the run list
   chatModel: null, // the local model that answers typed questions
+  // What the side panel is showing, and how wide it is. The width is
+  // remembered because a panel that resets to a default every time is one
+  // nobody drags to a useful size twice.
+  // The thread's own id. A conversation with no document has no run to be
+  // identified by, and without this it could not be written down -- which is
+  // how a page reload used to throw the whole conversation away.
+  threadId: null,
+  view: null,      // { src, name, download }
+  viewWidth: Number(localStorage.getItem('lv-view-w')) || 520,
 };
 
 const el = (id) => document.getElementById(id);
@@ -181,6 +191,142 @@ function fieldsWanted() {
 }
 
 
+/* A thread id, in the shape the server stores records under. */
+function newThreadId() {
+  const b = new Uint8Array(16);
+  (window.crypto || {}).getRandomValues
+    ? window.crypto.getRandomValues(b)
+    : b.forEach((_, i) => { b[i] = Math.floor(Math.random() * 256); });
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/* Write the conversation down. Called after every answer rather than on the
+ * way out: there is no "on the way out" for a browser tab, and a thread that
+ * is only in memory is one refresh from being gone. */
+async function saveThread() {
+  if (!S.threadId) return;
+  const turns = S.msgs
+    .filter((m) => m.role === 'chat' && (m.answer || m.error))
+    .map((m) => ({ question: m.question, answer: m.answer || '',
+                   model: m.model || '' }));
+  if (!turns.length) return;
+  const first = turns[0].question.replace(/\s+/g, ' ').trim();
+  try {
+    await api('/api/history/thread', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: S.threadId,
+        title: first.slice(0, 90),
+        turns,
+      }),
+    });
+    await loadHistory();
+    render();
+  } catch (e) {
+    // Losing the conversation silently is the thing this exists to prevent.
+    toast(`This conversation was not saved: ${e.message}`);
+  }
+}
+
+/* ------------------------------------------------------- the side panel */
+
+/* Open a document beside the thread. The point is checking: a value pulled
+ * off a page is worth nothing to whoever signs it off unless they can put it
+ * next to the page it came from. */
+function openView(src, name, download) {
+  S.view = { src, name, download: download || '' };
+  render();
+}
+
+function closeView() {
+  S.view = null;
+  render();
+}
+
+function viewPanel() {
+  const wrap = document.createElement('div');
+  wrap.className = 'viewer';
+  wrap.style.width = `${S.viewWidth}px`;
+
+  const head = document.createElement('div');
+  head.className = 'viewer-head';
+  const title = document.createElement('div');
+  title.className = 'viewer-name';
+  title.textContent = S.view.name;
+  title.title = S.view.name;
+  head.append(title);
+
+  if (S.view.download) {
+    const dl = document.createElement('a');
+    dl.className = 'icon-btn';
+    dl.href = S.view.download;
+    dl.setAttribute('aria-label', `Download ${S.view.name}`);
+    dl.innerHTML = svg('down', 16);
+    head.append(dl);
+  }
+  const pop = document.createElement('a');
+  pop.className = 'icon-btn';
+  pop.href = `/api/view?src=${encodeURIComponent(S.view.src)}`;
+  pop.target = '_blank';
+  pop.rel = 'noopener';
+  pop.setAttribute('aria-label', 'Open in a new tab');
+  pop.innerHTML = svg('pop', 16);
+  head.append(pop);
+
+  const x = document.createElement('button');
+  x.className = 'icon-btn';
+  x.type = 'button';
+  x.setAttribute('aria-label', 'Close the preview');
+  x.innerHTML = svg('x', 16);
+  x.onclick = closeView;
+  head.append(x);
+  wrap.append(head);
+
+  // One iframe for every kind of file. A PDF and an image are served as
+  // themselves and the browser draws them; a workbook, a document or a text
+  // file is rendered to HTML first. The page does not have to know which.
+  const frame = document.createElement('iframe');
+  frame.className = 'viewer-body';
+  frame.src = `/api/view?src=${encodeURIComponent(S.view.src)}`;
+  frame.title = S.view.name;
+  wrap.append(frame);
+  return wrap;
+}
+
+/* The drag handle. Width is written straight to the two elements while the
+ * pointer moves: re-rendering the page on every mousemove would rebuild the
+ * whole thread, and the drag would stutter against it. */
+function viewGrip() {
+  const grip = document.createElement('div');
+  grip.className = 'viewer-grip';
+  grip.setAttribute('role', 'separator');
+  grip.setAttribute('aria-label', 'Resize the preview');
+  grip.onpointerdown = (e) => {
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+    const panel = grip.nextSibling;
+    const startX = e.clientX;
+    const startW = panel.getBoundingClientRect().width;
+    const move = (ev) => {
+      const want = startW + (startX - ev.clientX);
+      const max = Math.max(320, window.innerWidth - 420);
+      S.viewWidth = Math.round(Math.min(Math.max(want, 320), max));
+      panel.style.width = `${S.viewWidth}px`;
+    };
+    const up = () => {
+      grip.releasePointerCapture(e.pointerId);
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      try { localStorage.setItem('lv-view-w', String(S.viewWidth)); }
+      catch (err) { /* a remembered width is not worth failing over */ }
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+  return grip;
+}
+
 async function loadChatModel() {
   try {
     S.chatModel = await api('/api/chat_model');
@@ -216,7 +362,8 @@ async function reopen(id) {
     const model = modelById(entry.model);
     // Replaces the thread rather than adding to it: picking one from the
     // list is opening it, not stacking it on whatever was already there.
-    S.msgs = [
+    const read = entry.file || (entry.text || '').trim();
+    S.msgs = !read ? [] : [
       { role: 'you', text: '', file: { name: entry.file, pdf: false } },
       {
         role: 'run', runId: entry.id, model: entry.model,
@@ -231,7 +378,17 @@ async function reopen(id) {
         tab: (entry.fields || []).length ? 'fields' : null,
       },
     ];
+    // The typed conversation comes back with it. A thread is one document
+    // plus what was asked about it, and reopening half of that was how the
+    // questions came to be lost.
+    (entry.turns || []).forEach((t) => {
+      S.msgs.push({ role: 'you', text: t.question, file: null });
+      S.msgs.push({ role: 'chat', question: t.question, answer: t.answer || '',
+                    model: t.model || '', busy: false, error: null,
+                    startedAt: 0 });
+    });
     S.openRun = id;
+    S.threadId = id;
     S.file = null;
     render();
   } catch (e) {
@@ -414,6 +571,7 @@ function detach() {
 function newRun() {
   S.msgs = [];
   S.openRun = null;
+  S.threadId = null;
   S.file = null;
   S.prompt = promptFor(modelById(S.model));
   S.promptDirty = false;
@@ -444,6 +602,8 @@ function syncSend() {
 async function ask() {
   const text = (S.prompt || '').trim();
   if (!text) return;
+  // A thread with no document still needs somewhere to be remembered.
+  if (!S.threadId) S.threadId = newThreadId();
 
   S.msgs.push({ role: 'you', text, file: null });
   const msg = { role: 'chat', question: text, answer: '', model: '',
@@ -454,8 +614,10 @@ async function ask() {
   S.promptDirty = false;
   render();
 
-  // Only the plain exchanges go back as history: a document run's transcript
-  // belongs to that document, not to this conversation.
+  // Every finished exchange in this thread, oldest first. The message just
+  // pushed has no answer yet, so it is not in here -- which is why nothing is
+  // sliced off the end. Doing that dropped the most recent exchange, and
+  // "rewrite that, more casual" arrived with the thing to rewrite missing.
   const history = [];
   S.msgs.forEach((m) => {
     if (m.role === 'chat' && m.answer) {
@@ -464,11 +626,23 @@ async function ask() {
     }
   });
 
+  // A chat is one document plus what was asked about it, so the document goes
+  // too. Without it the model was told it could not see one, and a question
+  // about the page on screen could only be refused. The server decides how
+  // much of it fits.
+  const read = S.msgs.filter((m) => m.role === 'run' && m.text);
+  const doc = read.length ? read[read.length - 1] : null;
+
   try {
     const out = await api('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: text, history: history.slice(0, -2) }),
+      body: JSON.stringify({
+        prompt: text,
+        history,
+        document: doc ? doc.text : '',
+        document_name: doc ? doc.file : '',
+      }),
     });
     msg.answer = out.answer;
     msg.model = out.model;
@@ -478,6 +652,7 @@ async function ask() {
   msg.busy = false;
   S.busy = false;
   render();
+  saveThread();
 }
 
 async function run() {
@@ -501,6 +676,7 @@ async function run() {
   // asked about it.
   S.msgs = [];
   S.openRun = null;
+  S.threadId = null;      // the run's own id becomes it, once it is started
   S.msgs.push({ role: 'you', text: m.takes_prompt ? S.prompt : '', file: S.file });
   const msg = {
     role: 'run', model: m.id, modelName: m.name, file: S.file.name,
@@ -538,6 +714,7 @@ async function run() {
   }
 
   msg.runId = started.id;
+  S.threadId = started.id;
   msg.steps = started.steps.map((name, i) => ({ i, name, state: 'wait', note: '' }));
   S.openRun = started.id;
   render();
@@ -795,7 +972,8 @@ function sidebar() {
   // are enough of them to need one. A run joins it the moment it finishes.
   const needle = S.search.trim().toLowerCase();
   const matching = S.history.filter(
-    (h) => !needle || h.file.toLowerCase().includes(needle)
+    (h) => !needle || (h.file || '').toLowerCase().includes(needle)
+           || (h.title || '').toLowerCase().includes(needle)
            || (h.model_name || '').toLowerCase().includes(needle));
 
   if (S.history.length > 6 || needle) {
@@ -832,11 +1010,19 @@ function sidebar() {
       b.setAttribute('aria-current', String(S.openRun === h.id));
       b.innerHTML = '<span class="past-text"><span class="past-file"></span>'
         + '<span class="past-sub"></span></span>';
-      b.querySelector('.past-file').textContent = h.file;
-      b.querySelector('.past-sub').textContent =
-        `${h.model_name}${h.fields ? `, ${h.fields} fields` : ''}`;
-      b.title = `${h.file}, read with ${h.model_name}`
-        + (h.chars ? `, ${h.chars} characters` : '');
+      // A conversation with no document is named by what was first asked
+      // in it, the way a chat sidebar names a chat.
+      const asked = h.turns ? `${h.turns} message${h.turns === 1 ? '' : 's'}` : '';
+      b.querySelector('.past-file').textContent =
+        h.file || h.title || 'Untitled conversation';
+      b.querySelector('.past-sub').textContent = h.file
+        ? `${h.model_name}${h.fields ? `, ${h.fields} fields` : ''}`
+          + (asked ? `, ${asked}` : '')
+        : asked;
+      b.title = h.file
+        ? `${h.file}, read with ${h.model_name}`
+          + (h.chars ? `, ${h.chars} characters` : '')
+        : (h.title || 'Conversation');
       b.onclick = () => reopen(h.id);
       row.append(b);
       const x = document.createElement('button');
@@ -972,10 +1158,21 @@ function youMsg(m) {
       img.alt = '';
       chip.append(img);
     }
-    const name = document.createElement('span');
+    const name = document.createElement('button');
+    name.type = 'button';
+    name.className = 'openable';
     name.textContent = m.file.pdf
       ? `${m.file.name} · ${m.file.pages} page${m.file.pages === 1 ? '' : 's'}`
       : m.file.name;
+    // The source, beside the values that were taken off it.
+    if (m.file.id) {
+      name.onclick = () => openView(`upload:${m.file.id}`, m.file.name);
+    } else {
+      name.disabled = true;
+      name.className = '';
+      name.title = 'This document was read in an earlier session and is no '
+        + 'longer held on disk.';
+    }
     chip.append(name);
     row.append(chip);
     b.append(row);
@@ -1016,9 +1213,18 @@ function runMsg(m) {
   head.innerHTML = `<span class="pick-icon">${svg(model ? model.icon : 'eye', 15)}</span>`
     + '<span class="card-title"><strong></strong><small></small></span>';
   head.querySelector('strong').textContent = m.modelName;
-  head.querySelector('small').textContent = m.status === 'running'
-    ? `reading ${m.file}…`
-    : `${m.file}${m.elapsed ? ` · ${m.elapsed.toFixed(1)}s` : ''}`;
+  const sub = head.querySelector('small');
+  if (m.status === 'running') {
+    sub.textContent = `reading ${m.file}…`;
+  } else {
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'openable';
+    open.textContent = m.file;
+    open.onclick = () => openView(`run:${m.runId}`, m.file);
+    sub.append(open);
+    if (m.elapsed) sub.append(` · ${m.elapsed.toFixed(1)}s`);
+  }
   card.append(head);
 
   // the live timeline
@@ -1119,28 +1325,32 @@ function runMsg(m) {
     // one is the document as it was rendered. Fields only appears once the
     // fields have actually been pulled -- an empty workbook is worse than no
     // button, since it looks like the read found nothing.
-    if (m.fieldRows && m.fieldRows.length) {
-      const fx = document.createElement('a');
-      fx.className = 'btn';
-      fx.href = `/api/runs/${m.runId}/export/fields`;
-      fx.innerHTML = `${svg('down', 14)}<span>Fields (XLSX)</span>`;
-      foot.append(fx);
-    }
-    if ((m.text || '').includes('<table')) {
-      const tx = document.createElement('a');
-      tx.className = 'btn';
-      tx.href = `/api/runs/${m.runId}/export/tables`;
-      tx.innerHTML = `${svg('down', 14)}<span>Table (XLSX)</span>`;
-      foot.append(tx);
-    }
+    // Both workbooks open in the panel rather than downloading straight
+    // away. Checking what is about to be sent is the whole reason the panel
+    // exists; the download sits in its header, one click further on.
+    const workbook = (what, label, on) => {
+      if (!on) return;
+      const b = document.createElement('button');
+      b.className = 'btn';
+      b.type = 'button';
+      b.innerHTML = `${svg('sheet', 14)}<span>${label}</span>`;
+      b.onclick = () => openView(`export:${m.runId}:${what}`,
+                                 `${m.file} — ${label}`,
+                                 `/api/runs/${m.runId}/export/${what}`);
+      foot.append(b);
+    };
+    workbook('fields', 'Fields (XLSX)', m.fieldRows && m.fieldRows.length);
+    workbook('tables', 'Table (XLSX)', (m.text || '').includes('<table'));
 
     if (m.saved.length) {
       m.saved.forEach((f) => {
-        const a = document.createElement('a');
-        a.className = 'btn';
-        a.href = `/api/runs/${m.runId}/download/${f.i}`;
-        a.textContent = f.name.split('.').pop().toUpperCase();
-        foot.append(a);
+        const b = document.createElement('button');
+        b.className = 'btn';
+        b.type = 'button';
+        b.textContent = f.name.split('.').pop().toUpperCase();
+        b.onclick = () => openView(`saved:${m.runId}:${f.i}`, f.name,
+                                   `/api/runs/${m.runId}/download/${f.i}`);
+        foot.append(b);
       });
     } else {
       const save = document.createElement('button');
@@ -1752,6 +1962,7 @@ function render() {
 
   main.append(composer());
   app.append(main);
+  if (S.view) { app.append(viewGrip()); app.append(viewPanel()); }
 
   if (hadCaret) {
     const node = hadCaret.id ? app.querySelector('#' + hadCaret.id)

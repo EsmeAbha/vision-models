@@ -44,7 +44,16 @@ class Node {
   get innerHTML() { return this.children.map(serialise).join(''); }
 
   append(...nodes) {
-    for (const n of nodes) if (n) this.children.push(n);
+    // append('some text') is ordinary DOM and makes a text node. Pushing the
+    // bare string instead left something in children with no matches() on
+    // it, which querySelector then walked into and died on.
+    for (const n of nodes) {
+      if (n === null || n === undefined || n === '') continue;
+      if (typeof n === 'object') { this.children.push(n); continue; }
+      const text = new Node('#text');
+      text.textContent = String(n);
+      this.children.push(text);
+    }
   }
 
   setAttribute(k, v) {
@@ -197,7 +206,7 @@ async function main() {
   const source = fs.readFileSync('vision_web/app.js', 'utf8')
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
     + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
-    + ' knownFields, fieldsWanted, run, ask,'
+    + ' knownFields, fieldsWanted, run, ask, openView, closeView,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
     + ' toggleGroup, isFolded, reopen, newRun, recall, remember };';
   vm.runInContext(source, sandbox);
@@ -662,6 +671,36 @@ async function main() {
   assert.ok(!t.S.msgs.some((m) => m.file === 'first.pdf' || m.role === 'chat'),
             'the previous chat is still in the thread');
 
+  // ---- a file in the thread opens in the side panel -----------------------
+  // The panel is why the values can be trusted: it puts the page the numbers
+  // came from next to the numbers. One iframe shows all of them -- a PDF and
+  // an image are served as themselves, a workbook and a document are rendered
+  // to HTML first -- so the page never has to know which kind it has.
+  assert.equal(app.querySelector('.viewer'), null,
+               'the panel is open before anything asked for it');
+
+  t.openView('upload:abc123', 'statement.pdf', '/api/runs/r1/export/fields');
+  const panel = app.querySelector('.viewer');
+  assert.ok(panel, 'clicking a file opened no panel');
+  assert.match(visible(panel), /statement\.pdf/, 'the panel does not name the file');
+
+  const frame = panel.querySelector('.viewer-body');
+  assert.ok(frame, 'the panel has no frame to draw into');
+  assert.equal(frame.attrs.src || frame.src,
+               '/api/view?src=upload%3Aabc123',
+               'the frame points somewhere unexpected');
+  assert.ok(app.querySelector('.viewer-grip'),
+            'the panel cannot be resized: no grip');
+
+  // The download sits in the panel header, one click past looking at it.
+  const href = (c) => c.attrs && c.attrs.href ? c.attrs.href : c.href;
+  const dl = panel.children[0].children.find(
+    (c) => (href(c) || '').includes('export'));
+  assert.ok(dl, 'no download in the panel header');
+
+  t.closeView();
+  assert.equal(app.querySelector('.viewer'), null, 'the panel would not close');
+
   // ---- the one palette defines every token the stylesheet uses -----------
   const css = await fetch(BASE + '/assets/style.css');
   assert.equal(css.status, 200);
@@ -678,7 +717,7 @@ async function main() {
 
   console.log(`PASS: live bootstrap, ${t.S.models.length} models, `
     + `${t.S.skills.length} skills, ${t.S.docTypes.length} document types, `
-    + 'field picker, fields result, template bar, error state, one chat per read, one palette.');
+    + 'field picker, fields result, template bar, error state, one chat per read, side panel, one palette.');
   console.log('Visual browser verification remains unavailable in this environment.');
 }
 

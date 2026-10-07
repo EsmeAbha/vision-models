@@ -38,7 +38,13 @@ def record(run, model_name=""):
     found rather than only the transcript.
     """
     rid = str(run.get("id") or "")
-    if not _ID_OK.match(rid) or run.get("status") != "done":
+    if not _ID_OK.match(rid):
+        return None
+    # A thread is worth remembering once it holds anything: a document that
+    # was read, or an exchange that was typed. Requiring a finished run meant
+    # a conversation with no document was never written down at all, and a
+    # page reload threw it away.
+    if run.get("status") != "done" and not run.get("turns"):
         return None
     os.makedirs(HISTORY_DIR, exist_ok=True)
 
@@ -56,6 +62,12 @@ def record(run, model_name=""):
         "annotated": run.get("annotated") or None,
         "fields": run.get("fields") or [],
         "field_summary": run.get("field_summary") or "",
+        # Every question and answer typed in this thread, in order. A chat is
+        # one document plus what was asked about it, so they belong to the
+        # same record rather than a list of their own.
+        "turns": run.get("turns") or [],
+        # What to call it in the sidebar when there is no document to name.
+        "title": run.get("title") or "",
     }
     # Keep the first timestamp across refreshes, so a run does not jump to
     # the top of the list every time its fields are pulled again.
@@ -122,6 +134,8 @@ def summaries(limit=60):
             "elapsed": entry.get("elapsed"),
             "chars": entry.get("chars", len(entry.get("text") or "")),
             "fields": len(entry.get("fields") or []),
+            "turns": len(entry.get("turns") or []),
+            "title": entry.get("title", ""),
         })
     out.sort(key=lambda e: (e.get("seq") or 0, e["at"]), reverse=True)
     return out[:limit]

@@ -37,6 +37,7 @@ from pydantic import BaseModel
 # Reimplementing any of that is how two front ends start disagreeing about
 # what a run actually does.
 import app as vision
+import doc_preview
 import field_search
 import fill_template
 import pdf_pages
@@ -318,9 +319,15 @@ async def api_upload(file: UploadFile = File(...),
 def api_preview(fid: str):
     with _state_lock:
         entry = _uploads.get(fid)
-    if not entry or entry["pdf"]:
+    if not entry:
         raise HTTPException(404, "no preview for that file")
-    return FileResponse(entry["path"])
+    # Inline, and PDFs included: the browser draws one better than anything
+    # here could, and the panel is for reading the source beside the values
+    # pulled out of it.
+    return FileResponse(entry["path"], media_type=_MEDIA.get(
+        os.path.splitext(entry["name"])[1].lower()),
+        headers={"Content-Disposition":
+                 f'inline; filename="{os.path.basename(entry["name"])}"'})
 
 
 # ----------------------------------------------------------------------- runs
@@ -355,6 +362,7 @@ def api_run(req: RunReq):
            # document came from, and the document type so its columns come
            # out in the order that type declares them.
            "source_path": upload.get("source_path", ""),
+           "upload": req.file_id,
            "doc_type": req.doc_type or ""}
     global _last_used
     _last_used = time.time()
@@ -539,6 +547,89 @@ CHAT_SYSTEM = (
     "contents. Never invent a figure, a date or a quotation."
 )
 
+# The same, for a thread that has a document in it. The transcript is sent
+# with the question, so the honest instruction is the opposite one: read it,
+# quote it, and say when it does not contain the answer.
+CHAT_SYSTEM_DOC = (
+    "You are a careful assistant inside a document-reading tool, answering on "
+    "a local machine. Answer the question directly and briefly.\n\n"
+    "The transcript of the document the user is looking at is given below. "
+    "Answer from it. Quote the figure or the line as it is printed rather "
+    "than rephrasing it, and if the transcript does not contain the answer, "
+    "say so plainly. Never invent a figure, a date or a quotation, and never "
+    "fill a gap in the transcript from general knowledge."
+)
+
+# Ollama is asked for an 8k window, and going over it does not fail -- it
+# silently drops messages from the front, which is where the system prompt
+# sits. So the window is spent on purpose instead: roughly four characters to
+# a token, a reserve for the answer, and the rest shared between the document
+# and the history with the newest turns kept first.
+CHARS_PER_TOKEN = 4
+ANSWER_RESERVE_TOKENS = 1200
+DOC_SHARE = 0.55            # of what is left after the system prompt
+
+
+def _fit_history(history, budget):
+    """The most recent turns that fit, in the order they were said.
+
+    Walked newest first so that what survives a tight budget is the part of
+    the conversation the next message actually refers to. A turn too long to
+    fit on its own is cut rather than dropped, because losing an answer
+    entirely is what makes a follow-up like "rewrite that" unanswerable.
+    """
+    kept, used = [], 0
+    for turn in reversed(history or []):
+        role = turn.get("role")
+        body = (turn.get("content") or "").strip()
+        if role not in ("user", "assistant") or not body:
+            continue
+        if used + len(body) > budget:
+            room = budget - used
+            if room < 400:
+                break
+            body = body[-room:]
+        kept.append({"role": role, "content": body})
+        used += len(body)
+    kept.reverse()
+    return kept
+
+
+def _build_messages(prompt, history, document, doc_name):
+    """System prompt, document, history and question -- inside the window."""
+    ctx = int(os.environ.get("VISION_CHAT_CTX", "8192"))
+    total = max(1000, (ctx - ANSWER_RESERVE_TOKENS)) * CHARS_PER_TOKEN
+
+    system = CHAT_SYSTEM_DOC if document else CHAT_SYSTEM
+    question = prompt[:8000]
+    room = total - len(system) - len(question)
+
+    doc_text, prefix = "", ""
+    if document:
+        # The line introducing the transcript is part of what gets sent, so it
+        # comes out of the allowance too. Counting only the transcript put the
+        # request over the window by exactly the length of this label -- and
+        # going over is not an error, it drops the system prompt.
+        prefix = "Transcript of %s:\n\n" % (doc_name or "the document")
+        allowance = max(0, int(room * DOC_SHARE) - len(prefix))
+        doc_text = document.strip()
+        if len(doc_text) > allowance:
+            # The head of a document carries the labels and the summary; the
+            # tail is usually the detail tables. Keeping both ends and saying
+            # what was dropped beats a silent cut in the middle.
+            half = allowance // 2
+            doc_text = (doc_text[:half] + "\n\n[... part of this document is "
+                        "not shown: it is longer than this window ...]\n\n"
+                        + doc_text[-half:])
+        room -= len(doc_text) + len(prefix)
+
+    messages = [{"role": "system", "content": system}]
+    if doc_text:
+        messages.append({"role": "system", "content": prefix + doc_text})
+    messages += _fit_history(history, max(room, 0))
+    messages.append({"role": "user", "content": question})
+    return messages
+
 
 @app.get("/api/chat_model")
 def api_chat_model():
@@ -562,6 +653,11 @@ def api_chat_model():
 class ChatReq(BaseModel):
     prompt: str
     history: list = []
+    # The transcript of the document this thread is about, when there is one.
+    # A chat is one document plus what was asked about it, so a question like
+    # "what is the account number" has something to be answered from.
+    document: str = ""
+    document_name: str = ""
 
 
 @app.post("/api/chat")
@@ -573,22 +669,21 @@ def api_chat(req: ChatReq):
     if not text:
         raise HTTPException(400, "nothing to answer")
 
-    messages = [{"role": "system", "content": CHAT_SYSTEM}]
-    for turn in (req.history or [])[-8:]:
-        role = turn.get("role")
-        body = (turn.get("content") or "").strip()
-        if role in ("user", "assistant") and body:
-            messages.append({"role": role, "content": body[:4000]})
-    messages.append({"role": "user", "content": text[:8000]})
+    messages = _build_messages(text, req.history, req.document or "",
+                               req.document_name or "")
 
     try:
         r = _rq.post(f"{OLLAMA_URL}/api/chat", timeout=600, json={
             "model": CHAT_MODEL, "messages": messages, "stream": False,
             "options": {
-                # Same question, same answer: this sits beside figures read
-                # off a page, and an answer that wanders between runs cannot
-                # be checked.
-                "temperature": 0, "top_p": 1, "top_k": 1, "seed": 7,
+                # Greedy decoding with a fixed seed was making "rewrite
+                # that, more casual" return almost exactly what it returned
+                # the first time. Nothing checkable depends on this being
+                # deterministic -- field extraction calls no model at all, it
+                # matches labels in the transcript -- so the answer is allowed
+                # a little room to differ when the question asks it to.
+                "temperature": float(os.environ.get("VISION_CHAT_TEMP", "0.3")),
+                "top_p": 0.9,
                 # The model's own default is a 64k window, and reserving the
                 # KV cache for it needs 1.6GB on top of 13.8GB of weights --
                 # which failed outright with "cudaMalloc failed ... kv cache"
@@ -761,6 +856,57 @@ def api_history(limit: int = 60):
     return run_history.summaries(limit=max(1, min(limit, 200)))
 
 
+
+class ThreadReq(BaseModel):
+    """A conversation as the page holds it, on its way to disk."""
+    id: str
+    title: str = ""
+    turns: list = []
+
+
+@app.post("/api/history/thread")
+def api_save_thread(req: ThreadReq):
+    """Write down a typed conversation so a reload does not lose it.
+
+    Called after every answer. A thread that read a document already has a
+    record under the run's id, and this adds the turns to it; a thread with no
+    document gets a record of its own, which is the only way one was ever
+    going to survive the page being refreshed.
+    """
+    rid = (req.id or "").strip()
+    if not run_history._ID_OK.match(rid):
+        raise HTTPException(400, "that is not a thread id")
+
+    turns = []
+    for t in (req.turns or [])[-80:]:
+        question = (t.get("question") or "").strip()
+        answer = (t.get("answer") or "").strip()
+        if question or answer:
+            turns.append({"question": question[:20000],
+                          "answer": answer[:40000],
+                          "model": (t.get("model") or "")[:80]})
+
+    with _state_lock:
+        run = dict(_runs.get(rid) or {})
+    existing = run_history.load(rid) or {}
+    # Keep whatever the record already knows: a thread saved after a read must
+    # not overwrite the transcript with nothing.
+    run.setdefault("id", rid)
+    run["status"] = "done"
+    run["turns"] = turns
+    run["title"] = (req.title or existing.get("title") or "").strip()[:120]
+    if not run.get("text"):
+        run["text"] = existing.get("text", "")
+    if not run.get("file"):
+        run["file"] = existing.get("file", "")
+    if not run.get("model"):
+        run["model"] = existing.get("model", "")
+
+    name = MODEL_META.get(run.get("model") or "", {}).get("name", "")
+    run_history.record(run, name or existing.get("model_name", ""))
+    return {"saved": rid, "turns": len(turns)}
+
+
 @app.get("/api/history/{rid}")
 def api_history_one(rid: str):
     """One remembered run, transcript and all.
@@ -777,6 +923,8 @@ def api_history_one(rid: str):
         if rid not in _runs:
             _runs[rid] = {
                 "id": rid, "model": entry["model"], "file": entry["file"],
+                "turns": entry.get("turns") or [],
+                "title": entry.get("title", ""),
                 "status": "done", "steps": [], "text": entry["text"],
                 "annotated": entry.get("annotated"), "error": None,
                 "started": 0, "elapsed": entry.get("elapsed"),
@@ -825,6 +973,15 @@ def api_save(rid: str):
                       for i, p in enumerate(files)]}
 
 
+
+def _doc_type_fields(doc_type):
+    """The field order a document type declares, or [] if it names none."""
+    for cfg in vision.load_doc_types():
+        if cfg["name"].lower().replace(" ", "-") == doc_type:
+            return list(cfg.get("fields") or [])
+    return []
+
+
 XLSX_TYPE = ("application/vnd.openxmlformats-officedocument"
              ".spreadsheetml.sheet")
 
@@ -849,11 +1006,7 @@ def api_export_fields(rid: str):
     if not run.get("fields"):
         raise HTTPException(400, "pull the fields out first")
 
-    order = []
-    for cfg in vision.load_doc_types():
-        if cfg["name"].lower().replace(" ", "-") == (run.get("doc_type") or ""):
-            order = list(cfg.get("fields") or [])
-            break
+    order = _doc_type_fields(run.get("doc_type") or "")
 
     name = _export_name(run, "fields")
     path = os.path.join(vision.OUTPUT_DIR, name)
@@ -880,6 +1033,98 @@ def api_export_tables(rid: str):
     except Exception as e:
         raise HTTPException(500, f"export failed: {type(e).__name__}: {e}")
     return FileResponse(path, filename=name, media_type=XLSX_TYPE)
+
+
+
+_MEDIA = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+          ".jpeg": "image/jpeg", ".webp": "image/webp", ".bmp": "image/bmp",
+          ".gif": "image/gif", ".html": "text/html", ".htm": "text/html"}
+
+
+def _resolve_view(src):
+    """Turn a view descriptor into (path, display name).
+
+    Descriptors name something the server already knows about -- an upload, a
+    run's export, a file it saved -- and are resolved against that state. A
+    path never arrives from the page, so the panel cannot be pointed at an
+    arbitrary file on this machine.
+    """
+    parts = (src or "").split(":")
+    kind = parts[0] if parts else ""
+
+    if kind == "upload" and len(parts) == 2:
+        with _state_lock:
+            entry = _uploads.get(parts[1])
+        if not entry:
+            raise HTTPException(404, "that upload is no longer held")
+        return entry["path"], entry["name"]
+
+    if kind == "run" and len(parts) == 2:
+        with _state_lock:
+            run = _runs.get(parts[1])
+        if not run:
+            raise HTTPException(404, "no such run")
+        with _state_lock:
+            entry = _uploads.get(run.get("upload") or "")
+        if not entry:
+            raise HTTPException(404, "the document this run read is no "
+                                     "longer held; upload it again to see it")
+        return entry["path"], entry["name"]
+
+    if kind == "export" and len(parts) == 3:
+        rid, what = parts[1], parts[2]
+        with _state_lock:
+            run = _runs.get(rid)
+        if not run:
+            raise HTTPException(404, "no such run")
+        name = _export_name(run, what)
+        path = os.path.join(vision.OUTPUT_DIR, name)
+        if what == "fields":
+            if not run.get("fields"):
+                raise HTTPException(400, "pull the fields out first")
+            order = _doc_type_fields(run.get("doc_type") or "")
+            run_export.fields_workbook(
+                [{"path": run.get("source_path") or "",
+                  "file": run.get("file", ""), "rows": run["fields"]}],
+                path, fields=order)
+        elif what == "tables":
+            run_export.tables_workbook(run.get("text") or "", path)
+        else:
+            raise HTTPException(400, f"unknown export {what!r}")
+        return path, name
+
+    if kind == "saved" and len(parts) == 3:
+        with _state_lock:
+            run = _runs.get(parts[1])
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            raise HTTPException(400, "bad file index")
+        if not run or idx >= len(run.get("saved") or []):
+            raise HTTPException(404, "no such saved file")
+        path = run["saved"][idx]
+        return path, os.path.basename(path)
+
+    raise HTTPException(400, "that is not something this page can show")
+
+
+@app.get("/api/view")
+def api_view(src: str = ""):
+    """One file, ready for an iframe.
+
+    A PDF or an image is sent as itself and the browser draws it. Everything
+    else is rendered to HTML first, so a single iframe in the page can show
+    any of them without needing to know which it is.
+    """
+    path, name = _resolve_view(src)
+    if not os.path.exists(path):
+        raise HTTPException(404, "that file is no longer on disk")
+
+    if doc_preview.kind_of(name) == "raw":
+        return FileResponse(path, media_type=_MEDIA.get(
+            os.path.splitext(name)[1].lower()),
+            headers={"Content-Disposition": f'inline; filename="{name}"'})
+    return HTMLResponse(doc_preview.to_html(path, name))
 
 
 @app.get("/api/runs/{rid}/download/{idx}")

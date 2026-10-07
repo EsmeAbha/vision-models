@@ -1327,3 +1327,80 @@ table.fields td.where { color: var(--m-dim); font-size: 11px; white-space: nowra
   .thread, .composer-wrap { padding-left: 14px; padding-right: 14px; }
   .hello h1 { font-size: 27px; }
 }
+
+/* ------------------------------------------------------ the side panel
+ *
+ * A third column of the shell, not an overlay: the thread has to stay
+ * readable beside it, because the whole point is comparing one against the
+ * other. The grip sets the split and the width is remembered.
+ */
+
+.viewer {
+  flex-shrink: 0;
+  height: 100%;
+  min-width: 320px;
+  background: var(--m-card);
+  border-left: 1px solid var(--m-line);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.viewer-head {
+  flex-shrink: 0;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid var(--m-line);
+  background: var(--m-raise);
+}
+
+.viewer-name {
+  flex-grow: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--m-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viewer-body {
+  flex-grow: 1;
+  width: 100%;
+  border: 0;
+  background: var(--m-bg);
+}
+
+.viewer-grip {
+  flex-shrink: 0;
+  width: 6px;
+  cursor: col-resize;
+  background: var(--m-line);
+  transition: background .12s;
+}
+.viewer-grip:hover, .viewer-grip:active { background: var(--accent); }
+
+/* A file in the thread opens in the panel, so it has to look like it will. */
+.openable {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-color: var(--m-line-2);
+  text-underline-offset: 3px;
+}
+.openable:hover { text-decoration-color: var(--accent); }
+
+@media (max-width: 900px) {
+  /* No room for three columns; the panel takes the screen when it is open. */
+  .viewer { position: fixed; inset: 0; width: auto !important; z-index: 40; }
+  .viewer-grip { display: none; }
+}
