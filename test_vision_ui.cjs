@@ -44,7 +44,16 @@ class Node {
   get innerHTML() { return this.children.map(serialise).join(''); }
 
   append(...nodes) {
-    for (const n of nodes) if (n) this.children.push(n);
+    // append('some text') is ordinary DOM and makes a text node. Pushing the
+    // bare string instead left something in children with no matches() on
+    // it, which querySelector then walked into and died on.
+    for (const n of nodes) {
+      if (n === null || n === undefined || n === '') continue;
+      if (typeof n === 'object') { this.children.push(n); continue; }
+      const text = new Node('#text');
+      text.textContent = String(n);
+      this.children.push(text);
+    }
   }
 
   setAttribute(k, v) {
@@ -53,6 +62,8 @@ class Node {
   }
 
   getAttribute(k) { return this.attrs[k]; }
+
+  contains() { return false; }
   removeAttribute(k) { delete this.attrs[k]; }
   remove() {}
   focus() {}
@@ -160,7 +171,7 @@ async function main() {
   // be buildable more than once.
   const makeSandbox = (storage, byIdFor) => {
     const s = {
-      console, setTimeout, clearTimeout,
+      console, setTimeout, clearTimeout, setInterval, clearInterval,
       FormData, URL,
       fetch: (url, opts) => {
         seenBootCalls.push(url);
@@ -194,8 +205,8 @@ async function main() {
   // Top-level const is script-scoped in a vm, so expose what the test drives.
   const source = fs.readFileSync('vision_web/app.js', 'utf8')
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
-    + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
-    + ' dealPanel, dealMenu, addMappingRow, knownFields, fieldsWanted,'
+    + ' toggleField, fieldsTable, docTypeMenu, fieldPicker,'
+    + ' knownFields, fieldsWanted, run, ask, openView, closeView,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
     + ' toggleGroup, isFolded, reopen, newRun, recall, remember };';
   vm.runInContext(source, sandbox);
@@ -213,9 +224,20 @@ async function main() {
   let seen = visible(app);
   assert.match(seen, /Local Vision/);
   assert.match(seen, /Read a document, locally/, 'empty state missing');
+  assert.ok(!seen.includes('undefined'), 'undefined leaked into the shell');
+
+  // Models and Skills start folded on every load: the sidebar is for the run
+  // history, and only that part of it scrolls.
+  assert.ok(t.isFolded('models') && t.isFolded('skills'),
+            'Models and Skills do not start folded');
+  assert.equal(app.querySelectorAll('.pick.model').length, 0, 'models drawn while folded');
+  assert.equal(app.querySelectorAll('.pick.skill').length, 0, 'skills drawn while folded');
+  assert.ok(app.querySelector('.side-scroll'), 'the run history has no scroll region of its own');
+  t.toggleGroup('models');
+  t.toggleGroup('skills');
+  seen = visible(app);
   assert.match(seen, /PaddleOCR-VL/);
   assert.match(seen, /DeepSeek-OCR/);
-  assert.ok(!seen.includes('undefined'), 'undefined leaked into the shell');
 
   // Skills come off disk, so assert the shape rather than exact wording.
   assert.ok(t.S.skills.length >= 4, 'fewer skills than expected');
@@ -253,7 +275,7 @@ async function main() {
             'boot did not ask the server for the history');
 
   // ---- a group heading folds its list away --------------------------------
-  assert.ok(!t.isFolded('models'), 'Models starts folded');
+  assert.ok(!t.isFolded('models'), 'Models did not unfold when asked');
   assert.equal(app.querySelectorAll('.pick.model').length, t.S.models.length,
                'the models are not all listed');
 
@@ -348,15 +370,12 @@ async function main() {
   assert.ok(!seen.includes('Tideform') && !seen.includes('Teal'),
             'the theme buttons are still drawn');
 
-  // ---- what is folded stays folded next time ------------------------------
+  // ---- a reload folds Models and Skills again -----------------------------
   // Array.from on everything that crosses out of the vm: assert/strict
   // compares prototypes, and an array built inside the context has a
   // different Array.prototype than this realm's.
-  // A disclosure that springs back open on every reload is not a
-  // preference, it is a nuisance.
-  t.toggleGroup('skills');
-  assert.deepEqual(Array.from(t.recall('collapsed', null)), ['skills'],
-                   'folding a group was not remembered');
+  // Opening a row inside a group is still remembered; opening the group is
+  // not -- they are meant to be closed whenever the page comes up.
   t.toggleExpanded('model:paddleocr_vl');
   assert.deepEqual(Array.from(t.recall('expanded', null)), ['model:paddleocr_vl'],
                    'opening a row was not remembered');
@@ -370,15 +389,11 @@ async function main() {
   vm.createContext(second);
   vm.runInContext(fs.readFileSync('vision_web/app.js', 'utf8')
                   + ';globalThis.__again = { S };', second);
-  assert.deepEqual(Array.from(second.__again.S.collapsed), ['skills'],
-                   'a reload forgot which group was folded');
+  assert.deepEqual(Array.from(second.__again.S.collapsed), ['models', 'skills'],
+                   'a reload left Models or Skills open');
   assert.deepEqual(Array.from(second.__again.S.expanded), ['model:paddleocr_vl'],
                    'a reload forgot which row was open');
-
-  t.toggleGroup('skills');
   t.toggleExpanded('model:paddleocr_vl');
-  assert.deepEqual(Array.from(t.recall('collapsed', null)), [],
-                   'unfolding was not remembered either');
 
   // Storage can refuse outright; the sidebar must not care.
   const realStore = sandbox.localStorage;
@@ -486,28 +501,56 @@ async function main() {
   seen = visible(app);
   assert.equal(t.S.chosen.length, bill.fields.length, 'fields not all ticked');
   assert.equal(t.S.model, bill.reader, 'picking a type did not set its reader');
+  const labelOf = (field) => {
+    const shown = field.replace(/_/g, ' ');
+    return shown.charAt(0).toUpperCase() + shown.slice(1);
+  };
+  // Closed, the picker is only the selected fields as tags -- no grid.
+  assert.equal(app.querySelectorAll('.picked-tag').length, bill.fields.length,
+               'one tag per selected field');
+  assert.equal(app.querySelectorAll('.field-option').length, 0,
+               'the full list is drawn before anyone opened it');
   for (const field of bill.fields) {
-    assert.ok(seen.includes(field), `picker is missing ${field}`);
+    assert.ok(seen.includes(labelOf(field)), `no tag for ${labelOf(field)}`);
+    if (field.includes('_')) {
+      assert.ok(!seen.includes(field), `picker shows the raw key ${field}`);
+    }
   }
-  assert.match(seen, /Other fields/);
-  const boxes = app.querySelectorAll('.field-chip');
-  assert.equal(boxes.length, bill.fields.length, 'wrong number of checkboxes');
 
-  // Unticking one is reflected in the count on the composer button.
+  // Unticking one is reflected in the tags and the composer count.
   t.toggleField(bill.fields[0]);
   assert.equal(t.S.chosen.length, bill.fields.length - 1);
+  assert.equal(app.querySelectorAll('.picked-tag').length, bill.fields.length - 1);
   assert.match(visible(app),
                new RegExp(`${bill.fields.length - 1}/${bill.fields.length}`),
                'the composer count did not follow the picker');
+
+  // Opened, the dropdown lists every field of the type, ticked or not.
+  t.S.menu = 'fields';
+  t.render();
+  const options = app.querySelectorAll('.field-option');
+  assert.equal(options.length, bill.fields.length, 'the dropdown does not list every field');
+  assert.ok(app.querySelector('#field-search'), 'the dropdown has no search box');
+  // Search narrows it, and a name the type lacks can be added as a field.
+  t.S.fieldQuery = 'water';
+  t.render();
+  assert.ok(app.querySelectorAll('.field-option').every(
+    (o) => /water/i.test(visible(o))), 'search did not narrow the list');
+  t.S.fieldQuery = 'Meter number';
+  t.render();
+  assert.match(visible(app), /Add "Meter number" as a field/, 'no way to add a new field');
+  t.S.menu = null;
+  t.S.fieldQuery = '';
+  t.render();
 
   // ---- a type with no fixed list explains itself --------------------------
   const lease = t.S.docTypes.find((d) => d.fields.length === 0);
   assert.ok(lease, 'expected a type with no field list');
   t.pickDocType(lease.id);
   seen = visible(app);
-  assert.equal(app.querySelectorAll('.field-chip').length, 0,
-               'a type with no fields still drew checkboxes');
-  assert.match(seen, /Fields to find/, 'no prompt to name fields');
+  assert.equal(app.querySelectorAll('.picked-tag').length, 0,
+               'a type with no fields still drew tags');
+  assert.match(seen, /Choose the fields to find/, 'no prompt to name fields');
   assert.ok(seen.includes(lease.why.slice(0, 40)),
             'the reason for having no field list is not shown');
 
@@ -545,15 +588,13 @@ async function main() {
   assert.match(seen, /2 of 3 found/, 'the summary line is missing');
   assert.ok(!seen.includes('undefined'), 'undefined leaked into the result card');
 
-  // The template button only appears for a type that has one.
-  if (t.templatesFor(bank.name).length) {
-    assert.match(seen, /Drop these into:/, 'no template bar for Bank statement');
-    assert.match(seen, /Bank statement summary/, 'template name missing');
+  // The result card offers the two workbooks and nothing else: no template
+  // drop, no raw MD/HTML/XLSX saves, no copy of the raw transcript.
+  assert.ok(!seen.includes('Drop these into:'), 'the template bar came back');
+  assert.match(seen, /Fields \(XLSX\)/, 'the fields workbook button is missing');
+  for (const gone of ['>MD<', '>HTML<', '>Save<']) {
+    assert.ok(!serialise(app).includes(gone), `${gone} button came back`);
   }
-  t.S.msgs[1].docTypeName = 'Rent roll';
-  t.render();
-  assert.ok(!visible(app).includes('Drop these into:'),
-            'template bar shown for a type with no template');
 
   // ---- a run made WITHOUT choosing a type first ---------------------------
   // This is the path that hid the template button: fields, and so the
@@ -611,9 +652,12 @@ async function main() {
   };
   await extract.onclick();
   sandbox.fetch = realFetch;
-  assert.equal(calls.length, 1, 'clicking extract sent no request');
+  assert.ok(calls.length >= 1, 'clicking extract sent no request');
   assert.match(calls[0].url, /\/api\/runs\/plain\/fields$/,
                `extract posted to ${calls[0].url}`);
+  // New values void old ticks, so the approval state is fetched again after.
+  assert.ok(calls.slice(1).every((c) => /\/api\/runs\/plain\/review$/.test(c.url)),
+            `unexpected follow-up request: ${calls.slice(1).map((c) => c.url)}`);
   assert.equal(calls[0].opts.method, 'POST');
   const sent = JSON.parse(calls[0].opts.body);
   assert.deepEqual(sent.fields, bank.fields,
@@ -621,151 +665,112 @@ async function main() {
   assert.equal(plain.docTypeName, bank.name,
                'the type was not recorded on the run, so no template matches');
 
-  // ---- the new-deal form survives being clicked ---------------------------
-  // It used to live on S.menu, and the global click handler clears S.menu on
-  // any click, so clicking into the name box destroyed the form before a
-  // character could be typed.
-  t.S.newDeal = true;
-  t.S.dealName = '';
-  t.render();
-  seen = visible(app);
-  assert.match(seen, /New deal/, 'the new-deal form did not render');
-  assert.match(seen, /Name the deal, then choose its workbook/,
-               'no hint that the name comes first');
-
-  const chooser = () => app.querySelectorAll('.btn')
-    .find((b) => visible(b).includes('Choose workbook'));
-  assert.ok(chooser(), 'no workbook button');
-  assert.equal(chooser().disabled, true,
-               'offered to take a workbook before the deal was named');
-
-  // A click anywhere closes menus. The form has to still be there.
-  t.S.menu = 'deal';
-  t.S.menu = null;
-  t.render();
-  assert.ok(visible(app).includes('New deal'),
-            'the form vanished when a menu was closed');
-
-  // Typing a name enables the button.
-  const nameBox = app.querySelector('#deal-name');
-  assert.ok(nameBox, 'no name field');
-  nameBox.value = 'Maple Avenue';
-  nameBox.oninput();
-  assert.equal(t.S.dealName, 'Maple Avenue', 'the name was not captured');
-  assert.equal(chooser().disabled, false,
-               'the button stayed disabled after naming the deal');
-
-  t.S.newDeal = false;
-  t.S.dealName = '';
-  t.render();
-
-  // ---- a mapping row can be added by hand ---------------------------------
-  // The scan knows only the names the document types list, so a template
-  // with its own labels is unusable without this.
-  t.S.deal = {
-    id: 'sample', name: 'sample', confirmed: false, filled: {}, history: [],
-    mapping: [{ field: 'Account number', cell: 'D7', sheet: 'Utility Recon',
-                label_cell: 'D6', label_text: 'Account Number',
-                matched: 'account number', how: 'under the label' }],
-  };
-  t.render();
-  seen = visible(app);
-  assert.match(seen, /sample/, 'the deal panel did not render');
-  assert.match(seen, /Account Number/, 'the matched label is not shown');
-  assert.ok(t.knownFields().length > 10, 'no suggestions to offer');
-
-  const fieldBox = app.querySelector('#add-field');
-  const cellBox = app.querySelector('#add-cell');
-  assert.ok(fieldBox && cellBox, 'no row for adding a field by hand');
-
-  // A name the vocabulary has never heard of still has to be accepted.
-  fieldBox.value = 'Meter number';
-  fieldBox.oninput();
-  cellBox.value = 'c18';
-  cellBox.oninput();
-  t.addMappingRow();
-  assert.equal(t.S.deal.mapping.length, 2, 'the row was not added');
-  const added = t.S.deal.mapping[1];
-  assert.equal(added.field, 'Meter number');
-  assert.equal(added.cell, 'C18', 'the cell was not normalised to upper case');
-  assert.equal(added.how, 'set by hand');
-
-  // Nonsense is refused rather than stored.
-  fieldBox.value = 'Tariff';
-  fieldBox.oninput();
-  cellBox.value = 'over there';
-  cellBox.oninput();
-  t.addMappingRow();
-  assert.equal(t.S.deal.mapping.length, 2, 'a bad cell reference was accepted');
-
-  // And the added field is actually looked for, or it could never fill.
-  assert.ok(t.fieldsWanted().includes('Meter number'),
-            'a hand-added field is not searched for');
-
-  t.S.deal = null;
-  t.S.addField = '';
-  t.S.addCell = '';
-  t.render();
-
-  // ---- reading a document into an open deal fills it ----------------------
-  // Confirming a mapping did nothing by itself, so a deal could sit at
-  // "0 of 3 cells filled" with a workbook that downloaded empty and no
-  // sign of what had been missed.
-  t.S.deal = {
-    id: 'sample', name: 'sample', confirmed: true, filled: {}, history: [],
-    mapping: [{ field: 'Account number', cell: 'D7', sheet: 'Utility Recon',
-                label_cell: 'D6', label_text: 'Account Number',
-                matched: 'account number', how: 'under the label' }],
-  };
-  t.render();
-  assert.match(visible(app), /Nothing read into it yet/,
-               'an empty deal does not say what to do about it');
-
-  const into = {
-    role: 'run', runId: 'into-deal', model: bank.reader,
-    modelName: 'PaddleOCR-VL', file: 'bill.pdf', status: 'done', steps: [],
-    text: '# bill', annotated: null, error: null, elapsed: 7, saved: [],
-    docType: null, docTypeName: '', want: null, fieldRows: null,
-    fieldSummary: '', fieldsBusy: false, fieldError: null, tab: null,
-  };
-  t.S.msgs.length = 0;
-  t.S.msgs.push(into);
-
-  const seenCalls = [];
-  const realFetch2 = sandbox.fetch;
-  sandbox.fetch = (url, opts) => {
-    seenCalls.push(url);
-    const body = url.endsWith('/fields')
-      ? { rows: [{ field: 'Account number', value: 'EL-88342710',
-                   verdict: 'yes', where: 'beside the label', evidence: 'x' }],
-          summary: '1 of 1 found.' }
-      : url.endsWith('/apply')
-        ? { written: [{ field: 'Account number', cell: 'D7',
-                        value: 'EL-88342710' }],
-            skipped: [], clashed: [], download: '/api/deals/sample/workbook' }
-        : { id: 'sample', name: 'sample', confirmed: true, mapping: [],
-            filled: { 'Account number': {} }, history: [{ source: 'bill.pdf' }] };
-    return Promise.resolve({ ok: true, status: 200,
-                             json: () => Promise.resolve(body) });
-  };
-  await t.extractFields(into, ['Account number'], '');
-  sandbox.fetch = realFetch2;
-
-  assert.ok(seenCalls.some((u) => u.endsWith('/fields')), 'nothing was extracted');
-  assert.ok(seenCalls.some((u) => u.endsWith('/apply')),
-            'the document was never put into the open deal');
-  assert.ok(into.dealResult, 'no record of what went into the deal');
-  assert.equal(into.dealResult.written[0].cell, 'D7');
-
-  t.S.deal = null;
-  t.render();
-
   // ---- an error is shown as an error, not swallowed -----------------------
   const last = t.S.msgs[t.S.msgs.length - 1];
   last.status = 'error';
   last.error = 'RuntimeError: OCR worker exited unexpectedly.';
   t.render();
   assert.match(visible(app), /OCR worker exited unexpectedly/);
+
+  // ---- each document read starts its own chat -----------------------------
+  // The sidebar lists one row per run, and reopening a row replaces the
+  // thread. A thread that had accumulated two documents could not be any one
+  // of those rows, so reading a second document starts a fresh chat. A typed
+  // question still belongs to the document above it.
+  t.S.msgs = [];
+  t.S.busy = false;
+  t.S.openRun = 'a-previous-run';
+  t.S.model = t.S.models[0].id;
+  t.S.file = { id: 'no-such-upload', name: 'first.pdf', pdf: false };
+  await t.run();
+  assert.equal(t.S.msgs.length, 2, 'a read should leave one exchange in the thread');
+  assert.equal(t.S.msgs[1].file, 'first.pdf');
+  assert.notEqual(t.S.openRun, 'a-previous-run',
+                  'the sidebar still points at the run before this one');
+
+  t.S.busy = false;
+  t.S.file = null;
+  t.S.prompt = 'what is the total?';
+  // Answered here, not by the live server: a real ask goes to the local model
+  // and is saved as a conversation in the history a person actually reads.
+  const liveFetch = sandbox.fetch;
+  const asked = [];
+  sandbox.fetch = (url) => {
+    asked.push(url);
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(
+      { answer: 'The total is $109.27.', model: 'stub', saved: 'stub', turns: 1 }) });
+  };
+  try {
+    await t.ask();
+  } finally {
+    sandbox.fetch = liveFetch;
+  }
+  assert.ok(asked.length, 'asking sent no request');
+  assert.equal(t.S.msgs.length, 4, 'a question should join the chat, not replace it');
+  assert.equal(t.S.msgs[1].file, 'first.pdf', 'the document left the thread');
+
+  t.S.busy = false;
+  t.S.file = { id: 'no-such-upload-2', name: 'second.pdf', pdf: false };
+  await t.run();
+  assert.equal(t.S.msgs.length, 2,
+               'the second document stacked instead of starting its own chat');
+  assert.equal(t.S.msgs[1].file, 'second.pdf');
+  assert.ok(!t.S.msgs.some((m) => m.file === 'first.pdf' || m.role === 'chat'),
+            'the previous chat is still in the thread');
+
+  // ---- a file in the thread opens in the side panel -----------------------
+  // The panel is why the values can be trusted: it puts the page the numbers
+  // came from next to the numbers. One iframe shows all of them -- a PDF and
+  // an image are served as themselves, a workbook and a document are rendered
+  // to HTML first -- so the page never has to know which kind it has.
+  assert.equal(app.querySelector('.viewer'), null,
+               'the panel is open before anything asked for it');
+
+  t.openView('upload:abc123', 'statement.pdf', '/api/runs/r1/export/fields');
+  const panel = app.querySelector('.viewer');
+  assert.ok(panel, 'clicking a file opened no panel');
+  assert.match(visible(panel), /statement\.pdf/, 'the panel does not name the file');
+
+  const frame = panel.querySelector('.viewer-body');
+  assert.ok(frame, 'the panel has no frame to draw into');
+  assert.equal(frame.attrs.src || frame.src,
+               '/api/view?src=upload%3Aabc123',
+               'the frame points somewhere unexpected');
+  assert.ok(app.querySelector('.viewer-grip'),
+            'the panel cannot be resized: no grip');
+
+  // The download sits in the panel header, one click past looking at it.
+  const href = (c) => c.attrs && c.attrs.href ? c.attrs.href : c.href;
+  const dl = panel.children[0].children.find(
+    (c) => (href(c) || '').includes('export'));
+  assert.ok(dl, 'no download in the panel header');
+
+  t.closeView();
+  assert.equal(app.querySelector('.viewer'), null, 'the panel would not close');
+
+  // A workbook previews before it is approved, but cannot be copied or
+  // downloaded until every row in it has been ticked against the page.
+  t.S.msgs.push({ role: 'run', runId: 'r9', model: t.S.models[0].id,
+                  modelName: 'PaddleOCR-VL', file: 'bill.pdf', status: 'done',
+                  steps: [], text: 'x', annotated: null, error: null, elapsed: 1,
+                  saved: [], want: null, fieldRows: null, fieldSummary: '',
+                  fieldsBusy: false, fieldError: null, tab: null,
+                  approval: { fields: { need: 2, done: 1, complete: false },
+                              tables: { need: 0, done: 0, complete: true } } });
+  t.openView('export:r9:fields', 'bill.pdf - Fields', '/api/runs/r9/export/fields');
+  let head = app.querySelector('.viewer').children[0];
+  assert.ok(!head.children.some((c) => (href(c) || '').includes('/export/')),
+            'an unapproved workbook can be downloaded');
+  assert.match(visible(head), /Approve to unlock/, 'no way to the review from a locked workbook');
+  assert.ok(!/Copy all/.test(visible(head)), 'an unapproved workbook can be copied');
+  t.S.msgs[t.S.msgs.length - 1].approval.fields = { need: 2, done: 2, complete: true };
+  t.render();
+  head = app.querySelector('.viewer').children[0];
+  assert.ok(head.children.some((c) => (href(c) || '').includes('/export/')),
+            'approving every row did not unlock the download');
+  assert.match(visible(head), /Copy all/, 'approving every row did not unlock copying');
+  t.closeView();
+  t.S.msgs.pop();
 
   // ---- the one palette defines every token the stylesheet uses -----------
   const css = await fetch(BASE + '/assets/style.css');
@@ -783,7 +788,7 @@ async function main() {
 
   console.log(`PASS: live bootstrap, ${t.S.models.length} models, `
     + `${t.S.skills.length} skills, ${t.S.docTypes.length} document types, `
-    + 'field picker, fields result, template bar, error state, one palette.');
+    + 'field picker, fields result, two-workbook footer, error state, one chat per read, side panel, one palette.');
   console.log('Visual browser verification remains unavailable in this environment.');
 }
 

@@ -89,7 +89,7 @@ function upload(file) {
   const body = new FormData();
   body.append('file', file);
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/jobs');
+  xhr.open('POST', 'api/jobs');
 
   // fetch() cannot report upload progress, and a 400 MB archive over
   // localhost is still long enough that a dead-looking page invites a second
@@ -129,7 +129,7 @@ function upload(file) {
 }
 
 function listen(jid) {
-  const es = new EventSource(`/api/jobs/${jid}/events`);
+  const es = new EventSource(`api/jobs/${jid}/events`);
   es.onmessage = (ev) => {
     let m;
     try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -173,7 +173,7 @@ async function showTable(index) {
   S.preview = null;
   render();
   try {
-    const r = await fetch(`/api/jobs/${S.job}/table/${index}`);
+    const r = await fetch(`api/jobs/${S.job}/table/${index}`);
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     S.preview = await r.json();
   } catch (e) {
@@ -326,7 +326,7 @@ function progressCard() {
       const b = node('button', 'btn primary');
       b.innerHTML = svg('down', 15);
       b.append(node('span', null, 'Download workbook'));
-      b.onclick = () => { window.location = `/api/jobs/${S.job}/workbook`; };
+      b.onclick = () => { window.location = `api/jobs/${S.job}/workbook`; };
       row.append(b);
       row.append(node('span', 'src', S.workbook));
     }
@@ -479,7 +479,7 @@ function loginCard() {
     S.authError = null;
     render();
     try {
-      const r = await fetch('/api/login', {
+      const r = await fetch('api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: input.value || '' }),
@@ -556,7 +556,7 @@ function render() {
 });
 
 async function loadSpec() {
-  const r = await fetch('/api/spec');
+  const r = await fetch('api/spec');
   if (r.status === 401) {          // the session lapsed mid-use
     S.auth = { required: true, signed_in: false };
     return;
@@ -567,7 +567,7 @@ async function loadSpec() {
 (async function start() {
   render();
   try {
-    S.auth = await (await fetch('/api/session')).json();
+    S.auth = await (await fetch('api/session')).json();
     if (!(S.auth.required && !S.auth.signed_in)) await loadSpec();
   } catch (e) {
     toast('Could not reach the server — is appraisal_server.py running?');

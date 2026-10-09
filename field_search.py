@@ -52,6 +52,132 @@ SYNONYMS = {
     "Land value": ["land value", "site value"],
 }
 
+
+# ---------------------------------------------------------------- PEXL fields
+#
+# PEXL's own field names, kept verbatim: a value found here is handed straight
+# to its API, and renaming them for display would mean translating back at the
+# boundary, which is where mappings rot.
+#
+# A document never prints "total_gas_bill". It prints "Gas Charges", or just
+# "Gas" in a column of a summary table. So each name carries the spellings that
+# actually appear on a page. _key() folds the underscores, so the PEXL name is
+# tried too, and labels_for() sorts longest first -- which is what stops
+# "water" claiming the line that belongs to "water and sewer".
+PEXL_SYNONYMS = {
+    # --- shared across types
+    "provider_name": ["provider", "utility", "supplier", "issued by",
+                      "utility company", "service provider"],
+    "property_name": ["property name", "service address", "property address",
+                      "premises", "site", "service location", "property"],
+    "account_number": ["account no", "acct no", "acct number", "account #",
+                       "customer number", "customer no", "account"],
+    "address": ["service address", "billing address", "property address",
+                "mailing address"],
+    "date": ["date"],
+
+    # --- utility_bill
+    "billing_date": ["billing date", "bill date", "invoice date",
+                     "statement date", "issued"],
+    "total_gas_bill": ["gas usage charges", "gas charges", "total gas",
+                       "natural gas", "gas service", "gas"],
+    "total_electricity_bill": ["electricity charges", "electric charges",
+                               "total electric", "electric service",
+                               "electricity", "electric"],
+    "total_water_bill": ["water charges", "total water", "water service",
+                         "water"],
+    "total_sewer_bill": ["sewer charges", "total sewer", "sewer service",
+                         "wastewater", "sewer"],
+    "total_water_sewer_bill": ["water and sewer charges", "water and sewer",
+                               "water & sewer", "water sewer"],
+    "total_internet_bill": ["internet charges", "internet service", "broadband",
+                            "internet"],
+    "total_phone_bill": ["telephone charges", "phone charges", "phone service",
+                         "telephone", "phone"],
+    "total_trash_bill": ["trash charges", "waste removal", "sanitation",
+                         "refuse", "garbage", "trash"],
+    "other_charges": ["miscellaneous charges", "other charges", "misc charges",
+                      "adjustments"],
+    "taxes": ["taxes and fees", "total tax", "sales tax", "taxes", "tax"],
+    "total_utilities": ["total current charges", "total amount due",
+                        "total charges", "amount due", "balance due",
+                        "total due"],
+
+    # --- bank_statement
+    "statement_date": ["statement date", "period ending", "bill date", "as of"],
+    "beginning_balance": ["beginning balance", "opening balance",
+                          "previous balance", "balance forward"],
+    "ending_balance": ["closing balance", "ending balance", "new balance"],
+    "total_credits": ["total deposits", "credits", "deposits"],
+    "total_debits": ["total withdrawals", "debits", "withdrawals"],
+
+    # --- appraisal
+    "appraised_date": ["date of value", "valuation date", "effective date",
+                       "appraisal date", "as is date"],
+    "appraised_as_is_value": ["as is market value", "appraised value",
+                              "market value", "as-is value", "as is value"],
+    "property_type": ["property type", "type of property", "asset type"],
+    "cap_rate": ["capitalization rate", "overall rate", "cap rate"],
+
+    # --- lease_contract
+    "lease_date": ["date of lease", "agreement date", "lease date", "dated"],
+    "parties": ["by and between", "parties", "between"],
+    "landlord_name": ["landlord", "lessor", "owner", "management", "agent"],
+    "property_address": ["demised premises", "leased premises",
+                         "property address", "premises"],
+    "unit_number": ["unit no", "apartment", "suite", "apt", "unit"],
+    "utilities_included": ["utilities included", "included utilities",
+                           "utilities"],
+    "lease_begin_date": ["lease commencement", "commencement date",
+                         "beginning date", "term begins", "lease start",
+                         "start date"],
+    "lease_end_date": ["lease expiration", "expiration date",
+                       "termination date", "term ends", "lease end",
+                       "end date"],
+    "security_deposit": ["security deposit", "deposit"],
+    "monthly_rent": ["monthly base rent", "rent per month", "monthly rent",
+                     "base rent"],
+    "rent_and_charges": ["total rent and charges", "rent and charges",
+                         "rent plus charges"],
+    "onetime_concession_amount": ["one time concession", "concession amount",
+                                  "concession"],
+    "onetime_concession_comment": ["concession description", "concession note",
+                                   "concession comment"],
+    "monthly_discount": ["discount per month", "monthly discount"],
+    "other_discount": ["additional discount", "other discount"],
+    "other_discount_comment": ["other discount comment", "discount description",
+                               "discount note"],
+    "household_ca_count": ["ca household members", "number of ca members",
+                           "ca members", "ca count"],
+    "household_non_ca_count": ["non ca household members", "non ca members",
+                               "non ca count"],
+    "total_income_ca": ["total ca income", "ca income"],
+    "total_income_non_ca": ["total non ca income", "non ca income"],
+    "total_rent": ["total rent"],
+    "utility_allowance": ["utility allowance", "utility credit"],
+    "ca_shelter_allowance": ["ca shelter allowance", "shelter allowance"],
+    "cityfheps_rent_supplement": ["cityfheps rent supplement",
+                                  "rent supplement", "cityfheps"],
+    "household_share": ["household share", "tenant share", "family share"],
+    "utility_payment": ["utility reimbursement", "utility payment"],
+    "total_monthly_rent": ["total monthly rent", "total rent due"],
+
+    # --- tax
+    "tax_year": ["assessment year", "tax year", "levy year"],
+    "tax_bill_date": ["tax bill date", "bill date", "statement date"],
+    "tax_due_date": ["delinquent after", "payment due", "due date", "pay by"],
+    "tax_authority": ["taxing authority", "tax collector", "tax authority",
+                      "municipality", "collector", "assessor", "county"],
+    "assessed_value": ["total assessed value", "assessed valuation",
+                       "assessed value", "assessment"],
+    "total_tax_due": ["total amount due", "total tax due", "total tax",
+                      "tax due", "amount due", "total due"],
+    "parcel_id": ["parcel number", "parcel id", "parcel no", "tax id",
+                  "apn", "parcel"],
+}
+SYNONYMS.update(PEXL_SYNONYMS)
+
+
 # A value is whatever sits after the label: behind a colon, across a run of
 # whitespace, or in the next cell of a table row.
 _SEPARATOR = re.compile(r"^[\s:\-\u2013\u2014|]+")
@@ -121,7 +247,14 @@ def _label_pattern(label_key):
 _NEXT_LABEL = re.compile(r"	|\s{2,}|\s+(?=[A-Z][A-Za-z .]{1,28}:)")
 
 
-def _value_on_line(line, label_key):
+# Shapes strict enough that matching one proves the text is a value rather
+# than the next word of a heading. "code" and "text" are deliberately not on
+# this list: "Information" is a perfectly good code, which is how "Meter
+# Reading Information" used to answer the field "Meter reading".
+_STRICT_SHAPES = ("date", "money", "number", "rate")
+
+
+def _value_on_line(line, label_key, shape=None):
     """The value printed after this label on this line, if there is one.
 
     A separator is required -- a colon, a dash, a tab, or a run of spaces.
@@ -141,11 +274,50 @@ def _value_on_line(line, label_key):
         rest = rest[bracket.end():]
     separator = re.match(r"\s*[:\-\u2013\u2014]\s*|\t+|\s{2,}", rest)
     if not separator:
-        return ""
+        # A two-column bill collapses to one line in the text layer, and the
+        # gap between a label and its value survives as a single space:
+        # "Service Address: Bill Date 09/05/2026". Insisting on a wider gap
+        # loses that date altogether. So one space is allowed to separate
+        # them, but only when what follows is unmistakably a value of the
+        # shape being looked for -- which is what keeps the old
+        # heading-swallowing bug shut.
+        if shape not in _STRICT_SHAPES:
+            return ""
+        single = re.match(r"\s(?=\S)", rest)
+        if not single:
+            return ""
+        candidate = rest[single.end():]
+        cut = _NEXT_LABEL.search(candidate)
+        candidate = candidate[:cut.start()] if cut else candidate
+        words = candidate.strip(" :|\t").split()
+        if not words or not looks_like(words[0], shape):
+            return ""
+        return words[0]
     rest = rest[separator.end():]
     # Stop before whatever label comes next on the same line.
     cut = _NEXT_LABEL.search(rest)
     return (rest[:cut.start()] if cut else rest).strip(" :|\t")
+
+
+def _starts_with_known_label(value):
+    """Is this "value" really the next column's label and its value?
+
+    A two-column bill collapses to one line, so "Service Address:" is followed
+    on the same line by "Bill Date 09/05/2026" -- and reading sideways hands
+    the address field a date. A value that begins with a label belongs to that
+    label, not to this one.
+
+    Only labels of two words or more count. One-word labels are ordinary
+    English: "site", "unit" and "deposit" all start real values, and rejecting
+    those would lose more than it saves.
+    """
+    for key in _all_known_labels():
+        if " " not in key:
+            continue
+        match = _label_pattern(key).match(value)
+        if match and match.end() < len(value):
+            return True
+    return False
 
 
 def _cells(line):
@@ -169,6 +341,20 @@ SHAPES = {
     "Usage": "number", "Consumption": "number", "Cap rate": "rate",
     "Account number": "code", "Meter reading": "code", "Invoice number": "code",
 }
+
+# What the word match in shape_of cannot work out from the name alone.
+SHAPES.update({
+    "taxes": "money", "monthly_rent": "money", "security_deposit": "money",
+    "utility_allowance": "money", "ca_shelter_allowance": "money",
+    "cityfheps_rent_supplement": "money", "household_share": "money",
+    "monthly_discount": "money", "other_discount": "money",
+    "total_income_ca": "money", "total_income_non_ca": "money",
+    "parcel_id": "code", "tax_year": "number",
+    "household_ca_count": "number", "household_non_ca_count": "number",
+    "date": "date", "parties": "text", "property_type": "text",
+    "utilities_included": "text", "onetime_concession_comment": "text",
+    "other_discount_comment": "text",
+})
 
 _DATE = re.compile(r"\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b"
                    r"|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}",
@@ -204,7 +390,10 @@ def looks_like(value, shape):
 def shape_of(field):
     if field in SHAPES:
         return SHAPES[field]
-    low = field.lower()
+    # Underscores become spaces first. The field names below come from PEXL
+    # and are snake_case, so without this "total_gas_bill" is one token, never
+    # matches "total", and loses its money check.
+    low = field.lower().replace("_", " ")
     # Plurals are listed out rather than stemmed: the match below is on whole
     # words, so "charge" never covers "charges". A bare "credits" with no
     # shape at all was the bug that put a column heading in a value cell.
@@ -265,7 +454,7 @@ def _align_right(head, row):
     return [(h, c) for h, c in reversed(pairs)]
 
 
-def _candidates(lines, index, key, all_keys):
+def _candidates(lines, index, key, all_keys, shape=None):
     """Everywhere the value for this label might have ended up.
 
     Each candidate carries how far it strayed, so a correct-looking value two
@@ -284,7 +473,10 @@ def _candidates(lines, index, key, all_keys):
     # by this test and is a real value.
     header_row = len(cells) >= 3 and not any(c.isdigit() for c in line)
 
-    same = _value_on_line(line, key)
+    same = _value_on_line(line, key, shape)
+    bled = bool(same) and _starts_with_known_label(same)
+    if bled:
+        same = ""      # that is the next column along, not this field
     if same and not header_row:
         out.append((same, "beside the label", 0))
 
@@ -321,9 +513,11 @@ def _candidates(lines, index, key, all_keys):
                     elif len(below) == 1 and column == 0:
                         out.append((below[0], "line below", down))
 
-    if pattern.fullmatch(line.strip(" .:")):
-        # Label on its own. The value may be directly under it, or further
-        # down past a block of other labels.
+    if pattern.fullmatch(line.strip(" .:")) or bled:
+        # Label on its own -- or sharing the line with another column whose
+        # value has just been rejected, which leaves this one empty and means
+        # the same thing. Either way the value may be directly under it, or
+        # further down past a block of other labels.
         run = 0
         for offset in range(1, 9):
             if index + offset >= len(lines):
@@ -357,7 +551,7 @@ def find_field(text, field, extra=None):
         for index in range(len(lines)):
             if not _label_pattern(key).search(lines[index]):
                 continue
-            for value, how, distance in _candidates(lines, index, key, keys):
+            for value, how, distance in _candidates(lines, index, key, keys, shape):
                 value = value.strip(" :|\t")
                 if not value or _label_pattern(key).fullmatch(value.strip(" .:")):
                     continue

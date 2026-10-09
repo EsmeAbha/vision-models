@@ -4,12 +4,18 @@ Upload a zip of appraisals; every PDF inside is searched for the manufactured-
 housing rating guide — the Class A / B / C / Unratable grid — and only that
 table is taken.
 
+It is part of the chat OCR server: start that one and open
+**http://127.0.0.1:7862/appraisals/**, or click **Appraisal rating guides**
+in its sidebar.
+
 ```powershell
-.\.venv\Scripts\python.exe appraisal_server.py
+.\.venv\Scripts\python.exe vision_server.py
 ```
 
-Open **http://127.0.0.1:7885**. The Gradio app keeps 7860, the chat OCR page
-7862, the FinAI workspace 7880.
+`appraisal_server.py` still runs on its own (on 7885) — that is how
+`serve_appraisals.ps1` shares just this page on the network, with its
+password, without exposing the rest of the chat server. The page uses
+relative URLs, so the same files work both ways.
 
 ## Serving it to the rest of the network
 
@@ -154,6 +160,10 @@ was read correctly.
 node test_appraisal_ui.cjs                             # the page, server running
 .\.venv\Scripts\python.exe test_appraisal_public.py    # the guards; starts its own
 ```
+
+The API and page tests default to a standalone server on 7885. To test the
+copy inside the chat server, point them at it first:
+`$env:APPRAISAL_BASE = "http://127.0.0.1:7862/appraisals"`.
 
 `test_appraisal_public.py` runs its own password-protected server on port 7899
 so it does not disturb the one on 7885. It covers the login gate, the lockout,

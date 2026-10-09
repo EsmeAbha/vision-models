@@ -25,7 +25,8 @@ from openpyxl import load_workbook
 
 import test_mhc_rating_table as F
 
-BASE = "http://127.0.0.1:7885"
+# Standalone on 7885, or mounted in the chat server: APPRAISAL_BASE=http://127.0.0.1:7862/appraisals
+BASE = os.environ.get("APPRAISAL_BASE", "http://127.0.0.1:7885").rstrip("/")
 FAILED = []
 
 # Set when the server under test is password-protected, which it is whenever
@@ -151,7 +152,10 @@ def main():
     print("\nthe page itself is served")
     html = get("/", raw=True).decode("utf-8")
     check("the shell is there", "<div id=\"app\"" in html, True)
-    check("it loads its script", "/assets/app.js" in html, True)
+    # Relative, so the same page works standalone and mounted under
+    # /appraisals/ in the chat server; an absolute /assets/ would load the
+    # chat page's own script there.
+    check("it loads its script", 'src="assets/app.js"' in html, True)
     check("the stylesheet is served",
           b"--accent" in get("/assets/style.css", raw=True), True)
 

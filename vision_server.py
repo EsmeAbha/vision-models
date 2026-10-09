@@ -14,9 +14,11 @@ app.py keeps port 7860; the FinAI workspace keeps 7880.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
+import re
 import shutil
 import tempfile
 import threading
@@ -25,21 +27,24 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import (FileResponse, HTMLResponse,
-                               StreamingResponse)
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import (FileResponse, HTMLResponse, RedirectResponse,
+                               Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 # app.py owns the models. Importing it costs a torch import on startup and
 # gives us the worker lifecycle, the default prompts and the skills for free.
 # Reimplementing any of that is how two front ends start disagreeing about
 # what a run actually does.
 import app as vision
-import deal_book
+import doc_preview
 import field_search
 import fill_template
 import pdf_pages
+import review
+import run_export
 import run_history
 import save_output
 
@@ -81,6 +86,13 @@ _state_lock = threading.Lock()
 # nothing. 642 stale upload folders, 642MB, were sitting in Temp before this.
 MAX_UPLOADS = 40
 MAX_RUNS = 100
+# A loaded model sits on 11-15GB of VRAM and 21-25GB of commit for as long as
+# the server runs, whether or not anything is using it. Nothing else on the
+# machine can have that memory back while it waits. Letting it go after a
+# quiet spell costs the next run a load it would have paid anyway, and
+# changes nothing about what comes out.
+IDLE_UNLOAD_SECONDS = int(os.environ.get("VISION_IDLE_UNLOAD", "600"))
+_last_used = time.time()
 # Anything older than this in Temp is from a previous run of the server.
 STALE_HOURS = 6
 
@@ -92,8 +104,14 @@ def _evict_uploads():
     """
     busy = {r.get("upload") for r in _runs.values()
             if r.get("status") == "running"}
+    now = time.time()
     for fid in list(_uploads)[:-MAX_UPLOADS or None]:
         if len(_uploads) <= MAX_UPLOADS or fid in busy:
+            continue
+        # A zip's files wait their turn to be read; a 53-file batch would
+        # otherwise evict its own first files before reaching them. Pinned
+        # until read, or for a few hours if the batch is abandoned.
+        if _uploads[fid].get("pinned_until", 0) > now:
             continue
         entry = _uploads.pop(fid)
         shutil.rmtree(entry.get("folder", ""), ignore_errors=True)
@@ -108,17 +126,50 @@ def _evict_runs():
         _runs.pop(rid, None)
 
 
+def _idle_watcher():
+    """Unload the model once nothing has used it for a while.
+
+    Takes app.py's lock without blocking: if a run holds it, the model is in
+    use and there is nothing to do. Never interrupts work.
+    """
+    while True:
+        time.sleep(30)
+        try:
+            if vision._state.get("kind") is None:
+                continue
+            if time.time() - _last_used < IDLE_UNLOAD_SECONDS:
+                continue
+            if not vision._lock.acquire(blocking=False):
+                continue
+            try:
+                if vision._state.get("kind") is not None:
+                    kind = vision._state["kind"]
+                    vision.unload_current()
+                    print(f"unloaded {kind} after "
+                          f"{IDLE_UNLOAD_SECONDS}s idle", flush=True)
+            finally:
+                vision._lock.release()
+        except Exception as e:
+            print(f"idle watcher: {type(e).__name__}: {e}", flush=True)
+
+
 def sweep_temp(hours=STALE_HOURS):
-    """Remove upload and page-render folders left by an earlier server.
+    """Remove upload, page-render and worker-output folders left behind.
 
     Nothing here survives a restart: an upload is only useful while the run
-    that reads it is alive, and rendered pages only until they are read.
+    that reads it is alive, rendered pages only until they are read, and a
+    worker output folder only while its annotated image is on screen.
     """
     cutoff = time.time() - hours * 3600
     root = tempfile.gettempdir()
     removed = 0
     for name in os.listdir(root):
-        if not name.startswith(("vision_up_", "vision_pdf_")):
+        # ocr_ folders are app.py's: one per inference, holding the
+        # annotated image, and nothing has ever deleted them. They are only
+        # needed while the run that produced them is on screen, so the same
+        # age cutoff applies.
+        if not name.startswith(("vision_up_", "vision_pdf_", "vision_zip_",
+                                "vision_part_", "ocr_")):
             continue
         path = os.path.join(root, name)
         try:
@@ -133,11 +184,46 @@ app = FastAPI(docs_url=None, redoc_url=None)
 app.mount("/assets", StaticFiles(directory=WEB), name="assets")
 
 
+# The appraisal rating-guide page, served from here rather than a server of
+# its own on 7885: one app, one port, one restart. It is mounted whole -- its
+# own page, login, zip guards and job stream unchanged -- and its page uses
+# relative URLs, so the same files still work if appraisal_server.py is run
+# on its own (serve_appraisals.ps1 does that to share it on the network).
+import appraisal_server  # noqa: E402
+
+
+@app.get("/appraisals", include_in_schema=False)
+def appraisals_slash():
+    # Relative URLs resolve against the directory, so the page must be
+    # opened at /appraisals/ -- without the slash they would hit /api here.
+    return RedirectResponse("/appraisals/")
+
+
+app.mount("/appraisals", appraisal_server.app, name="appraisals")
+
+
 # ----------------------------------------------------------------- the page
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse((WEB / "index.html").read_text(encoding="utf-8"))
+    """The page, with its assets stamped by their own modification time.
+
+    Without the stamp the browser keeps serving the app.js it already has,
+    and a change to the interface looks like it did not happen -- a button
+    removed from the source stays on the screen until someone thinks to hard
+    refresh. The stamp changes when the file does, so the browser fetches the
+    new one and keeps caching the old one the rest of the time.
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "style.css"):
+        try:
+            stamp = int((WEB / name).stat().st_mtime)
+        except OSError:
+            continue
+        html = html.replace(f"/assets/{name}", f"/assets/{name}?v={stamp}")
+    # The page itself must never be served from cache, or the stamps above
+    # are never seen and an old app.js keeps running after it changed.
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 # ----------------------------------------------------------- what is on offer
@@ -209,6 +295,10 @@ def api_doc_types():
             "reader_short": MODEL_META.get(reader, {}).get("name", cfg["reader"]),
             "why": cfg.get("why", ""),
             "fields": list(cfg.get("fields") or []),
+            # The field names are PEXL's, so a value pulled here goes straight
+            # to its API without a translation step in between. This names the
+            # document type they belong to on that side.
+            "pexl": cfg.get("pexl", ""),
         })
     return out
 
@@ -216,16 +306,211 @@ def api_doc_types():
 # -------------------------------------------------------------------- uploads
 
 @app.post("/api/upload")
-async def api_upload(file: UploadFile = File(...)):
+async def api_upload(file: UploadFile = File(...),
+                     source_path: str = Form("")):
+    """Take one document. source_path is where it sat before it was uploaded.
+
+    A browser is not allowed to tell a page the folder a picked file came
+    from, so this is empty for an ordinary upload and carries a relative path
+    only when the file arrived through a folder pick. It is recorded rather
+    than guessed at: the Path and Folder Name columns of the fields workbook
+    are for whatever reads that next, and a made-up path would be worse there
+    than an empty cell.
+    """
     name = os.path.basename(file.filename or "upload")
+    if name.lower().endswith(".zip"):
+        # Streamed to disk, not read into memory: an archive of appraisals is
+        # hundreds of megabytes. Unpacked on a worker thread, so the page and
+        # its progress streams keep answering while it happens.
+        tmp = Path(tempfile.mkdtemp(prefix="vision_zip_"))
+        try:
+            path = tmp / "upload.zip"
+            size = 0
+            with open(path, "wb") as out:
+                while True:
+                    chunk = await file.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > appraisal_server.MAX_ZIP:
+                        raise HTTPException(413, "that archive is over "
+                                            f"{appraisal_server.MAX_ZIP // 1024 ** 3} GB")
+                    out.write(chunk)
+            return await run_in_threadpool(_register_zip, path, name, source_path)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    data = await file.read()
+    return _register_upload(name, lambda dest: dest.write_bytes(data), source_path)
+
+
+# --------------------------------------------------------- uploads in pieces
+#
+# Opened from another computer, this page goes through a tunnel, and the
+# tunnel's relay refuses a request much over 12MB with a 413 -- measured: 11MB
+# through, 16MB refused, and even 8-12MB sometimes timing out with a 504. An
+# appraisal is ~11MB and a zip of them hundreds. So the page sends anything
+# large in small pieces, each retried on its own, and they are put back
+# together here. Locally the pieces cost nothing; through a tunnel they are
+# the only way a file of any real size arrives.
+
+_parts: dict = {}
+PART_MAX_AGE = 6 * 3600
+
+
+class PartStart(BaseModel):
+    name: str
+    size: int
+    source_path: str = ""
+
+
+@app.post("/api/upload/start")
+def api_upload_start(req: PartStart):
+    name = os.path.basename(req.name or "upload")
     ext = os.path.splitext(name)[1].lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"):
+    if ext not in UPLOAD_EXT + (".zip",):
+        raise HTTPException(400, f"{ext or 'that'} is not an image, a PDF or a zip")
+    if req.size <= 0:
+        raise HTTPException(400, "that file is empty")
+    if req.size > appraisal_server.MAX_ZIP:
+        raise HTTPException(413, f"that file is over {appraisal_server.MAX_ZIP // 1024 ** 3} GB")
+    now = time.time()
+    with _state_lock:
+        for pid in [p for p, v in _parts.items() if now - v["at"] > PART_MAX_AGE]:
+            shutil.rmtree(_parts.pop(pid)["folder"], ignore_errors=True)
+    folder = Path(tempfile.mkdtemp(prefix="vision_part_"))
+    path = folder / "upload.bin"
+    with open(path, "wb") as fh:
+        fh.truncate(req.size)
+    pid = uuid.uuid4().hex
+    with _state_lock:
+        _parts[pid] = {"folder": str(folder), "path": str(path), "name": name,
+                       "size": req.size, "got": 0, "at": now,
+                       "source_path": req.source_path}
+    return {"id": pid}
+
+
+@app.put("/api/upload/{pid}/at/{offset}")
+async def api_upload_piece(pid: str, offset: int, request: Request):
+    """One piece, written where it belongs. Sending the same piece twice --
+    which a retry after a timeout does -- writes the same bytes twice, so it
+    is harmless."""
+    with _state_lock:
+        part = _parts.get(pid)
+    if not part:
+        raise HTTPException(404, "that upload is no longer held -- start again")
+    data = await request.body()
+    if offset < 0 or offset + len(data) > part["size"]:
+        raise HTTPException(400, "that piece does not fit the file")
+    with open(part["path"], "r+b") as fh:
+        fh.seek(offset)
+        fh.write(data)
+    part.setdefault("pieces", {})[offset] = len(data)
+    part["at"] = time.time()
+    return {"ok": True}
+
+
+def _whole(part):
+    """Did every byte arrive? The file was sized up front, so its length
+    proves nothing -- the pieces must tile it end to end, with no gap."""
+    at = 0
+    for offset, length in sorted((part.get("pieces") or {}).items()):
+        if offset > at:
+            return False
+        at = max(at, offset + length)
+    return at == part["size"]
+
+
+@app.post("/api/upload/{pid}/finish")
+async def api_upload_finish(pid: str):
+    with _state_lock:
+        part = _parts.pop(pid, None)
+    if not part:
+        raise HTTPException(404, "that upload is no longer held -- start again")
+    try:
+        if not _whole(part):
+            raise HTTPException(400, "the file did not arrive whole -- try again")
+        if part["name"].lower().endswith(".zip"):
+            return await run_in_threadpool(_register_zip, part["path"], part["name"],
+                                           part["source_path"])
+        return await run_in_threadpool(
+            _register_upload, part["name"],
+            lambda dest: shutil.move(part["path"], dest), part["source_path"])
+    finally:
+        shutil.rmtree(part["folder"], ignore_errors=True)
+
+
+UPLOAD_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf")
+MAX_ZIP_FILES = 500
+BATCH_PIN_SECONDS = 6 * 3600
+
+
+def _junk_member(name):
+    """Files a zip carries that are not documents: macOS forks, Office locks."""
+    base = os.path.basename(name)
+    return (name.startswith("__MACOSX/") or base.startswith("._")
+            or base.startswith("~$"))
+
+
+def _register_zip(zip_path, name, source_path=""):
+    """Hold every PDF and image inside a zip, each as an upload of its own.
+
+    Read straight out of the archive, one member at a time, so nothing is
+    unpacked to a shared folder: each document gets its own upload folder
+    like any other, and evicting one cannot take its neighbours with it.
+    The archive is checked first with the appraisal page's own guards --
+    member count, declared size, expansion ratio -- before a byte is written.
+
+    Each file's source path leads back through the zip:
+    C:\\...\\Appraisal.zip\\folder\\report.pdf when the zip's own location is
+    known, otherwise Appraisal.zip/folder/report.pdf.
+    """
+    import zipfile
+
+    appraisal_server._inspect_archive(zip_path)
+    batch = uuid.uuid4().hex
+    files, skipped = [], []
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [m for m in zf.infolist()
+                   if not m.is_dir() and not _junk_member(m.filename)
+                   and os.path.splitext(m.filename)[1].lower() in UPLOAD_EXT]
+        if not members:
+            raise HTTPException(400, "there is no PDF or image inside that zip")
+        if len(members) > MAX_ZIP_FILES:
+            raise HTTPException(413, f"that zip holds {len(members)} documents; "
+                                     f"the limit is {MAX_ZIP_FILES} at a time")
+        members.sort(key=lambda m: m.filename.lower())
+        for m in members:
+            inner = m.filename.replace("\\", "/")
+            where = (os.path.join(source_path, *inner.split("/")) if source_path
+                     else f"{name}/{inner}")
+            try:
+                entry = _register_upload(
+                    inner, lambda dest, m=m: dest.write_bytes(zf.read(m)), where,
+                    batch=batch)
+            except HTTPException as e:
+                skipped.append({"name": inner, "why": e.detail})
+                continue
+            entry["inner"] = inner
+            files.append(entry)
+    if not files:
+        raise HTTPException(400, "nothing in that zip could be read: "
+                                 + "; ".join(f"{s['name']}: {s['why']}" for s in skipped[:3]))
+    return {"batch": True, "id": batch, "name": name,
+            "source_path": source_path, "files": files, "skipped": skipped}
+
+
+def _register_upload(filename, write, source_path="", batch=None):
+    """Hold one document for reading. `write(dest)` puts its bytes at dest."""
+    name = os.path.basename(filename)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in UPLOAD_EXT:
         raise HTTPException(400, f"{ext or 'that'} is not an image or a PDF")
 
     fid = uuid.uuid4().hex
     folder = Path(tempfile.mkdtemp(prefix="vision_up_"))
     path = folder / name
-    path.write_bytes(await file.read())
+    write(path)
 
     is_pdf = ext == ".pdf"
     pages = None
@@ -233,24 +518,101 @@ async def api_upload(file: UploadFile = File(...)):
         try:
             pages = pdf_pages.page_count(str(path))
         except Exception as e:
+            shutil.rmtree(folder, ignore_errors=True)
             raise HTTPException(400, f"unreadable PDF: {type(e).__name__}: {e}")
 
+    source_path = (source_path or "").strip()
     entry = {"id": fid, "name": name, "path": str(path),
-             "folder": str(folder), "pdf": is_pdf, "pages": pages}
+             "folder": str(folder), "pdf": is_pdf, "pages": pages,
+             "source_path": source_path}
+    if batch:
+        entry["batch"] = batch
+        entry["pinned_until"] = time.time() + BATCH_PIN_SECONDS
     with _state_lock:
         _uploads[fid] = entry
         _evict_uploads()
     return {"id": fid, "name": name, "pdf": is_pdf, "pages": pages,
+            "source_path": source_path,
             "preview": None if is_pdf else f"/api/files/{fid}/preview"}
+
+
+# A browser never tells a page where a picked file lives -- only its name --
+# so an upload through the page cannot say where the document came from. This
+# server runs on the same PC as the browser, so it can open the Windows file
+# dialog itself and know the real path. That path is what keeps a value
+# traceable to the file it was read from, so this is the normal way in.
+#
+# tkinter must own the main thread of its process, and this is a worker
+# thread of the web server, so the dialog runs as a small process of its own.
+_PICK_SCRIPT = r"""
+import json, sys, tkinter as tk
+from tkinter import filedialog
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+root.update()
+path = filedialog.askopenfilename(
+    parent=root, title="Choose a document to read",
+    initialdir=sys.argv[1] or None,
+    filetypes=[("PDFs, images and zips",
+                "*.pdf *.png *.jpg *.jpeg *.webp *.bmp *.zip"),
+               ("All files", "*.*")])
+root.destroy()
+print(json.dumps(path or ""))
+"""
+_pick_lock = threading.Lock()
+_last_pick_dir = {"dir": ""}
+
+
+@app.post("/api/pick")
+def api_pick():
+    """Open the Windows file dialog here, and hold what was chosen, path and all."""
+    import subprocess
+    import sys
+    if not _pick_lock.acquire(blocking=False):
+        raise HTTPException(409, "a file dialog is already open -- look behind "
+                                 "the browser window")
+    try:
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", _PICK_SCRIPT, _last_pick_dir["dir"]],
+                capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(408, "the file dialog was left open too long")
+        if out.returncode != 0:
+            raise HTTPException(500, "the file dialog could not open: "
+                                     + (out.stderr.strip()[-300:] or "no detail"))
+        lines = out.stdout.strip().splitlines()
+        chosen = json.loads(lines[-1]) if lines else ""
+    finally:
+        _pick_lock.release()
+
+    if not chosen:
+        return {"cancelled": True}
+    chosen = os.path.normpath(chosen)
+    if not os.path.isfile(chosen):
+        raise HTTPException(404, f"{chosen} is not a file")
+    _last_pick_dir["dir"] = os.path.dirname(chosen)
+    if chosen.lower().endswith(".zip"):
+        # Read where it lies; each document's path then runs through the zip.
+        return _register_zip(chosen, os.path.basename(chosen), chosen)
+    return _register_upload(chosen, lambda dest: shutil.copyfile(chosen, dest),
+                            chosen)
 
 
 @app.get("/api/files/{fid}/preview")
 def api_preview(fid: str):
     with _state_lock:
         entry = _uploads.get(fid)
-    if not entry or entry["pdf"]:
+    if not entry:
         raise HTTPException(404, "no preview for that file")
-    return FileResponse(entry["path"])
+    # Inline, and PDFs included: the browser draws one better than anything
+    # here could, and the panel is for reading the source beside the values
+    # pulled out of it.
+    return FileResponse(entry["path"], media_type=_MEDIA.get(
+        os.path.splitext(entry["name"])[1].lower()),
+        headers={"Content-Disposition":
+                 f'inline; filename="{os.path.basename(entry["name"])}"'})
 
 
 # ----------------------------------------------------------------------- runs
@@ -261,6 +623,9 @@ class RunReq(BaseModel):
     prompt: str = ""
     pages: str = ""
     dpi: int = 300
+    # Which document type was picked, so the fields workbook can order its
+    # columns the way that type declares them.
+    doc_type: str = ""
 
 
 @app.post("/api/run")
@@ -277,7 +642,20 @@ def api_run(req: RunReq):
            "status": "running", "steps": [], "text": "", "annotated": None,
            "error": None, "started": time.time(), "elapsed": None,
            "events": queue.Queue(), "saved": [],
-           "fields": [], "field_summary": "", "filled": None}
+           "fields": [], "field_summary": "", "filled": None,
+           "approved": {}, "layout": None,
+           # Carried through so the fields workbook can say where the
+           # document came from, and the document type so its columns come
+           # out in the order that type declares them.
+           "source_path": upload.get("source_path", ""),
+           # The file on disk, so run_history can keep a copy and the side
+           # panel still works after this upload is evicted or the server
+           # restarts.
+           "source_file": upload.get("path", ""),
+           "upload": req.file_id,
+           "doc_type": req.doc_type or ""}
+    global _last_used
+    _last_used = time.time()
     run["upload"] = req.file_id
     with _state_lock:
         _runs[rid] = run
@@ -295,13 +673,20 @@ def _do_run(rid, upload, req):
     kind = req.model
     names = MODEL_META[kind]["steps"]
 
-    def step(i, state, note=""):
-        entry = {"i": i, "name": names[i], "state": state, "note": note}
+    def step(i, state, note="", done=None, total=None):
+        # `since` is when this step went active, on the server's clock, so a
+        # page that reconnects mid-read still shows how long it has been.
+        prev = next((s for s in run["steps"] if s["i"] == i), None)
+        since = (prev or {}).get("since") if state == "active" else None
+        entry = {"i": i, "name": names[i], "state": state, "note": note,
+                 "since": since or (time.time() if state == "active" else None),
+                 "done": done, "total": total}
         run["steps"] = [s for s in run["steps"] if s["i"] != i] + [entry]
         run["steps"].sort(key=lambda s: s["i"])
         run["events"].put({"type": "step", **entry})
 
     page_dir = None
+    locked = False
     try:
         # Rasterise the PDF BEFORE the model loads, and outside the lock since
         # it needs no GPU. Loading paddle pushes system commit to its ceiling
@@ -310,6 +695,8 @@ def _do_run(rid, upload, req):
         # MemoryError while Windows is still growing a lazily-sized page file.
         # Rendering first keeps that allocation out of the spike, which is the
         # difference between the first run working and needing a retry.
+        if upload["pdf"]:
+            step(0, "active", "preparing the pages")
         pages, page_dir = (_render_pdf_pages(upload, req) if upload["pdf"]
                            else (None, None))
 
@@ -318,27 +705,58 @@ def _do_run(rid, upload, req):
         # if the Gradio page is also serving, the two can still collide over
         # vLLM and VRAM. Run one front end or the other (see the note in
         # __main__), not both.
-        with vision._lock:
-            step(0, "active")
-            vision.ensure_model(kind)
-            step(0, "done")
+        # Every wait gets said out loud: a step sitting silent for a minute is
+        # indistinguishable from a crash.
+        if not vision._lock.acquire(blocking=False):
+            step(0, "active", "waiting for the GPU: another read is running")
+            vision._lock.acquire()
+        locked = True
 
-            step(1, "active")
-            t0 = time.time()
-            if pages is not None:
-                text, annotated = _read_pages(pages, req, kind)
-            else:
-                text, annotated = vision._run_one(kind, upload["path"],
-                                                  req.prompt or "")
-            step(1, "done", f"{time.time() - t0:.1f}s, {len(text or '')} chars")
+        # Warm only if the worker is up AND, for a reader served from WSL, its
+        # vLLM server is too -- otherwise ensure_model is about to restart it,
+        # which takes a minute, and saying "already loaded" would be a lie.
+        in_wsl = vision.OCR_WORKERS[kind].get("wsl")
+        server_up = not in_wsl or vision._vllm_up()
+        warm = vision._state.get("kind") == kind and server_up
+        # Measured: a cold start (vLLM in WSL plus the layout model) took 178s
+        # for a read that then took 13s. Say so, so three minutes of waiting
+        # reads as expected rather than as a hang.
+        if warm:
+            note = "model already loaded"
+        elif not server_up:
+            note = "starting the OCR engine; after a restart or idle this takes about 3 minutes"
+        else:
+            note = "loading the model; about a minute"
+        step(0, "active", note)
+        vision.ensure_model(kind)
+        step(0, "done")
 
-            step(2, "active")
-            run["text"] = text or ""
-            run["annotated"] = annotated
-            step(2, "done")
+        n = len(pages) if pages is not None else 1
+        step(1, "active", f"page 0 of {n}", 0, n)
+        t0 = time.time()
+
+        def on_page(done, total):
+            step(1, "active", f"page {done} of {total}", done, total)
+
+        if pages is not None:
+            text, annotated, run["layout"] = _read_pages(pages, req, kind,
+                                                         on_page)
+        else:
+            text, annotated = vision._run_one(kind, upload["path"],
+                                              req.prompt or "")
+        step(1, "done", f"{n} page{'' if n == 1 else 's'}, "
+                        f"{time.time() - t0:.1f}s, {len(text or '')} chars")
+
+        step(2, "active")
+        run["text"] = text or ""
+        run["annotated"] = annotated
+        step(2, "done")
+        vision._lock.release()
+        locked = False
 
         run["status"] = "done"
         run["elapsed"] = time.time() - run["started"]
+        globals()["_last_used"] = time.time()
         run_history.record(run, MODEL_META.get(kind, {}).get("name", kind))
         run["events"].put({"type": "done", "elapsed": run["elapsed"]})
     except Exception as e:
@@ -347,6 +765,10 @@ def _do_run(rid, upload, req):
         traceback.print_exc()
         run["events"].put({"type": "error", "error": run["error"]})
     finally:
+        # Read now, so it no longer needs to outlive the upload cap.
+        upload.pop("pinned_until", None)
+        if locked:
+            vision._lock.release()
         if page_dir:
             shutil.rmtree(page_dir, ignore_errors=True)
         run["events"].put({"type": "end"})
@@ -371,22 +793,51 @@ def _render_pdf_pages(upload, req):
         raise RuntimeError("that PDF rendered no pages")
     # The caller deletes out_dir once the pages have been read; they are only
     # the way in, and 45 of these folders had been left behind in Temp.
-    return [(n, p) for n, p, _ in rendered], out_dir
+    return [(n, p, info) for n, p, info in rendered], out_dir
 
 
-def _read_pages(pages, req, kind):
-    """Read already-rendered page images, joined with page markers."""
-    numbers = [n for n, _ in pages]
-    images = [p for _, p in pages]
+PAGES_PER_CALL = int(os.environ.get("VISION_PAGES_PER_CALL", "8"))
 
+
+def _read_pages(pages, req, kind, on_page=None):
+    """(text joined with page markers, None, layout) for rendered pages.
+
+    `on_page(done, total)` is told as each page finishes.
+    """
+    numbers = [n for n, _, _ in pages]
+    images = [p for _, p, _ in pages]
+    on_page = on_page or (lambda done, total: None)
+
+    layouts = [None] * len(images)
     if kind == "paddleocr_vl":
-        # PaddleOCR-VL reads a whole batch in one worker call.
-        texts = vision._ocr_request_batch(images)
+        # A few pages per worker call, not the whole document. One call for a
+        # 167-page appraisal held every 300dpi page in memory at once and died
+        # with "Unable to allocate 3.05 MiB" in the vlm worker -- the machine
+        # had 1.8GB of commit left. Eight at a time keeps memory the size of
+        # eight pages however long the document is, and the batch is still
+        # big enough for the vLLM server to read its blocks together.
+        texts, layouts = [], []
+        total = len(images)
+        for start in range(0, total, PAGES_PER_CALL):
+            chunk = images[start:start + PAGES_PER_CALL]
+            t, lay = vision.ocr_batch_with_layout(
+                chunk, progress=lambda done, _n, s=start: on_page(s + done, total))
+            texts += t
+            layouts += lay
     else:
-        texts = [vision._run_one(kind, p, req.prompt or "")[0] for p in images]
+        texts = []
+        for p in images:
+            texts.append(vision._run_one(kind, p, req.prompt or "")[0])
+            on_page(len(texts), len(images))
 
-    parts = [f"<!-- page {n} -->\n{body}" for n, body in zip(numbers, texts)]
-    return "\n\n".join(parts), None
+    # save_output.page_marker is the canonical form. Writing our own meant
+    # split_pages did not recognise it, so a twelve page PDF came back as one
+    # page: one row of fields instead of twelve, and one sheet in the workbook.
+    parts = [f"{save_output.page_marker('', n)}\n{body}"
+             for n, body in zip(numbers, texts)]
+    layout = [review.page_layout(n, info, lay)
+              for (n, _, info), lay in zip(pages, layouts) if lay]
+    return "\n\n".join(parts), None, layout
 
 
 @app.get("/api/runs/{rid}/events")
@@ -440,6 +891,191 @@ def api_run_state(rid: str):
     }
 
 
+# ----------------------------------------------------------- plain questions
+
+# The OCR models on this page read documents; they do not converse. A question
+# typed with nothing attached used to go nowhere at all. This answers it with
+# the local text model, on the same machine, so the box is useful for "what
+# does a cap rate mean" as well as for reading a page.
+CHAT_MODEL = os.environ.get("VISION_CHAT_MODEL", "gpt-oss-64k:latest")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+
+CHAT_SYSTEM = (
+    "You are a careful assistant inside a document-reading tool, answering on "
+    "a local machine. Answer the question directly and briefly.\n\n"
+    "You cannot see any document here: this is the plain-question path, and no "
+    "file was attached. If the question is about a specific document, say that "
+    "it needs to be attached and read first rather than guessing at its "
+    "contents. Never invent a figure, a date or a quotation."
+)
+
+# The same, for a thread that has a document in it. The transcript is sent
+# with the question, so the honest instruction is the opposite one: read it,
+# quote it, and say when it does not contain the answer.
+CHAT_SYSTEM_DOC = (
+    "You are a careful assistant inside a document-reading tool, answering on "
+    "a local machine. Answer the question directly and briefly.\n\n"
+    "The transcript of the document the user is looking at is given below. "
+    "Answer from it. Quote the figure or the line as it is printed rather "
+    "than rephrasing it, and if the transcript does not contain the answer, "
+    "say so plainly. Never invent a figure, a date or a quotation, and never "
+    "fill a gap in the transcript from general knowledge."
+)
+
+# Ollama is asked for an 8k window, and going over it does not fail -- it
+# silently drops messages from the front, which is where the system prompt
+# sits. So the window is spent on purpose instead: roughly four characters to
+# a token, a reserve for the answer, and the rest shared between the document
+# and the history with the newest turns kept first.
+CHARS_PER_TOKEN = 4
+ANSWER_RESERVE_TOKENS = 1200
+DOC_SHARE = 0.55            # of what is left after the system prompt
+
+
+def _fit_history(history, budget):
+    """The most recent turns that fit, in the order they were said.
+
+    Walked newest first so that what survives a tight budget is the part of
+    the conversation the next message actually refers to. A turn too long to
+    fit on its own is cut rather than dropped, because losing an answer
+    entirely is what makes a follow-up like "rewrite that" unanswerable.
+    """
+    kept, used = [], 0
+    for turn in reversed(history or []):
+        role = turn.get("role")
+        body = (turn.get("content") or "").strip()
+        if role not in ("user", "assistant") or not body:
+            continue
+        if used + len(body) > budget:
+            room = budget - used
+            if room < 400:
+                break
+            body = body[-room:]
+        kept.append({"role": role, "content": body})
+        used += len(body)
+    kept.reverse()
+    return kept
+
+
+def _build_messages(prompt, history, document, doc_name):
+    """System prompt, document, history and question -- inside the window."""
+    ctx = int(os.environ.get("VISION_CHAT_CTX", "8192"))
+    total = max(1000, (ctx - ANSWER_RESERVE_TOKENS)) * CHARS_PER_TOKEN
+
+    system = CHAT_SYSTEM_DOC if document else CHAT_SYSTEM
+    question = prompt[:8000]
+    room = total - len(system) - len(question)
+
+    doc_text, prefix = "", ""
+    if document:
+        # The line introducing the transcript is part of what gets sent, so it
+        # comes out of the allowance too. Counting only the transcript put the
+        # request over the window by exactly the length of this label -- and
+        # going over is not an error, it drops the system prompt.
+        prefix = "Transcript of %s:\n\n" % (doc_name or "the document")
+        allowance = max(0, int(room * DOC_SHARE) - len(prefix))
+        doc_text = document.strip()
+        if len(doc_text) > allowance:
+            # The head of a document carries the labels and the summary; the
+            # tail is usually the detail tables. Keeping both ends and saying
+            # what was dropped beats a silent cut in the middle.
+            half = allowance // 2
+            doc_text = (doc_text[:half] + "\n\n[... part of this document is "
+                        "not shown: it is longer than this window ...]\n\n"
+                        + doc_text[-half:])
+        room -= len(doc_text) + len(prefix)
+
+    messages = [{"role": "system", "content": system}]
+    if doc_text:
+        messages.append({"role": "system", "content": prefix + doc_text})
+    messages += _fit_history(history, max(room, 0))
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+@app.get("/api/chat_model")
+def api_chat_model():
+    """Which local model answers typed questions, and whether it is up.
+
+    Exposed so the sidebar can name it rather than the page asserting a
+    privacy claim nobody can check. If the service is down, the page should
+    say the questions will not work -- not promise they stay local.
+    """
+    import requests as _rq
+
+    try:
+        r = _rq.get(f"{OLLAMA_URL}/api/tags", timeout=4)
+        names = [m["name"] for m in r.json().get("models", [])] if r.ok else []
+    except Exception:
+        return {"model": CHAT_MODEL, "available": False, "where": OLLAMA_URL}
+    return {"model": CHAT_MODEL, "available": CHAT_MODEL in names,
+            "where": OLLAMA_URL}
+
+
+class ChatReq(BaseModel):
+    prompt: str
+    history: list = []
+    # The transcript of the document this thread is about, when there is one.
+    # A chat is one document plus what was asked about it, so a question like
+    # "what is the account number" has something to be answered from.
+    document: str = ""
+    document_name: str = ""
+
+
+@app.post("/api/chat")
+def api_chat(req: ChatReq):
+    """Answer a typed question with the local text model."""
+    import requests as _rq
+
+    text = (req.prompt or "").strip()
+    if not text:
+        raise HTTPException(400, "nothing to answer")
+
+    messages = _build_messages(text, req.history, req.document or "",
+                               req.document_name or "")
+
+    try:
+        r = _rq.post(f"{OLLAMA_URL}/api/chat", timeout=600, json={
+            "model": CHAT_MODEL, "messages": messages, "stream": False,
+            "options": {
+                # Greedy decoding with a fixed seed was making "rewrite
+                # that, more casual" return almost exactly what it returned
+                # the first time. Nothing checkable depends on this being
+                # deterministic -- field extraction calls no model at all, it
+                # matches labels in the transcript -- so the answer is allowed
+                # a little room to differ when the question asks it to.
+                "temperature": float(os.environ.get("VISION_CHAT_TEMP", "0.3")),
+                "top_p": 0.9,
+                # The model's own default is a 64k window, and reserving the
+                # KV cache for it needs 1.6GB on top of 13.8GB of weights --
+                # which failed outright with "cudaMalloc failed ... kv cache"
+                # whenever anything else held a few GB of the card. A typed
+                # question and eight turns of history do not need 64k, and
+                # asking for what is actually used leaves room for the OCR
+                # models to coexist.
+                "num_ctx": int(os.environ.get("VISION_CHAT_CTX", "8192")),
+            },
+        })
+    except _rq.exceptions.ConnectionError:
+        raise HTTPException(503, f"the local model service is not answering on "
+                                 f"{OLLAMA_URL}. Start Ollama and try again.")
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
+
+    if not r.ok:
+        raise HTTPException(502, f"the local model returned {r.status_code}. "
+                                 f"If that is 500, the GPU may be full.")
+    msg = (r.json().get("message") or {})
+    answer = (msg.get("content") or "").strip()
+    if not answer:
+        # Reasoning models can spend the whole budget thinking and return an
+        # empty content field. Half an answer beats a blank bubble.
+        answer = (msg.get("thinking") or "").strip()
+    if not answer:
+        raise HTTPException(502, "the local model returned nothing")
+    return {"answer": answer, "model": CHAT_MODEL}
+
+
 class FieldsReq(BaseModel):
     fields: list = []
     extra: str = ""
@@ -466,24 +1102,35 @@ def api_fields(rid: str, req: FieldsReq):
     if not wanted:
         raise HTTPException(400, "choose at least one field")
 
-    rows, missing, odd = [], 0, 0
-    for r in field_search.find_fields(run["text"], wanted):
-        if not r["found"]:
-            missing += 1
-            verdict = "none"
-        elif r.get("guessed"):
-            verdict = "guess"
-        elif r["shape_ok"]:
-            verdict = "yes"
-        else:
-            odd += 1
-            verdict = "check"
-        where = r["evidence"].split("[")[-1].rstrip("]") if r["evidence"] else ""
-        rows.append({"field": r["field"], "value": r["value"] or "",
-                     "verdict": verdict, "where": where,
-                     "evidence": r["evidence"] or ""})
+    # One page at a time, because one document is not one record. Twelve
+    # monthly bills in a twelve page PDF are twelve bills, and searching the
+    # whole transcript at once returns the first match for every field -- one
+    # row, every value from page 1, the other eleven silently gone.
+    pages = save_output.split_pages(run["text"]) or [("page 1", run["text"])]
 
-    parts = [f"{len(rows) - missing} of {len(rows)} found."]
+    rows, missing, odd = [], 0, 0
+    for number, (label, content) in enumerate(pages, 1):
+        for r in field_search.find_fields(content, wanted):
+            if not r["found"]:
+                missing += 1
+                verdict = "none"
+            elif r.get("guessed"):
+                verdict = "guess"
+            elif r["shape_ok"]:
+                verdict = "yes"
+            else:
+                odd += 1
+                verdict = "check"
+            where = r["evidence"].split("[")[-1].rstrip("]") if r["evidence"] else ""
+            rows.append({"field": r["field"], "value": r["value"] or "",
+                         "label": r.get("matched_label") or "",
+                         "verdict": verdict, "where": where,
+                         "evidence": r["evidence"] or "",
+                         "page": number, "page_label": label})
+
+    found_count = len(rows) - missing
+    parts = [f"{found_count} of {len(rows)} found"
+             + (f" across {len(pages)} pages." if len(pages) > 1 else ".")]
     if missing:
         parts.append(f"{missing} label(s) not printed on the page.")
     if odd:
@@ -582,6 +1229,57 @@ def api_history(limit: int = 60):
     return run_history.summaries(limit=max(1, min(limit, 200)))
 
 
+
+class ThreadReq(BaseModel):
+    """A conversation as the page holds it, on its way to disk."""
+    id: str
+    title: str = ""
+    turns: list = []
+
+
+@app.post("/api/history/thread")
+def api_save_thread(req: ThreadReq):
+    """Write down a typed conversation so a reload does not lose it.
+
+    Called after every answer. A thread that read a document already has a
+    record under the run's id, and this adds the turns to it; a thread with no
+    document gets a record of its own, which is the only way one was ever
+    going to survive the page being refreshed.
+    """
+    rid = (req.id or "").strip()
+    if not run_history._ID_OK.match(rid):
+        raise HTTPException(400, "that is not a thread id")
+
+    turns = []
+    for t in (req.turns or [])[-80:]:
+        question = (t.get("question") or "").strip()
+        answer = (t.get("answer") or "").strip()
+        if question or answer:
+            turns.append({"question": question[:20000],
+                          "answer": answer[:40000],
+                          "model": (t.get("model") or "")[:80]})
+
+    with _state_lock:
+        run = dict(_runs.get(rid) or {})
+    existing = run_history.load(rid) or {}
+    # Keep whatever the record already knows: a thread saved after a read must
+    # not overwrite the transcript with nothing.
+    run.setdefault("id", rid)
+    run["status"] = "done"
+    run["turns"] = turns
+    run["title"] = (req.title or existing.get("title") or "").strip()[:120]
+    if not run.get("text"):
+        run["text"] = existing.get("text", "")
+    if not run.get("file"):
+        run["file"] = existing.get("file", "")
+    if not run.get("model"):
+        run["model"] = existing.get("model", "")
+
+    name = MODEL_META.get(run.get("model") or "", {}).get("name", "")
+    run_history.record(run, name or existing.get("model_name", ""))
+    return {"saved": rid, "turns": len(turns)}
+
+
 @app.get("/api/history/{rid}")
 def api_history_one(rid: str):
     """One remembered run, transcript and all.
@@ -598,6 +1296,8 @@ def api_history_one(rid: str):
         if rid not in _runs:
             _runs[rid] = {
                 "id": rid, "model": entry["model"], "file": entry["file"],
+                "turns": entry.get("turns") or [],
+                "title": entry.get("title", ""),
                 "status": "done", "steps": [], "text": entry["text"],
                 "annotated": entry.get("annotated"), "error": None,
                 "started": 0, "elapsed": entry.get("elapsed"),
@@ -605,6 +1305,9 @@ def api_history_one(rid: str):
                 "fields": entry.get("fields") or [],
                 "field_summary": entry.get("field_summary", ""),
                 "filled": None,
+                "approved": entry.get("approved") or {},
+                "layout": run_history.load_layout(rid),
+                "source_path": entry.get("source_path", ""),
             }
     entry["annotated"] = (f"/api/runs/{rid}/annotated"
                           if entry.get("annotated") else None)
@@ -616,97 +1319,6 @@ def api_forget(rid: str):
     if not run_history.forget(rid):
         raise HTTPException(404, "that run is not remembered")
     return {"forgotten": rid}
-
-
-@app.get("/api/deals")
-def api_deals():
-    return [{"id": d["id"], "name": d["name"], "created": d.get("created", ""),
-             "confirmed": d.get("confirmed", False),
-             "mapped": len(d.get("mapping") or []),
-             "filled": len(d.get("filled") or {}),
-             "documents": len(d.get("history") or [])}
-            for d in deal_book.list_deals()]
-
-
-@app.post("/api/deals")
-async def api_create_deal(name: str = Form(...), file: UploadFile = File(...)):
-    """Start a deal from a workbook you supply, and propose where fields go.
-
-    Nothing is written yet. The proposal comes back for checking, and the
-    mapping that gets stored is whatever is confirmed afterwards.
-    """
-    if not (name or "").strip():
-        raise HTTPException(400, "the deal needs a name")
-    if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
-        raise HTTPException(400, "the template has to be an .xlsx workbook")
-    try:
-        deal = deal_book.create_deal(name.strip(), await file.read(),
-                                     _all_fields())
-    except FileExistsError as e:
-        raise HTTPException(409, str(e))
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(400, str(e))
-    return deal
-
-
-@app.get("/api/deals/{deal_id}")
-def api_deal(deal_id: str):
-    deal = deal_book.load_deal(deal_id)
-    if deal is None:
-        raise HTTPException(404, f"no deal {deal_id!r}")
-    return deal
-
-
-class MappingReq(BaseModel):
-    mapping: list
-
-
-@app.put("/api/deals/{deal_id}/mapping")
-def api_set_mapping(deal_id: str, req: MappingReq):
-    """Store the mapping as corrected. Later documents reuse this one."""
-    try:
-        return deal_book.set_mapping(deal_id, req.mapping)
-    except FileNotFoundError:
-        raise HTTPException(404, f"no deal {deal_id!r}")
-    except (ValueError, KeyError) as e:
-        raise HTTPException(400, str(e))
-
-
-class ApplyReq(BaseModel):
-    run: str
-
-
-@app.post("/api/deals/{deal_id}/apply")
-def api_apply_to_deal(deal_id: str, req: ApplyReq):
-    """Put one document's fields into the deal's workbook."""
-    with _state_lock:
-        run = _runs.get(req.run)
-    if not run:
-        raise HTTPException(404, "no such run")
-    if not run["fields"]:
-        raise HTTPException(400, "pull the fields out first")
-
-    values = {r["field"]: r["value"] for r in run["fields"] if r["value"]}
-    try:
-        out = deal_book.apply_values(deal_id, values, source=run["file"])
-    except FileNotFoundError:
-        raise HTTPException(404, f"no deal {deal_id!r}")
-    except RuntimeError as e:
-        raise HTTPException(500, str(e))
-    out["download"] = f"/api/deals/{deal_id}/workbook"
-    out.pop("workbook", None)
-    return out
-
-
-@app.get("/api/deals/{deal_id}/workbook")
-def api_deal_workbook(deal_id: str):
-    deal = deal_book.load_deal(deal_id)
-    if deal is None:
-        raise HTTPException(404, f"no deal {deal_id!r}")
-    path = deal_book.deal_path(deal_id, deal_book.WORKING_NAME)
-    if not os.path.isfile(path):
-        raise HTTPException(404, "this deal has no workbook yet")
-    return FileResponse(path, filename=f"{deal_id}.xlsx")
 
 
 @app.get("/api/runs/{rid}/annotated")
@@ -737,6 +1349,279 @@ def api_save(rid: str):
                       for i, p in enumerate(files)]}
 
 
+
+def _doc_type_fields(doc_type):
+    """The field order a document type declares, or [] if it names none."""
+    for cfg in vision.load_doc_types():
+        if cfg["name"].lower().replace(" ", "-") == doc_type:
+            return list(cfg.get("fields") or [])
+    return []
+
+
+XLSX_TYPE = ("application/vnd.openxmlformats-officedocument"
+             ".spreadsheetml.sheet")
+
+
+def _export_name(run, kind):
+    stem = os.path.splitext(os.path.basename(run.get("file") or "run"))[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "run"
+    return f"{safe}_{kind}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+
+@app.get("/api/runs/{rid}/export/fields")
+def api_export_fields(rid: str):
+    """The scraped values as a workbook: one row per document, one per field.
+
+    Nothing is worked out here. The cells carry what was found on the page,
+    in the document type's own field order, for another tool's API to read.
+    """
+    with _state_lock:
+        run = _runs.get(rid)
+    if not run:
+        raise HTTPException(404, "no such run")
+    if not run.get("fields"):
+        raise HTTPException(400, "pull the fields out first")
+    _require_approved(rid, run, "fields")
+
+    order = _doc_type_fields(run.get("doc_type") or "")
+
+    name = _export_name(run, "fields")
+    path = os.path.join(vision.OUTPUT_DIR, name)
+    run_export.fields_workbook(
+        [{"path": run.get("source_path") or "", "file": run.get("file", ""),
+          "rows": run["fields"]}], path, fields=order)
+    return FileResponse(path, filename=name, media_type=XLSX_TYPE)
+
+
+@app.get("/api/runs/{rid}/export/tables")
+def api_export_tables(rid: str):
+    """The rendered table as a workbook, a sheet per table, as it was read."""
+    with _state_lock:
+        run = _runs.get(rid)
+    if not run:
+        raise HTTPException(404, "no such run")
+    if not (run.get("text") or "").strip():
+        raise HTTPException(400, "that run produced nothing to export")
+    _require_approved(rid, run, "tables")
+
+    name = _export_name(run, "tables")
+    path = os.path.join(vision.OUTPUT_DIR, name)
+    try:
+        run_export.tables_workbook(run["text"], path)
+    except Exception as e:
+        raise HTTPException(500, f"export failed: {type(e).__name__}: {e}")
+    return FileResponse(path, filename=name, media_type=XLSX_TYPE)
+
+
+# ------------------------------------------------------------------- review
+#
+# Nothing leaves this page unchecked. Every value is shown on the page it was
+# read from, the analyst ticks it, and only a fully ticked workbook can be
+# downloaded. A tick is pinned to the value it approved, so re-extracting a
+# different value takes the tick away rather than carrying it over.
+
+def _run_or_404(rid):
+    with _state_lock:
+        run = _runs.get(rid)
+    if not run:
+        raise HTTPException(404, "no such run -- reopen it from the list")
+    return run
+
+
+def _source_of(rid, run):
+    """The document this run read: the live upload, else the kept copy."""
+    with _state_lock:
+        entry = _uploads.get(run.get("upload") or "")
+    if entry and os.path.exists(entry["path"]):
+        return entry["path"]
+    return run_history._source_path(rid) or None
+
+
+def _review_of(rid, run):
+    return review.build(_source_of(rid, run), run.get("fields") or [],
+                        run.get("text") or "", run.get("layout"))
+
+
+def _require_approved(rid, run, what):
+    state = review.approval(_review_of(rid, run), run.get("approved"))[what]
+    if not state["complete"]:
+        left = state["need"] - state["done"]
+        raise HTTPException(409, f"{left} {what[:-1]}(s) still to approve -- "
+                                 f"check them against the page in Review first")
+
+
+@app.get("/api/runs/{rid}/review")
+def api_review(rid: str):
+    run = _run_or_404(rid)
+    data = _review_of(rid, run)
+    data["file"] = run.get("file", "")
+    data["source_path"] = run.get("source_path", "")
+    data["has_source"] = bool(data["pages"])
+    data["state"] = review.approval(data, run.get("approved"))
+    return data
+
+
+class ApproveReq(BaseModel):
+    keys: list = []
+    on: bool = True
+
+
+@app.post("/api/runs/{rid}/approve")
+def api_approve(rid: str, req: ApproveReq):
+    """Tick or untick values. The server pins each tick to the value as it
+    stands now; the page never says what it approved."""
+    run = _run_or_404(rid)
+    data = _review_of(rid, run)
+    approved = dict(run.get("approved") or {})
+    for key in req.keys or []:
+        key = str(key)
+        if not req.on:
+            approved.pop(key, None)
+            continue
+        pinned = review.fingerprint_of(data, key)
+        if pinned is not None:
+            approved[key] = pinned
+    run["approved"] = approved
+    run_history.record(run, MODEL_META.get(run.get("model") or "", {})
+                       .get("name", ""))
+    return review.approval(data, approved)
+
+
+@app.get("/api/runs/{rid}/page/{n}")
+def api_page_image(rid: str, n: int, dpi: int = 110):
+    run = _run_or_404(rid)
+    source = _source_of(rid, run)
+    if not source or not os.path.exists(source):
+        raise HTTPException(404, "the document this run read was not kept")
+    try:
+        img = review.render(source, n, dpi=max(50, min(dpi, 200)))
+    except (IndexError, ValueError):
+        raise HTTPException(404, "no such page")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/api/runs/{rid}/highlighted.pdf")
+def api_highlighted(rid: str):
+    run = _run_or_404(rid)
+    source = _source_of(rid, run)
+    if not source or not os.path.exists(source):
+        raise HTTPException(404, "the document this run read was not kept")
+    data = review.highlighted_pdf(source, _review_of(rid, run))
+    stem = os.path.splitext(os.path.basename(run.get("file") or "run"))[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "run"
+    return Response(data, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="{safe}_highlighted.pdf"'})
+
+
+
+_MEDIA = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+          ".jpeg": "image/jpeg", ".webp": "image/webp", ".bmp": "image/bmp",
+          ".gif": "image/gif", ".html": "text/html", ".htm": "text/html"}
+
+
+def _resolve_view(src):
+    """Turn a view descriptor into (path, display name).
+
+    Descriptors name something the server already knows about -- an upload, a
+    run's export, a file it saved -- and are resolved against that state. A
+    path never arrives from the page, so the panel cannot be pointed at an
+    arbitrary file on this machine.
+    """
+    parts = (src or "").split(":")
+    kind = parts[0] if parts else ""
+
+    if kind == "upload" and len(parts) == 2:
+        with _state_lock:
+            entry = _uploads.get(parts[1])
+        if not entry:
+            raise HTTPException(404, "that upload is no longer held")
+        return entry["path"], entry["name"]
+
+    if kind == "run" and len(parts) == 2:
+        rid = parts[1]
+        with _state_lock:
+            run = _runs.get(rid)
+        if run:
+            with _state_lock:
+                entry = _uploads.get(run.get("upload") or "")
+            if entry and os.path.exists(entry["path"]):
+                return entry["path"], entry["name"]
+        # The upload is gone -- evicted, or the server restarted. The copy
+        # kept beside the run record is the point of keeping it.
+        kept = run_history._source_path(rid)
+        if kept and os.path.exists(kept):
+            name = (run or {}).get("file", "")
+            if not name:
+                # run fell out of the live table, so its own history record
+                # has the name it was uploaded under -- falling back to the
+                # kept copy's own "<rid>.src.pdf" instead, as this used to,
+                # is how that meaningless name ended up downloaded,
+                # re-uploaded, and baked into a brand new run as its file.
+                recorded = run_history.load(rid, with_text=False)
+                name = (recorded or {}).get("file") or os.path.basename(kept)
+            return kept, name
+        raise HTTPException(404, "the document this run read was not kept; "
+                                 "upload it again to see it")
+
+    if kind == "export" and len(parts) == 3:
+        rid, what = parts[1], parts[2]
+        with _state_lock:
+            run = _runs.get(rid)
+        if not run:
+            raise HTTPException(404, "no such run")
+        name = _export_name(run, what)
+        path = os.path.join(vision.OUTPUT_DIR, name)
+        if what == "fields":
+            if not run.get("fields"):
+                raise HTTPException(400, "pull the fields out first")
+            order = _doc_type_fields(run.get("doc_type") or "")
+            run_export.fields_workbook(
+                [{"path": run.get("source_path") or "",
+                  "file": run.get("file", ""), "rows": run["fields"]}],
+                path, fields=order)
+        elif what == "tables":
+            run_export.tables_workbook(run.get("text") or "", path)
+        else:
+            raise HTTPException(400, f"unknown export {what!r}")
+        return path, name
+
+    if kind == "saved" and len(parts) == 3:
+        with _state_lock:
+            run = _runs.get(parts[1])
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            raise HTTPException(400, "bad file index")
+        if not run or idx >= len(run.get("saved") or []):
+            raise HTTPException(404, "no such saved file")
+        path = run["saved"][idx]
+        return path, os.path.basename(path)
+
+    raise HTTPException(400, "that is not something this page can show")
+
+
+@app.get("/api/view")
+def api_view(src: str = ""):
+    """One file, ready for an iframe.
+
+    A PDF or an image is sent as itself and the browser draws it. Everything
+    else is rendered to HTML first, so a single iframe in the page can show
+    any of them without needing to know which it is.
+    """
+    path, name = _resolve_view(src)
+    if not os.path.exists(path):
+        raise HTTPException(404, "that file is no longer on disk")
+
+    if doc_preview.kind_of(name) == "raw":
+        return FileResponse(path, media_type=_MEDIA.get(
+            os.path.splitext(name)[1].lower()),
+            headers={"Content-Disposition": f'inline; filename="{name}"'})
+    return HTMLResponse(doc_preview.to_html(path, name))
+
+
 @app.get("/api/runs/{rid}/download/{idx}")
 def api_download(rid: str, idx: int):
     with _state_lock:
@@ -762,6 +1647,7 @@ def _gradio_is_serving(timeout=1.5):
 
 if __name__ == "__main__":
     import uvicorn
+    threading.Thread(target=_idle_watcher, daemon=True).start()
     swept = sweep_temp()
     if swept:
         print(f"removed {swept} stale upload/page folder(s) from Temp")

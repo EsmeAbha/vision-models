@@ -111,7 +111,13 @@ def _secure(request: Request):
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
+    # Mounted inside the chat server this page lives under /appraisals, and
+    # the full path no longer starts with /api -- which would wave every
+    # request past the password. Judge the path within this app instead.
     path = request.url.path
+    root = request.scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root):] or "/"
     # /api/session and /api/login are how a browser finds out it needs a
     # password and supplies one; gating them behind the password would leave
     # the page with no way to ask for it.
@@ -331,6 +337,13 @@ def _do_job(jid, archive, staging):
         _emit(job, {"type": "error", "error": job["error"]})
     finally:
         _emit(job, {"type": "end"})
+        # The raw archive and its unpacked PDFs have done their job: the
+        # table each one holds is already in job["_full"] in memory, and the
+        # workbook is already written out to OUT_DIR. Nothing ever read this
+        # folder back, and nothing ever deleted it either -- every finished
+        # job, success or failure, left its whole unpacked copy on disk
+        # forever. One archive of appraisals is hundreds of megabytes.
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _slim(res):

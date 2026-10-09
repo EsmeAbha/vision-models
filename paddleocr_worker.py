@@ -3,8 +3,19 @@ import sys
 import json
 
 _here = os.path.dirname(os.path.abspath(__file__))
+
+# The bundle is for Windows, where an intercepting proxy means the system
+# store is not enough. It must NOT be used when this runs inside WSL off the
+# Windows filesystem: pointing OpenSSL at /mnt/c/.../combined_cacert.pem kills
+# the process during PaddleOCRVL construction -- no traceback, no faulthandler
+# dump, and it takes the whole WSL distro down with it, so the vLLM server
+# dies in the same instant and the only symptom upstream is "OCR worker exited
+# unexpectedly".
+#
+# Measured both ways against the same running server: without these variables
+# the pipeline builds in 6s; with them it is dead in 2s.
 _cert_bundle = os.path.join(_here, "combined_cacert.pem")
-if os.path.exists(_cert_bundle):
+if os.path.exists(_cert_bundle) and not _here.replace("\\", "/").startswith("/mnt/"):
     os.environ.setdefault("SSL_CERT_FILE", _cert_bundle)
     os.environ.setdefault("REQUESTS_CA_BUNDLE", _cert_bundle)
 
@@ -39,8 +50,24 @@ def _text_of(res, out_dir):
     return ""
 
 
-def run_many(image_paths, out_dir):
-    """Recognise several page images in one pipeline call.
+def _layout_of(res):
+    """Where each block sat on the page image, in that image's pixels.
+
+    The markdown keeps only the words; this keeps the boxes, so a value can be
+    shown on the page it was read from.
+    """
+    try:
+        blocks = [{"label": b.label, "bbox": list(b.bbox),
+                   "text": b.content or ""}
+                  for b in (res["parsing_res_list"] or [])]
+        return {"width": int(res["width"]), "height": int(res["height"]),
+                "blocks": blocks}
+    except Exception:
+        return None
+
+
+def run_many_with_layout(image_paths, out_dir):
+    """Recognise several page images in one pipeline call: (texts, layouts).
 
     Passing the whole batch to predict() lets the pipeline fan every block of
     every page out to the vLLM server together, instead of draining one page
@@ -49,13 +76,25 @@ def run_many(image_paths, out_dir):
     _load()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    texts = []
+    texts, layouts = [], []
+    total = len(image_paths)
     for res in _PIPELINE.predict(list(image_paths)):
         texts.append(_text_of(res, out_dir))
+        layouts.append(_layout_of(res))
+        # One line per finished page, so the page can say "page 3 of 12"
+        # instead of sitting on "reading" for minutes looking crashed.
+        print("###PROGRESS###" + json.dumps({"done": len(texts), "total": total}),
+              flush=True)
     # Guard against the pipeline returning a different count than we sent.
     while len(texts) < len(image_paths):
         texts.append("")
-    return texts[: len(image_paths)]
+        layouts.append(None)
+    n = len(image_paths)
+    return texts[:n], layouts[:n]
+
+
+def run_many(image_paths, out_dir):
+    return run_many_with_layout(image_paths, out_dir)[0]
 
 
 def run_one(image_path, prompt, out_dir):
@@ -77,8 +116,9 @@ def serve():
         try:
             req = json.loads(line)
             if req.get("image_paths"):
-                texts = run_many(req["image_paths"], req["out_dir"])
-                resp = {"ok": True, "texts": texts}
+                texts, layouts = run_many_with_layout(req["image_paths"],
+                                                      req["out_dir"])
+                resp = {"ok": True, "texts": texts, "layouts": layouts}
             else:
                 text, img_out = run_one(req["image_path"], req.get("prompt", ""),
                                         req["out_dir"])

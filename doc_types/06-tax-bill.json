@@ -2,6 +2,18 @@
   "name": "Tax bill",
   "reader": "PaddleOCR-VL (document OCR)",
   "why": "No fixed field list: formats vary by authority, so the whole document is transcribed.",
-  "fields": [],
-  "instruction": ""
+  "fields": [
+    "property_name",
+    "account_number",
+    "address",
+    "tax_year",
+    "tax_bill_date",
+    "tax_due_date",
+    "tax_authority",
+    "assessed_value",
+    "total_tax_due",
+    "parcel_id"
+  ],
+  "instruction": "",
+  "pexl": "tax"
 }

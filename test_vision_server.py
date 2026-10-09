@@ -6,12 +6,12 @@ break silently -- the shape of what /api/models and /api/skills hand the page,
 and the PDF path, where render_pdf yields (page, path, info) tuples rather
 than the list of paths it looks like it returns.
 
-One side effect worth knowing: importing vision_server imports app.py, which
-registers stop_vllm with atexit. So finishing a test run stops the WSL vLLM
-server -- including one a running Gradio page was using. Restart that page's
-model, or just run these when nothing else is mid-read.
+Importing vision_server imports app.py. Its exit hook only stops vLLM if
+that same process started it, so a test run no longer stops the shared
+vLLM server a running page is using.
 """
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -170,8 +170,8 @@ class VisionServerTests(unittest.TestCase):
         with patch.object(server.pdf_pages, "page_count", return_value=9), \
              patch.object(server.pdf_pages, "render_pdf", return_value=iter(rendered)) as rp, \
              patch.object(server.vision, "ensure_model"), \
-             patch.object(server.vision, "_ocr_request_batch",
-                          return_value=["two", "three"]) as batch:
+             patch.object(server.vision, "ocr_batch_with_layout",
+                          return_value=(["two", "three"], [None, None])) as batch:
             up = self.upload("scan.pdf", b"%PDF-1.4 fake")
             self.assertTrue(up["pdf"])
             self.assertEqual(up["pages"], 9)
@@ -436,3 +436,250 @@ class VisionServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PickFromPCTests(unittest.TestCase):
+    """The Windows file dialog path: the file comes in with where it lives.
+
+    The dialog itself is not opened -- subprocess.run is stubbed to answer as
+    the dialog would -- so these never put a window on anyone's screen.
+    """
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+        self.history = tempfile.mkdtemp(prefix="hist_")
+        self.addCleanup(shutil.rmtree, self.history, ignore_errors=True)
+        patcher = patch.object(server.run_history, "HISTORY_DIR", self.history)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # A real document in a real folder, as the dialog would hand it back.
+        self.folder = tempfile.mkdtemp(prefix="APR_")
+        self.addCleanup(shutil.rmtree, self.folder, ignore_errors=True)
+        self.doc = os.path.join(self.folder, "Courtyard bill.png")
+        with open(self.doc, "wb") as fh:
+            fh.write(PNG)
+
+    def answer(self, path, code=0):
+        import subprocess
+        return patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            [], code, stdout=json.dumps(path) + "\n", stderr=""))
+
+    def test_a_picked_file_keeps_its_full_path(self):
+        with self.answer(self.doc):
+            r = self.client.post("/api/pick")
+        self.assertEqual(r.status_code, 200, r.text)
+        up = r.json()
+        self.assertEqual(up["source_path"], os.path.normpath(self.doc))
+        self.assertEqual(up["name"], "Courtyard bill.png")
+
+        # ... and the run made from it remembers that path after a restart.
+        with patch.object(server.vision, "ensure_model"), \
+             patch.object(server.vision, "_run_one", return_value=("text", None)):
+            rid = self.client.post("/api/run", json={
+                "file_id": up["id"], "model": "paddleocr_vl"}).json()["id"]
+            self.assertEqual(wait_for(self.client, rid)["status"], "done")
+        server._runs.pop(rid, None)
+        again = self.client.get(f"/api/history/{rid}").json()
+        self.assertEqual(again["source_path"], os.path.normpath(self.doc))
+        self.assertEqual(server._runs[rid]["source_path"], os.path.normpath(self.doc))
+
+    def test_cancelling_the_dialog_attaches_nothing(self):
+        with self.answer(""):
+            r = self.client.post("/api/pick")
+        self.assertEqual(r.json(), {"cancelled": True})
+
+    def test_the_dialog_script_is_valid_python(self):
+        compile(server._PICK_SCRIPT, "<pick>", "exec")
+
+    def test_only_documents_are_taken(self):
+        other = os.path.join(self.folder, "notes.txt")
+        open(other, "w").close()
+        with self.answer(other):
+            r = self.client.post("/api/pick")
+        self.assertEqual(r.status_code, 400)
+
+
+class ProgressTests(unittest.TestCase):
+    """A long read says how far it has got, page by page, as it goes."""
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+        self.history = tempfile.mkdtemp(prefix="hist_")
+        self.addCleanup(shutil.rmtree, self.history, ignore_errors=True)
+        patcher = patch.object(server.run_history, "HISTORY_DIR", self.history)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_progress_is_recorded_while_reading(self):
+        rendered = [(1, "/tmp/p1.png", {}), (2, "/tmp/p2.png", {}), (3, "/tmp/p3.png", {})]
+
+        def read(images, progress=None):
+            for done in (1, 2, 3):
+                progress(done, 3)
+            return ["a", "b", "c"], [None] * 3
+
+        events = []
+        with patch.object(server.pdf_pages, "page_count", return_value=3), \
+             patch.object(server.pdf_pages, "render_pdf", return_value=iter(rendered)), \
+             patch.object(server.vision, "ensure_model"), \
+             patch.object(server.vision, "ocr_batch_with_layout", side_effect=read):
+            up = self.client.post("/api/upload",
+                                  files={"file": ("bill.pdf", b"%PDF-1.4")}).json()
+            started = self.client.post("/api/run", json={
+                "file_id": up["id"], "model": "paddleocr_vl"}).json()
+            wait_for(self.client, started["id"])
+            run = server._runs[started["id"]]
+            # Drain what was queued for a live listener, in order.
+            while not run["events"].empty():
+                events.append(run["events"].get_nowait())
+        notes = [e["note"] for e in events if e.get("type") == "step" and e.get("i") == 1]
+        self.assertEqual(notes[:4], ["page 0 of 3", "page 1 of 3", "page 2 of 3", "page 3 of 3"])
+        totals = [(e["done"], e["total"]) for e in events
+                  if e.get("type") == "step" and e.get("i") == 1 and e["state"] == "active"]
+        self.assertEqual(totals, [(0, 3), (1, 3), (2, 3), (3, 3)])
+        active = [e for e in events if e.get("type") == "step" and e["state"] == "active"]
+        self.assertTrue(all(e["since"] for e in active), "an active step has no start time")
+
+
+class ZipBatchTests(unittest.TestCase):
+    """A zip in the chat is every document inside it, each held to be read."""
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+
+    def zip_of(self, members):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, data in members.items():
+                zf.writestr(name, data)
+        return buf.getvalue()
+
+    def upload_zip(self, data, name="Appraisal.zip"):
+        return self.client.post("/api/upload", files={"file": (name, data)})
+
+    def forget(self, files):
+        for f in files:
+            e = server._uploads.pop(f["id"], None)
+            if e:
+                shutil.rmtree(e["folder"], ignore_errors=True)
+
+    def test_each_document_is_held_with_a_path_through_the_zip(self):
+        r = self.upload_zip(self.zip_of({
+            "set/a.png": PNG, "set/b.png": PNG,
+            "__MACOSX/set/._a.png": b"junk", "set/~$lock.png": PNG,
+            "set/notes.txt": b"not a document",
+        }))
+        self.assertEqual(r.status_code, 200, r.text)
+        d = r.json()
+        self.addCleanup(self.forget, d["files"])
+        self.assertTrue(d["batch"])
+        self.assertEqual([f["inner"] for f in d["files"]], ["set/a.png", "set/b.png"])
+        self.assertEqual(d["files"][0]["source_path"], "Appraisal.zip/set/a.png")
+
+    def test_a_zip_with_no_document_is_refused(self):
+        r = self.upload_zip(self.zip_of({"readme.txt": b"hello"}))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("no PDF or image", r.json()["detail"])
+
+    def test_a_large_batch_is_not_evicted_before_it_is_read(self):
+        n = server.MAX_UPLOADS + 5
+        r = self.upload_zip(self.zip_of({f"doc{i:02d}.png": PNG for i in range(n)}))
+        d = r.json()
+        self.addCleanup(self.forget, d["files"])
+        self.assertEqual(len(d["files"]), n)
+        self.assertTrue(all(f["id"] in server._uploads for f in d["files"]),
+                        "the upload cap evicted documents still waiting to be read")
+
+    def test_a_picked_zip_keeps_the_full_path_to_each_document(self):
+        import subprocess
+        folder = tempfile.mkdtemp(prefix="zip_")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        zpath = os.path.join(folder, "Appraisal.zip")
+        with open(zpath, "wb") as fh:
+            fh.write(self.zip_of({"sub/a.png": PNG}))
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps(zpath) + "\n", stderr="")
+        with patch("subprocess.run", return_value=done):
+            d = self.client.post("/api/pick").json()
+        self.addCleanup(self.forget, d["files"])
+        self.assertEqual(d["files"][0]["source_path"],
+                         os.path.join(os.path.normpath(zpath), "sub", "a.png"))
+
+
+class PieceUploadTests(unittest.TestCase):
+    """Large files arrive in pieces, as they must through the tunnel."""
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+
+    def send(self, name, data, piece=7, order=None, skip=None, repeat=None):
+        pid = self.client.post("/api/upload/start",
+                               json={"name": name, "size": len(data)}).json()["id"]
+        offsets = list(range(0, len(data), piece))
+        for at in (order(offsets) if order else offsets):
+            if at == skip:
+                continue
+            for _ in range(2 if at == repeat else 1):
+                r = self.client.put(f"/api/upload/{pid}/at/{at}",
+                                    content=data[at:at + piece])
+                self.assertEqual(r.status_code, 200, r.text)
+        return self.client.post(f"/api/upload/{pid}/finish")
+
+    def tearDown(self):
+        for fid in list(server._uploads):
+            e = server._uploads.pop(fid)
+            shutil.rmtree(e["folder"], ignore_errors=True)
+
+    def test_pieces_in_any_order_and_repeated_make_the_file(self):
+        r = self.send("doc.png", PNG, order=lambda o: list(reversed(o)), repeat=7)
+        self.assertEqual(r.status_code, 200, r.text)
+        with open(server._uploads[r.json()["id"]]["path"], "rb") as fh:
+            self.assertEqual(fh.read(), PNG)
+
+    def test_a_missing_piece_is_refused_not_read(self):
+        r = self.send("doc.png", PNG, skip=14)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("did not arrive whole", r.json()["detail"])
+
+    def test_a_zip_in_pieces_becomes_a_batch(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("a.png", PNG)
+            zf.writestr("b.png", PNG)
+        r = self.send("Appraisal.zip", buf.getvalue(), piece=64)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(r.json()["files"]), 2)
+
+    def test_a_piece_past_the_end_is_refused(self):
+        pid = self.client.post("/api/upload/start",
+                               json={"name": "doc.png", "size": 10}).json()["id"]
+        r = self.client.put(f"/api/upload/{pid}/at/8", content=b"12345")
+        self.assertEqual(r.status_code, 400)
+
+
+class ChunkedReadTests(unittest.TestCase):
+    """A long document is read a few pages per worker call, never all at once."""
+
+    def test_pages_go_to_the_reader_in_chunks_and_come_back_in_order(self):
+        n = 20
+        pages = [(i, f"/tmp/p{i}.png", {}) for i in range(1, n + 1)]
+        calls, seen = [], []
+
+        def read(images, progress=None):
+            calls.append(len(images))
+            for done in range(1, len(images) + 1):
+                progress(done, len(images))
+            return [f"text of {p}" for p in images], [None] * len(images)
+
+        with patch.object(server.vision, "ocr_batch_with_layout", side_effect=read):
+            text, _, _ = server._read_pages(
+                pages, type("R", (), {"prompt": ""})(), "paddleocr_vl",
+                lambda done, total: seen.append((done, total)))
+        self.assertEqual(calls, [8, 8, 4], "pages were not read in chunks of eight")
+        self.assertEqual(seen[-1], (20, 20))
+        self.assertEqual([d for d, _ in seen], list(range(1, 21)),
+                         "page progress did not count straight through the chunks")
+        self.assertLess(text.index("p9.png"), text.index("p17.png"))
