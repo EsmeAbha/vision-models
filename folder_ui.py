@@ -15,6 +15,7 @@ import pandas as pd
 
 import corpus_scan
 import group_extract as GE
+import zips
 from extract_ui import MODELS, free_ocr_server, gpu_used_mb, vllm_running, wsl_running
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -83,74 +84,16 @@ def resolve_folder(raw):
 
 
 UPLOAD_DIR = os.path.join(_here, "uploads")
-_zip_cache = {}
-
-
-def _safe_members(zf, dest):
-    """Yield members that stay inside dest.
-
-    A zip entry can name ../../etc or an absolute path, and extractall will
-    happily follow it. Files arriving over the network get checked.
-    """
-    dest = os.path.realpath(dest)
-    for m in zf.infolist():
-        name = m.filename.replace("\\", "/")
-        if name.startswith("/") or ".." in name.split("/"):
-            continue
-        if os.path.isabs(name) or (len(name) > 1 and name[1] == ":"):
-            continue
-        target = os.path.realpath(os.path.join(dest, name))
-        if target == dest or target.startswith(dest + os.sep):
-            yield m
-
-
-def _descend_single(root):
-    """Step through wrapper folders like om-tms-asr 22/om-tms-asr 22/.
-
-    Zipping a folder usually nests it once, and sometimes twice. Without this,
-    'which level names the row' silently points at the wrapper and every loan
-    collapses into one row.
-    """
-    for _ in range(4):
-        try:
-            entries = [e for e in os.listdir(root) if not e.startswith((".", "__"))]
-        except OSError:
-            return root
-        subdirs = [e for e in entries if os.path.isdir(os.path.join(root, e))]
-        if len(entries) == 1 and len(subdirs) == 1:
-            root = os.path.join(root, subdirs[0])
-        else:
-            return root
-    return root
 
 
 def extract_zip(zip_path):
-    """(root, note). Extracted once per upload and reused."""
-    import zipfile
-
-    zip_path = str(getattr(zip_path, "name", zip_path))
-    key = (zip_path, os.path.getsize(zip_path))
-    if key in _zip_cache and os.path.isdir(_zip_cache[key]):
-        return _zip_cache[key], "using the already-extracted copy"
-
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(UPLOAD_DIR, f"zip_{stamp}")
-    os.makedirs(dest, exist_ok=True)
-    n = 0
-    with zipfile.ZipFile(zip_path) as zf:
-        members = list(_safe_members(zf, dest))
-        skipped = len(zf.infolist()) - len(members)
-        for m in members:
-            zf.extract(m, dest)
-            n += 1
-    root = _descend_single(dest)
-    note = f"unpacked {n} entr{'y' if n == 1 else 'ies'}"
-    if skipped:
-        note += f" ({skipped} unsafe path(s) skipped)"
-    if root != dest:
-        note += f"; using inner folder '{os.path.basename(root)}'"
-    _zip_cache[key] = root
-    return root, note
+    """(root, note). Extracted once per distinct zip, ever, and reused after
+    that. See zips.extract -- this used to keep its own copy of that logic,
+    named by upload time instead of content, which left a fresh copy on disk
+    every time the same archive was uploaded again and never cleaned any of
+    them up.
+    """
+    return zips.extract(zip_path, dest_dir=UPLOAD_DIR)
 
 
 def _pick_root(root_text, zip_file):

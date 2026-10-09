@@ -13,14 +13,32 @@ points at the wrapper and every unit collapses into one.
 """
 from __future__ import annotations
 
+import hashlib
 import os
-import time
 import zipfile
 
 _here = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(_here, "uploads", "finai")
 
 _cache = {}
+
+
+def _fingerprint(path):
+    """A stable id for this zip's bytes.
+
+    Naming the destination folder from a timestamp meant every re-upload of
+    the same archive -- a retry, a second session, a restart that emptied the
+    in-memory cache below -- extracted a fresh copy beside the old one and
+    never cleaned either up. Hundreds of megabytes of identical content built
+    up this way before anyone noticed. Naming it from the content instead
+    means the same zip always lands in the same folder, so a repeat upload
+    reuses what is already on disk.
+    """
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 def _safe_members(zf, dest):
@@ -54,16 +72,26 @@ def descend_single(root):
 
 
 def extract(zip_path, dest_dir=UPLOAD_DIR):
-    """(root, note). Unpacked once per upload and reused."""
+    """(root, note). Unpacked once per distinct zip, ever, and reused after
+    that -- including across a restart, since the destination folder is named
+    from the zip's own content rather than the time it was uploaded.
+    """
     zip_path = str(getattr(zip_path, "name", zip_path))
     key = (zip_path, os.path.getsize(zip_path))
     if key in _cache and os.path.isdir(_cache[key]):
         return _cache[key], "using the already-unpacked copy"
 
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(dest_dir, f"zip_{stamp}")
-    os.makedirs(dest, exist_ok=True)
+    dest = os.path.join(dest_dir, f"zip_{_fingerprint(zip_path)}")
+    # The marker is written only once extraction finishes, so a folder left
+    # behind by a process killed mid-extraction is never mistaken for a
+    # finished one and handed out half-written.
+    done = os.path.join(dest, ".extracted")
+    if os.path.exists(done):
+        root = descend_single(dest)
+        _cache[key] = root
+        return root, "using the already-unpacked copy"
 
+    os.makedirs(dest, exist_ok=True)
     n = 0
     with zipfile.ZipFile(zip_path) as zf:
         members = list(_safe_members(zf, dest))
@@ -71,6 +99,7 @@ def extract(zip_path, dest_dir=UPLOAD_DIR):
         for m in members:
             zf.extract(m, dest)
             n += 1
+    open(done, "w").close()
 
     root = descend_single(dest)
     note = f"unpacked {n} entr{'y' if n == 1 else 'ies'}"

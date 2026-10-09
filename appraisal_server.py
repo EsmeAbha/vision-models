@@ -331,6 +331,13 @@ def _do_job(jid, archive, staging):
         _emit(job, {"type": "error", "error": job["error"]})
     finally:
         _emit(job, {"type": "end"})
+        # The raw archive and its unpacked PDFs have done their job: the
+        # table each one holds is already in job["_full"] in memory, and the
+        # workbook is already written out to OUT_DIR. Nothing ever read this
+        # folder back, and nothing ever deleted it either -- every finished
+        # job, success or failure, left its whole unpacked copy on disk
+        # forever. One archive of appraisals is hundreds of megabytes.
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _slim(res):
