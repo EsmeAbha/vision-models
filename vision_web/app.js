@@ -24,6 +24,9 @@ const ICON = {
   pop: '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5"/>',
   chev: '<path d="M9 6l6 6-6 6"/>',
   fields: '<rect x="3" y="4" width="5" height="5" rx="1"/><rect x="3" y="15" width="5" height="5" rx="1"/><path d="M11 6.5h10"/><path d="M11 17.5h10"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  mark2: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
 };
 
 function svg(name, size) {
@@ -69,11 +72,12 @@ const S = {
   docType: null,   // id of the chosen type, or null for a plain read
   chosen: [],      // field names ticked in the picker
   extras: [],      // extra field names, added one at a time
-  typing: '',      // what is half-typed in the add box
-  templates: [],   // spreadsheets the found fields can be dropped into
+  fieldQuery: '',  // what is typed in the field dropdown's search box
   history: [],     // documents read in earlier sessions
   expanded: recall('expanded', []),   // rows opened to their detail
-  collapsed: recall('collapsed', []), // groups folded shut
+  // Models and Skills start folded on every load: the run history is what
+  // the sidebar is for, and the composer already shows the chosen reader.
+  collapsed: ['models', 'skills'],
   openRun: null,   // the run the thread is currently showing
   search: '',      // filter over the run list
   chatModel: null, // the local model that answers typed questions
@@ -164,7 +168,7 @@ function clearDocType() {
   S.docType = null;
   S.chosen = [];
   S.extras = [];
-  S.typing = '';
+  S.fieldQuery = '';
   S.menu = null;
   render();
 }
@@ -256,7 +260,7 @@ function closeView() {
 function viewPanel() {
   const wrap = document.createElement('div');
   wrap.className = 'viewer';
-  wrap.style.width = `${S.viewWidth}px`;
+  wrap.style.width = `${viewWidthNow()}px`;
 
   const head = document.createElement('div');
   head.className = 'viewer-head';
@@ -266,7 +270,22 @@ function viewPanel() {
   title.title = S.view.name;
   head.append(title);
 
-  if (S.view.download) {
+  const isWorkbook = S.view.src.startsWith('export:');
+  // A workbook previews freely, but copies and downloads only once every row
+  // in it has been approved against the page.
+  const [, runId, what] = S.view.src.split(':');
+  const owner = isWorkbook ? msgByRun(runId) : null;
+  const locked = isWorkbook && lockOf(owner, what);
+
+  if (locked) {
+    const go = document.createElement('button');
+    go.className = 'btn primary';
+    go.type = 'button';
+    go.innerHTML = `${svg('lock', 14)}<span>Approve to unlock</span>`;
+    go.title = 'Copy and download open once every row is checked against the page';
+    go.onclick = () => owner && openReview(owner);
+    head.append(go);
+  } else if (S.view.download) {
     const dl = document.createElement('a');
     dl.className = 'icon-btn';
     dl.href = S.view.download;
@@ -274,6 +293,17 @@ function viewPanel() {
     dl.innerHTML = svg('down', 16);
     head.append(dl);
   }
+  let frame = null;
+  if (isWorkbook && !locked) {
+    const all = document.createElement('button');
+    all.className = 'btn';
+    all.type = 'button';
+    all.innerHTML = `${svg('copy', 14)}<span>Copy all</span>`;
+    all.onclick = () => copyTables(
+      [...(frame.contentDocument?.querySelectorAll('table') || [])], 'every sheet');
+    head.append(all);
+  }
+
   const pop = document.createElement('a');
   pop.className = 'icon-btn';
   pop.href = `/api/view?src=${encodeURIComponent(S.view.src)}`;
@@ -295,17 +325,570 @@ function viewPanel() {
   // One iframe for every kind of file. A PDF and an image are served as
   // themselves and the browser draws them; a workbook, a document or a text
   // file is rendered to HTML first. The page does not have to know which.
-  const frame = document.createElement('iframe');
+  frame = document.createElement('iframe');
   frame.className = 'viewer-body';
   frame.src = `/api/view?src=${encodeURIComponent(S.view.src)}`;
   frame.title = S.view.name;
+  if (isWorkbook && !locked) {
+    frame.onload = () => addSheetCopyButtons(frame.contentDocument);
+  }
   wrap.append(frame);
   return wrap;
 }
 
+/* A Copy button beside every sheet heading in a workbook preview, so one
+ * table can be taken without the rest. The preview is same-origin, so its
+ * DOM is ours to add to. */
+function addSheetCopyButtons(doc) {
+  if (!doc) return;
+  const style = doc.createElement('style');
+  style.textContent = `
+    .sheet-head { display: flex; align-items: center; gap: 10px; }
+    .sheet-copy { font: 600 11px "Segoe UI", system-ui, sans-serif;
+      color: #1F4E6B; background: #fff; border: 1px solid #DEDFD4;
+      border-radius: 8px; padding: 3px 10px; cursor: pointer; }
+    .sheet-copy:hover { background: #E8EEF4; }`;
+  doc.head.append(style);
+  doc.querySelectorAll('h2').forEach((h) => {
+    const table = h.nextElementSibling?.querySelector('table');
+    if (!table) return;
+    const row = doc.createElement('div');
+    row.className = 'sheet-head';
+    h.replaceWith(row);
+    const b = doc.createElement('button');
+    b.className = 'sheet-copy';
+    b.type = 'button';
+    b.textContent = 'Copy';
+    b.onclick = () => copyTables([table], h.textContent);
+    row.append(h, b);
+  });
+}
+
+/* Tab-separated for plain paste, HTML alongside so a paste into Excel or
+ * Sheets lands cell by cell rather than as one line of text. */
+async function copyTables(tables, what) {
+  if (!tables.length) {
+    toast('Nothing to copy yet; wait for the preview to load.');
+    return;
+  }
+  const cell = (c) => (c.innerText || '').replace(/\s+/g, ' ').trim();
+  const tsv = tables.map((t) => [...t.rows]
+    .map((r) => [...r.cells].map(cell).join('\t')).join('\n')).join('\n\n');
+  const html = tables.map((t) => t.outerHTML).join('<br>');
+  try {
+    if (window.ClipboardItem) {
+      await navigator.clipboard.write([new ClipboardItem({
+        'text/plain': new Blob([tsv], { type: 'text/plain' }),
+        'text/html': new Blob([html], { type: 'text/html' }),
+      })]);
+    } else {
+      await navigator.clipboard.writeText(tsv);
+    }
+    toast(`Copied ${what}.`);
+  } catch (e) {
+    toast('The browser would not give access to the clipboard.');
+  }
+}
+
+/* ------------------------------------------------------- the review screen
+ *
+ * Nothing is copied or downloaded until someone has looked at it against the
+ * page. The source sits on the left with every value boxed and labelled, the
+ * values sit on the right with a tick each, and clicking either side finds
+ * the other. A workbook unlocks only once every row in it is ticked.
+ *
+ * It lives in its own root, outside #app: render() rebuilds #app on every
+ * streamed step, and the pages here must keep their scroll and their loaded
+ * images while that happens. */
+
+const RV = { msg: null, data: null, sel: null, tab: 'fields', zoom: 100,
+             busy: false, error: null };
+
+const msgByRun = (runId) => S.msgs.find((m) => m.role === 'run' && m.runId === runId);
+
+/* The two locks for this run, as the card and the side panel need them. */
+function lockOf(m, what) {
+  const st = m && m.approval && m.approval[what];
+  return !st || !st.complete;
+}
+
+async function refreshApproval(m) {
+  if (!m || !m.runId || m.status !== 'done') return;
+  try {
+    const r = await api(`/api/runs/${m.runId}/review`);
+    m.approval = r.state;
+    render();
+  } catch (e) { /* the card still renders; the lock just stays shut */ }
+}
+
+async function openReview(m, selectKey) {
+  RV.msg = m;
+  RV.data = null;
+  RV.error = null;
+  RV.sel = selectKey || null;
+  RV.tab = selectKey && selectKey.startsWith('t:') ? 'tables' : 'fields';
+  renderReview();
+  try {
+    RV.data = await api(`/api/runs/${m.runId}/review`);
+    m.approval = RV.data.state;
+  } catch (e) {
+    RV.error = e.message;
+  }
+  renderReview();
+  if (RV.sel) requestAnimationFrame(() => focusItem(RV.sel, true));
+}
+
+function closeReview() {
+  RV.msg = null;
+  RV.data = null;
+  renderReview();
+  render();
+}
+
+const isApproved = (key) => !!(RV.data && RV.data.state.approved.includes(key));
+
+async function approve(keys, on) {
+  if (!keys.length || RV.busy) return;
+  RV.busy = true;
+  try {
+    const state = await api(`/api/runs/${RV.msg.runId}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys, on }),
+    });
+    RV.data.state = state;
+    RV.msg.approval = state;
+  } catch (e) {
+    toast(`Could not save that: ${e.message}`);
+  }
+  RV.busy = false;
+  renderReview();
+  render();
+}
+
+/* Everything that can be ticked, in the order the right-hand list shows it. */
+function reviewItems() {
+  if (!RV.data) return [];
+  return RV.tab === 'fields'
+    ? RV.data.fields.filter((f) => f.value)
+    : RV.data.tables;
+}
+
+function nextUnapproved(fromKey) {
+  const items = reviewItems();
+  const start = Math.max(0, items.findIndex((i) => i.key === fromKey) + 1);
+  return items.slice(start).concat(items.slice(0, start))
+    .find((i) => !isApproved(i.key));
+}
+
+/* Select an item, and bring both its box and its row into view. */
+function focusItem(key, scrollPage) {
+  RV.sel = key;
+  const root = el('review-root');
+  root.querySelectorAll('.rv-sel').forEach((n) => n.classList.remove('rv-sel'));
+  root.querySelectorAll(`[data-key="${CSS.escape(key)}"]`).forEach((n) => {
+    n.classList.add('rv-sel');
+    // A field sharing a box with another is reached through its own tag.
+    const boxEl = n.closest('.rv-box');
+    if (boxEl && scrollPage) {
+      boxEl.classList.add('rv-sel');
+      boxEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      boxEl.classList.remove('rv-pulse');
+      void boxEl.offsetWidth;
+      boxEl.classList.add('rv-pulse');
+    }
+    if (n.classList.contains('rv-row')) n.scrollIntoView({ block: 'nearest' });
+  });
+  // An item with no box still has a page: go to it.
+  const item = [...(RV.data.fields || []), ...(RV.data.tables || [])]
+    .find((i) => i.key === key);
+  if (scrollPage && item && !item.box) {
+    const page = root.querySelector(`.rv-page[data-page="${item.page}"]`);
+    if (page) page.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+}
+
+function reviewTop() {
+  const m = RV.msg;
+  const top = document.createElement('div');
+  top.className = 'rv-top';
+
+  const x = document.createElement('button');
+  x.type = 'button';
+  x.className = 'icon-btn';
+  x.setAttribute('aria-label', 'Close the review');
+  x.innerHTML = svg('x', 18);
+  x.onclick = closeReview;
+
+  const title = document.createElement('div');
+  title.className = 'rv-title';
+  title.innerHTML = '<b>Review</b><span></span>';
+  const path = (RV.data && RV.data.source_path) || m.sourcePath || '';
+  title.querySelector('span').textContent = path || m.file;
+  title.querySelector('span').title = path || 'File path not recorded for this run';
+  top.append(x, title);
+
+  if (RV.data) {
+    const st = RV.data.state;
+    const prog = document.createElement('div');
+    prog.className = 'rv-progress';
+    const bar = (label, s) => {
+      const p = document.createElement('span');
+      p.className = `rv-count${s.complete ? ' done' : ''}`;
+      p.textContent = `${label} ${s.done}/${s.need}`;
+      return p;
+    };
+    prog.append(bar('Fields', st.fields), bar('Tables', st.tables));
+    top.append(prog);
+
+    const zoom = document.createElement('div');
+    zoom.className = 'rv-zoom';
+    [['-', -20], ['+', 20]].forEach(([t, d]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn';
+      b.textContent = t;
+      b.setAttribute('aria-label', d < 0 ? 'Zoom out' : 'Zoom in');
+      b.onclick = () => {
+        RV.zoom = Math.max(60, Math.min(260, RV.zoom + d));
+        const pages = el('review-root').querySelector('.rv-pages-inner');
+        if (pages) pages.style.width = `${RV.zoom}%`;
+      };
+      zoom.append(b);
+    });
+    top.append(zoom);
+
+    const pdf = document.createElement('a');
+    pdf.className = 'btn';
+    pdf.href = `/api/runs/${m.runId}/highlighted.pdf`;
+    pdf.innerHTML = `${svg('down', 14)}<span>Highlighted PDF</span>`;
+    if (!RV.data.has_source) pdf.classList.add('disabled');
+    top.append(pdf);
+
+    [['fields', 'Fields (XLSX)'], ['tables', 'Table (XLSX)']].forEach(([what, label]) => {
+      const locked = lockOf(m, what);
+      const a = document.createElement('a');
+      a.className = `btn${locked ? ' disabled' : ' primary'}`;
+      a.innerHTML = `${svg(locked ? 'lock' : 'down', 14)}<span>${label}</span>`;
+      if (locked) {
+        a.title = `Tick every ${what === 'fields' ? 'field' : 'table'} to unlock`;
+        a.onclick = (e) => {
+          e.preventDefault();
+          RV.tab = what;
+          renderReview();
+          toast(a.title + '.');
+        };
+        a.href = '#';
+      } else {
+        a.href = `/api/runs/${m.runId}/export/${what}`;
+      }
+      top.append(a);
+    });
+  }
+  return top;
+}
+
+function reviewPages() {
+  const d = RV.data;
+  const wrap = document.createElement('div');
+  wrap.className = 'rv-pages';
+  if (!d.has_source) {
+    const p = document.createElement('div');
+    p.className = 'muted-line rv-empty';
+    p.textContent = 'The document this run read was not kept, so there is no '
+      + 'page to check against. Upload it again to review it.';
+    wrap.append(p);
+    return wrap;
+  }
+  const inner = document.createElement('div');
+  inner.className = 'rv-pages-inner';
+  inner.style.width = `${RV.zoom}%`;
+
+  d.pages.forEach((n) => {
+    const page = document.createElement('div');
+    page.className = 'rv-page';
+    page.dataset.page = n;
+    const cap = document.createElement('div');
+    cap.className = 'rv-page-no';
+    cap.textContent = `Page ${n}`;
+    const sheet = document.createElement('div');
+    sheet.className = 'rv-sheet';
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = `Page ${n}`;
+    img.src = `/api/runs/${RV.msg.runId}/page/${n}?dpi=130`;
+    sheet.append(img);
+
+    const box = (item, kind) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `rv-box ${kind}${isApproved(item.key) ? ' ok' : ''}`;
+      b.dataset.key = item.key;
+      const [x0, y0, x1, y1] = item.box;
+      b.style.left = `${x0 * 100}%`;
+      b.style.top = `${y0 * 100}%`;
+      b.style.width = `${(x1 - x0) * 100}%`;
+      b.style.height = `${(y1 - y0) * 100}%`;
+      b.style.setProperty('--c', kind === 'table' ? d.table_color : item.color);
+      b.setAttribute('aria-label', kind === 'table'
+        ? `Table ${item.sheet}` : `${fieldLabel(item.field)}: ${item.value}`);
+      b.onclick = () => {
+        RV.tab = kind === 'table' ? 'tables' : 'fields';
+        renderReview();
+        requestAnimationFrame(() => focusItem(item.key, false));
+      };
+      return b;
+    };
+
+    d.tables.filter((t) => t.page === n && t.box).forEach((t) => {
+      const b = box(t, 'table');
+      const tag = document.createElement('span');
+      tag.className = 'rv-tag';
+      tag.textContent = `${isApproved(t.key) ? '✓ ' : ''}Table ${t.sheet}`;
+      b.append(tag);
+      sheet.append(b);
+    });
+    // Fields that are the same printed value share one box, labels side by side.
+    const groups = new Map();
+    d.fields.filter((f) => f.page === n && f.box).forEach((f) => {
+      const k = f.box.join(',');
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(f);
+    });
+    groups.forEach((members) => {
+      const b = box(members[0], 'field');
+      const tags = document.createElement('span');
+      tags.className = 'rv-tags';
+      members.forEach((f) => {
+        const tag = document.createElement('span');
+        tag.className = 'rv-tag';
+        tag.dataset.key = f.key;
+        tag.style.setProperty('--c', f.color);
+        tag.textContent = `${isApproved(f.key) ? '✓ ' : ''}${fieldLabel(f.field)}`;
+        tag.onclick = (e) => {
+          e.stopPropagation();
+          RV.tab = 'fields';
+          renderReview();
+          requestAnimationFrame(() => focusItem(f.key, false));
+        };
+        tags.append(tag);
+      });
+      b.append(tags);
+      sheet.append(b);
+    });
+
+    page.append(cap, sheet);
+    inner.append(page);
+  });
+  wrap.append(inner);
+  return wrap;
+}
+
+function reviewRow(item, kind) {
+  const row = document.createElement('div');
+  const ok = isApproved(item.key);
+  row.className = `rv-row${ok ? ' ok' : ''}`;
+  row.dataset.key = item.key;
+
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = ok;
+  cb.setAttribute('aria-label', `Approve ${kind === 'table' ? item.sheet : fieldLabel(item.field)}`);
+  cb.onclick = (e) => e.stopPropagation();
+  cb.onchange = () => approve([item.key], cb.checked);
+
+  const body = document.createElement('div');
+  body.className = 'rv-row-body';
+  if (kind === 'table') {
+    const head = document.createElement('div');
+    head.className = 'rv-row-head';
+    head.innerHTML = '<span class="rv-dot"></span><b></b><small></small>';
+    head.querySelector('.rv-dot').style.background = RV.data.table_color;
+    head.querySelector('b').textContent = `Table ${item.sheet}`;
+    head.querySelector('small').textContent = item.box ? '' : 'not outlined on the page';
+    const t = document.createElement('div');
+    t.className = 'rv-table';
+    t.append(safeHtml(item.html));
+    body.append(head, t);
+  } else {
+    const head = document.createElement('div');
+    head.className = 'rv-row-head';
+    head.innerHTML = '<span class="rv-dot"></span><b></b><span class="verdict"></span>';
+    head.querySelector('.rv-dot').style.background = item.color;
+    head.querySelector('b').textContent = fieldLabel(item.field);
+    const V = { yes: ['ok', 'found'], check: ['warn', 'CHECK'], guess: ['warn', 'guess'] };
+    const [cls, txt] = V[item.verdict] || ['none', item.verdict];
+    const vt = head.querySelector('.verdict');
+    vt.classList.add(cls);
+    vt.textContent = txt;
+    const val = document.createElement('div');
+    val.className = 'rv-val';
+    val.textContent = item.value;
+    const where = document.createElement('small');
+    where.className = 'rv-where';
+    where.textContent = item.box
+      ? `${item.where}${item.precise ? '' : ' · region of the page'}`
+      : `${item.where} · could not be placed on the page; check it by eye`;
+    body.append(head, val, where);
+  }
+  row.append(cb, body);
+  row.onclick = () => focusItem(item.key, true);
+  return row;
+}
+
+function reviewSide() {
+  const d = RV.data;
+  const side = document.createElement('div');
+  side.className = 'rv-side';
+
+  const tabs = document.createElement('div');
+  tabs.className = 'rv-tabs';
+  [['fields', 'Fields', d.state.fields], ['tables', 'Tables', d.state.tables]]
+    .forEach(([id, label, st]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `rv-tab${RV.tab === id ? ' on' : ''}`;
+      b.textContent = `${label} ${st.done}/${st.need}`;
+      b.onclick = () => { RV.tab = id; renderReview(); };
+      tabs.append(b);
+    });
+  side.append(tabs);
+
+  const hint = document.createElement('div');
+  hint.className = 'rv-hint';
+  hint.textContent = 'Click a value to find it on the page, or a box on the '
+    + 'page to find its value. Tick each one you have checked. Space ticks the '
+    + 'selected one and moves to the next.';
+  side.append(hint);
+
+  const list = document.createElement('div');
+  list.className = 'rv-list';
+  const items = RV.tab === 'fields' ? d.fields : d.tables;
+  const pages = [...new Set(items.map((i) => i.page))].sort((a, b) => a - b);
+  pages.forEach((n) => {
+    const onPage = items.filter((i) => i.page === n);
+    const tickable = onPage.filter((i) => RV.tab === 'tables' || i.value);
+    const head = document.createElement('div');
+    head.className = 'rv-group';
+    const h = document.createElement('span');
+    h.textContent = `Page ${n}`;
+    head.append(h);
+    if (tickable.length) {
+      const allOk = tickable.every((i) => isApproved(i.key));
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'link';
+      b.textContent = allOk ? 'Untick page' : 'Approve page';
+      b.onclick = () => approve(tickable.map((i) => i.key), !allOk);
+      head.append(b);
+    }
+    list.append(head);
+    tickable.forEach((i) => list.append(reviewRow(i, RV.tab === 'tables' ? 'table' : 'field')));
+
+    const missing = onPage.filter((i) => RV.tab === 'fields' && !i.value);
+    if (missing.length) {
+      const miss = document.createElement('div');
+      miss.className = 'rv-missing';
+      miss.textContent = `Not printed on this page: ${missing.map((i) => fieldLabel(i.field)).join(', ')}`;
+      list.append(miss);
+    }
+  });
+  if (!items.length) {
+    const p = document.createElement('div');
+    p.className = 'muted-line';
+    p.textContent = RV.tab === 'fields'
+      ? 'No fields pulled from this run yet. Close this, pick the fields and press Extract again.'
+      : 'The reader found no tables in this document.';
+    list.append(p);
+  }
+  side.append(list);
+  return side;
+}
+
+function renderReview() {
+  let root = el('review-root');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'review-root';
+    document.body.append(root);
+  }
+  // Keep both scroll positions across a re-render: ticking a box must not
+  // throw the analyst back to page 1.
+  const keep = {
+    pages: root.querySelector('.rv-pages')?.scrollTop || 0,
+    list: root.querySelector('.rv-list')?.scrollTop || 0,
+  };
+  root.textContent = '';
+  document.body.classList.toggle('reviewing', !!RV.msg);
+  if (!RV.msg) return;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'review';
+  wrap.setAttribute('role', 'dialog');
+  wrap.setAttribute('aria-label', `Review ${RV.msg.file}`);
+  wrap.append(reviewTop());
+
+  const body = document.createElement('div');
+  body.className = 'rv-body';
+  if (RV.error) {
+    const f = document.createElement('div');
+    f.className = 'fail rv-empty';
+    f.textContent = RV.error;
+    body.append(f);
+  } else if (!RV.data) {
+    const p = document.createElement('div');
+    p.className = 'muted-line rv-empty';
+    p.textContent = 'Placing each value on its page...';
+    body.append(p);
+  } else {
+    body.append(reviewPages(), reviewSide());
+  }
+  wrap.append(body);
+  root.append(wrap);
+
+  const pagesEl = root.querySelector('.rv-pages');
+  const listEl = root.querySelector('.rv-list');
+  if (pagesEl) pagesEl.scrollTop = keep.pages;
+  if (listEl) listEl.scrollTop = keep.list;
+  if (RV.sel) {
+    root.querySelectorAll(`[data-key="${CSS.escape(RV.sel)}"]`)
+      .forEach((n) => n.classList.add('rv-sel'));
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!RV.msg) return;
+  if (e.key === 'Escape') { closeReview(); return; }
+  if (e.target.closest && e.target.closest('input, textarea')) return;
+  if ((e.key === ' ' || e.key === 'Enter') && RV.sel && RV.data) {
+    e.preventDefault();
+    const key = RV.sel;
+    const next = nextUnapproved(key);
+    approve([key], true).then(() => {
+      if (next && next.key !== key) focusItem(next.key, true);
+    });
+  }
+});
+
 /* The drag handle. Width is written straight to the two elements while the
  * pointer moves: re-rendering the page on every mousemove would rebuild the
  * whole thread, and the drag would stutter against it. */
+/* The widest the panel may be: whatever leaves the thread its minimum. The
+ * old limit forgot the sidebar, so a long drag crushed the thread to 140px
+ * and every line in it wrapped over the next -- and the width was remembered,
+ * so it came back that way on every load. */
+const MIN_THREAD = 560;
+function viewMax() {
+  const side = S.sidebar ? (el('app')?.querySelector('.side')?.offsetWidth || 280) : 0;
+  return Math.max(320, window.innerWidth - side - MIN_THREAD);
+}
+const viewWidthNow = () => Math.min(Math.max(S.viewWidth, 320), viewMax());
+
+window.addEventListener('resize', () => {
+  const panel = document.querySelector('.viewer');
+  if (panel) panel.style.width = `${viewWidthNow()}px`;
+});
+
 function viewGrip() {
   const grip = document.createElement('div');
   grip.className = 'viewer-grip';
@@ -319,8 +902,7 @@ function viewGrip() {
     const startW = panel.getBoundingClientRect().width;
     const move = (ev) => {
       const want = startW + (startX - ev.clientX);
-      const max = Math.max(320, window.innerWidth - 420);
-      S.viewWidth = Math.round(Math.min(Math.max(want, 320), max));
+      S.viewWidth = Math.round(Math.min(Math.max(want, 320), viewMax()));
       panel.style.width = `${S.viewWidth}px`;
     };
     const up = () => {
@@ -377,7 +959,8 @@ async function reopen(id) {
       {
         role: 'run', runId: entry.id, model: entry.model,
         modelName: entry.model_name || (model ? model.name : entry.model),
-        file: entry.file, status: 'done', steps: [], text: entry.text,
+        file: entry.file, sourcePath: entry.source_path || '',
+        status: 'done', steps: [], text: entry.text,
         annotated: entry.annotated, error: null, elapsed: entry.elapsed,
         saved: [], docType: null, docTypeName: '',
         want: (entry.fields || []).length ? { fields: [], extra: '' } : null,
@@ -436,7 +1019,6 @@ const isFolded = (key) => S.collapsed.includes(key);
 function toggleGroup(key) {
   S.collapsed = isFolded(key) ? S.collapsed.filter((k) => k !== key)
                               : S.collapsed.concat([key]);
-  remember('collapsed', S.collapsed);
   render();
 }
 
@@ -504,28 +1086,6 @@ function expandable(button, key, detail) {
   return wrap;
 }
 
-const templatesFor = (docTypeName) =>
-  S.templates.filter((t) => t.doc_type === docTypeName);
-
-/* Copy the template and write this run's fields into the copy. */
-async function fillTemplate(msg, templateId) {
-  msg.fillBusy = templateId;
-  msg.fillError = null;
-  render();
-  try {
-    msg.filled = await api(`/api/runs/${msg.runId}/template`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template: templateId }),
-    });
-    toast(`Wrote ${msg.filled.written.length} cell(s) into ${msg.filled.file}`);
-  } catch (e) {
-    msg.fillError = e.message;
-  }
-  msg.fillBusy = null;
-  render();
-}
-
 /* Pull fields out of a run that has already finished, using whatever is
  * selected in the picker right now. Also records the type on the message, so
  * the matching spreadsheet template appears once the rows are in. */
@@ -556,6 +1116,8 @@ async function extractFields(msg, wanted, extra) {
   }
   msg.fieldsBusy = false;
   render();
+  // A value that changed no longer carries its old tick.
+  refreshApproval(msg);
 
 }
 
@@ -689,6 +1251,7 @@ async function run() {
   S.msgs.push({ role: 'you', text: m.takes_prompt ? S.prompt : '', file: S.file });
   const msg = {
     role: 'run', model: m.id, modelName: m.name, file: S.file.name,
+    sourcePath: S.file.source_path || '',
     status: 'running', steps: [], tab: null, text: '', annotated: null,
     error: null, elapsed: null, saved: [],
     // Snapshot the picker now, so editing it mid-run cannot change what this
@@ -790,27 +1353,26 @@ function finish(msg) {
   render();
 }
 
-async function copyOut(msg) {
-  try {
-    await navigator.clipboard.writeText(msg.text);
-    toast('Copied the output.');
-  } catch (e) {
-    toast('The browser would not give access to the clipboard.');
-  }
-}
-
-async function saveOut(msg) {
-  try {
-    const r = await api(`/api/runs/${msg.runId}/save`, { method: 'POST' });
-    msg.saved = r.saved;
-    render();
-    toast(`Saved ${r.saved.length} file(s) into outputs/.`);
-  } catch (e) {
-    toast(`Save failed: ${e.message}`);
-  }
-}
-
 /* ------------------------------------------------------- getting an image */
+
+/* The server is on this PC, so it opens the Windows file dialog itself and
+ * hands back the file together with where it lives. A browser picker cannot:
+ * it only ever tells a page the file's name. */
+async function pickFromPC() {
+  S.menu = null;
+  S.picking = true;
+  render();
+  toast('Choose the file in the Windows dialog. It may open behind this window.');
+  try {
+    const r = await api('/api/pick', { method: 'POST' });
+    if (!r.cancelled) S.file = r;
+  } catch (e) {
+    toast(`The file dialog did not open (${e.message}). Using the browser picker instead; the path will not be recorded.`);
+    chooseFile();
+  }
+  S.picking = false;
+  render();
+}
 
 function chooseFile() {
   const inp = document.createElement('input');
@@ -976,6 +1538,19 @@ function sidebar() {
     node.append(kg);
   }
 
+  // The appraisal rating-guide page, served by this same server. A new tab,
+  // so a document open here is not lost by going there.
+  const tool = document.createElement('a');
+  tool.className = 'pick tool';
+  tool.href = '/appraisals/';
+  tool.target = '_blank';
+  tool.rel = 'noopener';
+  tool.innerHTML = `<span class="pick-icon">${svg('table', 15)}</span>`
+    + '<span class="pick-text"><span class="pick-head"><span class="pick-name">'
+    + 'Appraisal rating guides</span></span>'
+    + '<span class="pick-sub">A zip of appraisals, one workbook</span></span>';
+  node.append(tool);
+
   // One list of runs, the way a chat sidebar lists conversations: newest
   // first, bucketed by when, the open one marked, and a filter once there
   // are enough of them to need one. A run joins it the moment it finishes.
@@ -984,6 +1559,11 @@ function sidebar() {
     (h) => !needle || (h.file || '').toLowerCase().includes(needle)
            || (h.title || '').toLowerCase().includes(needle)
            || (h.model_name || '').toLowerCase().includes(needle));
+
+  // Everything above stays put; only the runs scroll, under their search box.
+  const scroller = document.createElement('div');
+  scroller.className = 'side-scroll';
+  node.append(scroller);
 
   if (S.history.length > 6 || needle) {
     const find = document.createElement('div');
@@ -995,7 +1575,7 @@ function sidebar() {
     input.value = S.search;
     input.oninput = () => { S.search = input.value; render(); };
     find.append(input);
-    node.append(find);
+    scroller.append(find);
   }
 
   if (matching.length) {
@@ -1043,12 +1623,12 @@ function sidebar() {
       row.append(x);
       list.append(row);
     });
-    node.append(list);
+    scroller.append(list);
   } else if (needle) {
     const none = document.createElement('div');
     none.className = 'muted-line no-runs';
     none.textContent = `Nothing matching "${S.search.trim()}".`;
-    node.append(none);
+    scroller.append(none);
   }
 
   const foot = document.createElement('div');
@@ -1316,18 +1896,14 @@ function runMsg(m) {
 
     const foot = document.createElement('div');
     foot.className = 'card-foot';
+    // Where the sign-off stands is what matters here, more than the length.
     const note = document.createElement('small');
-    note.textContent = m.saved.length
-      ? `Saved: ${m.saved.map((f) => f.name).join(', ')}`
+    const ap = m.approval;
+    note.textContent = ap
+      ? `Approved: fields ${ap.fields.done}/${ap.fields.need}`
+        + ` · tables ${ap.tables.done}/${ap.tables.need}`
       : `${m.text.length} characters`;
     foot.append(note);
-
-    const copy = document.createElement('button');
-    copy.className = 'btn';
-    copy.type = 'button';
-    copy.innerHTML = `${svg('copy', 14)}<span>Copy</span>`;
-    copy.onclick = () => copyOut(m);
-    foot.append(copy);
 
     // The two workbooks, side by side, because they answer different
     // questions: the fields one is the values another tool reads, the table
@@ -1337,12 +1913,25 @@ function runMsg(m) {
     // Both workbooks open in the panel rather than downloading straight
     // away. Checking what is about to be sent is the whole reason the panel
     // exists; the download sits in its header, one click further on.
+    // The source with every value boxed on it. Checking happens there, and
+    // the workbooks below stay locked until it is done.
+    const hl = document.createElement('button');
+    hl.className = 'btn primary';
+    hl.type = 'button';
+    hl.innerHTML = `${svg('mark2', 14)}<span>Highlighted PDF</span>`;
+    hl.title = 'See every value on the page it came from, and approve it';
+    hl.onclick = () => openReview(m);
+    foot.append(hl);
+
     const workbook = (what, label, on) => {
       if (!on) return;
+      const locked = lockOf(m, what);
       const b = document.createElement('button');
       b.className = 'btn';
       b.type = 'button';
-      b.innerHTML = `${svg('sheet', 14)}<span>${label}</span>`;
+      b.innerHTML = `${svg(locked ? 'lock' : 'sheet', 14)}<span>${label}</span>`;
+      b.title = locked ? 'Preview only until every row is approved in Highlighted PDF'
+                       : 'Approved: preview, copy and download';
       b.onclick = () => openView(`export:${m.runId}:${what}`,
                                  `${m.file} — ${label}`,
                                  `/api/runs/${m.runId}/export/${what}`);
@@ -1350,24 +1939,9 @@ function runMsg(m) {
     };
     workbook('fields', 'Fields (XLSX)', m.fieldRows && m.fieldRows.length);
     workbook('tables', 'Table (XLSX)', (m.text || '').includes('<table'));
-
-    if (m.saved.length) {
-      m.saved.forEach((f) => {
-        const b = document.createElement('button');
-        b.className = 'btn';
-        b.type = 'button';
-        b.textContent = f.name.split('.').pop().toUpperCase();
-        b.onclick = () => openView(`saved:${m.runId}:${f.i}`, f.name,
-                                   `/api/runs/${m.runId}/download/${f.i}`);
-        foot.append(b);
-      });
-    } else {
-      const save = document.createElement('button');
-      save.className = 'btn primary';
-      save.type = 'button';
-      save.innerHTML = `${svg('down', 14)}<span>Save</span>`;
-      save.onclick = () => saveOut(m);
-      foot.append(save);
+    if (m.approval === undefined) {
+      m.approval = null;
+      refreshApproval(m);
     }
     card.append(foot);
   }
@@ -1416,6 +1990,18 @@ function composer() {
     x.onclick = detach;
     chip.append(x);
     row.append(chip);
+    // Where it came from, so it can be traced -- or a plain warning that it
+    // cannot be, with the way to fix that.
+    const where = document.createElement('span');
+    if (S.file.source_path) {
+      where.className = 'attached-path';
+      where.textContent = S.file.source_path;
+      where.title = S.file.source_path;
+    } else {
+      where.className = 'attached-path missing';
+      where.textContent = 'File path not recorded. Use + then Open from this PC to keep it.';
+    }
+    row.append(where);
     box.append(row);
   }
 
@@ -1570,7 +2156,8 @@ function attachMenu() {
   m.className = 'menu';
   m.onclick = (e) => e.stopPropagation();
   m.innerHTML = '<div class="menu-label">Add</div>';
-  m.append(menuItem('image', 'Upload image or PDF', 'PNG, JPG, WEBP or PDF', chooseFile));
+  m.append(menuItem('doc', 'Open from this PC', 'Keeps the file’s full path for tracking', pickFromPC));
+  m.append(menuItem('image', 'Browser upload', 'PDF or image; the browser hides the path', chooseFile));
   m.append(menuItem('camera', 'Use webcam', 'Take a picture now', fromWebcam));
   m.append(menuItem('clip', 'Paste from clipboard', 'Whatever you last copied', fromClipboard));
   return m;
@@ -1607,35 +2194,31 @@ function docTypeMenu() {
 }
 
 
-/* The field checklist, shown inside the composer once a type is chosen. */
+/* The fields to pull out, inside the composer once a type is chosen.
+ *
+ * Closed, it is only what is selected: one small tag per field, each with a
+ * cross. The full list lives behind "Choose fields", a searchable dropdown
+ * where the same box that filters the list also adds a field the type does
+ * not name -- so there is one place to pick from, not a grid plus a second
+ * "other fields" form. */
 function fieldPicker() {
   const d = docTypeById(S.docType);
   if (!d) return null;
 
   const panel = document.createElement('div');
   panel.className = 'picker';
+  panel.onclick = (e) => e.stopPropagation();
 
   const head = document.createElement('div');
   head.className = 'picker-head';
   const title = document.createElement('div');
   title.innerHTML = '<strong></strong><small></small>';
   title.querySelector('strong').textContent = d.name;
-  title.querySelector('small').textContent =
-    `read with ${d.reader_short}, then found in the text`;
+  const count = S.chosen.length + S.extras.length;
+  title.querySelector('small').textContent = count
+    ? `${count} field${count === 1 ? '' : 's'} to find, read with ${d.reader_short}`
+    : `read with ${d.reader_short}`;
   head.append(title);
-
-  if (d.fields.length) {
-    const everything = S.chosen.length === d.fields.length;
-    const all = document.createElement('button');
-    all.type = 'button';
-    all.className = 'link';
-    all.textContent = everything ? 'Clear all' : 'Select all';
-    all.onclick = () => {
-      S.chosen = everything ? [] : d.fields.slice();
-      render();
-    };
-    head.append(all);
-  }
   const off = document.createElement('button');
   off.type = 'button';
   off.className = 'link';
@@ -1644,29 +2227,50 @@ function fieldPicker() {
   head.append(off);
   panel.append(head);
 
-  if (d.fields.length) {
-    const grid = document.createElement('div');
-    grid.className = 'field-grid';
-    d.fields.forEach((name) => {
-      const id = 'f-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-      const label = document.createElement('label');
-      label.className = 'field-chip';
-      label.htmlFor = id;
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.id = id;
-      cb.checked = S.chosen.includes(name);
-      cb.onchange = () => toggleField(name);
-      const span = document.createElement('span');
-      span.textContent = fieldLabel(name);
-      label.append(cb, span);
-      grid.append(label);
-    });
-    panel.append(grid);
-  } else {
+  const row = document.createElement('div');
+  row.className = 'picked';
+
+  const tag = (name, onRemove, custom) => {
+    const t = document.createElement('span');
+    t.className = `picked-tag${custom ? ' custom' : ''}`;
+    const txt = document.createElement('span');
+    txt.textContent = custom ? name : fieldLabel(name);
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'chip-x';
+    x.setAttribute('aria-label', `Remove ${txt.textContent}`);
+    x.textContent = '×';
+    x.onclick = onRemove;
+    t.append(txt, x);
+    return t;
+  };
+  // In the type's own order, not the order they were ticked.
+  d.fields.filter((f) => S.chosen.includes(f))
+    .forEach((f) => row.append(tag(f, () => toggleField(f), false)));
+  S.extras.forEach((f) => row.append(tag(f, () => {
+    S.extras = S.extras.filter((x) => x !== f);
+    render();
+  }, true)));
+
+  const open = S.menu === 'fields';
+  const choose = document.createElement('button');
+  choose.type = 'button';
+  choose.className = `picked-add${open ? ' on' : ''}`;
+  choose.setAttribute('aria-expanded', String(open));
+  choose.innerHTML = `${svg('plus', 13)}<span></span>`;
+  choose.querySelector('span').textContent = count ? 'Choose fields' : 'Choose the fields to find';
+  choose.onclick = () => {
+    S.menu = open ? null : 'fields';
+    S.fieldQuery = '';
+    render();
+    if (S.menu) el('field-search')?.focus();
+  };
+  row.append(choose);
+  panel.append(row);
+
+  if (!d.fields.length && !count) {
     // Rent roll, Lease and Tax bill carry no field list on purpose: the whole
-    // document is the answer, or formats vary too much to fix one. Say so and
-    // let the reader name what they want instead of showing an empty grid.
+    // document is the answer, or formats vary too much to fix one.
     const note = document.createElement('div');
     note.className = 'muted-line no-fields';
     note.textContent = d.why
@@ -1674,83 +2278,136 @@ function fieldPicker() {
     panel.append(note);
   }
 
-  const extra = document.createElement('div');
-  extra.className = 'picker-extra';
-  const lab = document.createElement('label');
-  lab.htmlFor = 'extra-fields';
-  lab.textContent = d.fields.length ? 'Other fields' : 'Fields to find';
-  extra.append(lab);
+  if (open) panel.append(fieldDropdown(d));
+  return panel;
+}
 
-  // One field at a time, each its own chip. A comma-separated box asked the
-  // reader to do the parsing: you could not see where one field ended and
-  // the next began, could not remove the middle one without re-typing the
-  // line, and a stray comma silently became two fields or none.
-  if (S.extras.length) {
-    const added = document.createElement('div');
-    added.className = 'field-grid';
-    S.extras.forEach((name) => {
-      const chip = document.createElement('span');
-      chip.className = 'field-chip added';
-      const txt = document.createElement('span');
-      txt.textContent = name;
-      const x = document.createElement('button');
-      x.type = 'button';
-      x.className = 'chip-x';
-      x.setAttribute('aria-label', `Remove ${name}`);
-      x.textContent = '×';
-      x.onclick = () => {
-        S.extras = S.extras.filter((f) => f !== name);
-        render();
-      };
-      chip.append(txt, x);
-      added.append(chip);
-    });
-    extra.append(added);
+function fieldDropdown(d) {
+  const box = document.createElement('div');
+  box.className = 'field-menu';
+  box.onclick = (e) => e.stopPropagation();
+
+  const q = (S.fieldQuery || '').trim();
+  const norm = (t) => t.toLowerCase().replace(/[_\s]+/g, ' ').trim();
+  const nq = norm(q);
+
+  const search = document.createElement('input');
+  search.id = 'field-search';
+  search.type = 'text';
+  search.autocomplete = 'off';
+  search.placeholder = d.fields.length
+    ? 'Search, or type a new field and press Enter'
+    : 'Type a field to find, for example Tenant name';
+  search.value = S.fieldQuery || '';
+  search.oninput = () => { S.fieldQuery = search.value; render(); };
+
+  const matches = d.fields.filter((f) => !nq || norm(f).includes(nq)
+                                     || norm(fieldLabel(f)).includes(nq));
+  const exact = d.fields.some((f) => norm(f) === nq)
+    || S.extras.some((f) => norm(f) === nq);
+
+  const addCustom = (name) => {
+    name = name.trim();
+    if (!name) return;
+    if (!S.extras.some((f) => norm(f) === norm(name))) S.extras.push(name);
+    S.fieldQuery = '';
+    render();
+    el('field-search')?.focus();
+  };
+
+  search.onkeydown = (e) => {
+    if (e.key === 'Escape') { S.menu = null; render(); return; }
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    // One match ticks it; anything else is a field of their own.
+    if (nq && matches.length === 1 && !S.chosen.includes(matches[0])) {
+      toggleField(matches[0]);
+      S.fieldQuery = '';
+      render();
+      el('field-search')?.focus();
+    } else if (nq && !exact) {
+      // A pasted list is still one field per name.
+      q.split(',').forEach(addCustom);
+    }
+  };
+  box.append(search);
+
+  if (d.fields.length) {
+    const bar = document.createElement('div');
+    bar.className = 'field-menu-bar';
+    const n = document.createElement('span');
+    n.textContent = `${d.fields.filter((f) => S.chosen.includes(f)).length} of ${d.fields.length} selected`;
+    const all = document.createElement('button');
+    all.type = 'button';
+    all.className = 'link';
+    all.textContent = 'Select all';
+    all.onclick = () => { S.chosen = d.fields.slice(); render(); el('field-search')?.focus(); };
+    const none = document.createElement('button');
+    none.type = 'button';
+    none.className = 'link';
+    none.textContent = 'Clear';
+    none.onclick = () => { S.chosen = []; render(); el('field-search')?.focus(); };
+    bar.append(n, all, none);
+    box.append(bar);
   }
 
-  const row = document.createElement('div');
-  row.className = 'add-field-row';
-  const inp = document.createElement('input');
-  inp.id = 'extra-fields';
-  inp.type = 'text';
-  inp.placeholder = d.fields.length
-    ? 'Add a field, for example Meter number'
-    : 'Name a field to find, for example Tenant name';
-  inp.value = S.typing;
-  inp.oninput = () => { S.typing = inp.value; };
+  const list = document.createElement('div');
+  list.className = 'field-menu-list';
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-multiselectable', 'true');
 
-  const addNow = () => {
-    // Accept a pasted list too: someone used to typing commas should not be
-    // punished for it, they just get one chip per name.
-    const names = inp.value.split(',').map((t) => t.trim()).filter(Boolean);
-    let added = 0;
-    names.forEach((n) => {
-      if (!S.extras.includes(n) && !S.chosen.includes(n)) {
-        S.extras.push(n);
-        added += 1;
-      }
-    });
-    S.typing = '';
-    if (!added && names.length) toast('Already on the list.');
-    render();
-    const again = el('extra-fields');
-    if (again) again.focus();
+  const option = (label, checked, onToggle, custom) => {
+    const o = document.createElement('label');
+    o.className = `field-option${checked ? ' on' : ''}`;
+    o.setAttribute('role', 'option');
+    o.setAttribute('aria-selected', String(checked));
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = checked;
+    cb.onchange = () => { onToggle(); el('field-search')?.focus(); };
+    const t = document.createElement('span');
+    t.textContent = label;
+    o.append(cb, t);
+    if (custom) {
+      const c = document.createElement('small');
+      c.textContent = 'your field';
+      o.append(c);
+    }
+    return o;
   };
 
-  inp.onkeydown = (e) => {
-    if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addNow(); }
-  };
+  matches.forEach((f) => list.append(
+    option(fieldLabel(f), S.chosen.includes(f), () => toggleField(f), false)));
+  S.extras.filter((f) => !nq || norm(f).includes(nq)).forEach((f) => list.append(
+    option(f, true, () => { S.extras = S.extras.filter((x) => x !== f); render(); }, true)));
 
-  const add = document.createElement('button');
-  add.type = 'button';
-  add.className = 'btn';
-  add.textContent = 'Add';
-  add.onclick = addNow;
+  if (nq && !exact) {
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'field-option add';
+    add.innerHTML = `${svg('plus', 13)}<span></span>`;
+    add.querySelector('span').textContent = `Add "${q}" as a field`;
+    add.onclick = () => q.split(',').forEach(addCustom);
+    list.append(add);
+  }
+  if (!list.children.length) {
+    const p = document.createElement('div');
+    p.className = 'field-menu-empty';
+    p.textContent = 'Type the name of a field to find.';
+    list.append(p);
+  }
+  box.append(list);
 
-  row.append(inp, add);
-  extra.append(row);
-  panel.append(extra);
-  return panel;
+  const foot = document.createElement('div');
+  foot.className = 'field-menu-foot';
+  const done = document.createElement('button');
+  done.type = 'button';
+  done.className = 'btn primary';
+  done.textContent = 'Done';
+  done.onclick = () => { S.menu = null; S.fieldQuery = ''; render(); };
+  foot.append(done);
+  box.append(foot);
+  return box;
 }
 
 /* The found-fields table, with the evidence line behind each value. */
@@ -1846,7 +2503,6 @@ function fieldsTable(m) {
     wrap.append(sum);
   }
 
-  const templates = templatesFor(m.docTypeName);
   const bar = document.createElement('div');
   bar.className = 'template-bar';
 
@@ -1860,53 +2516,7 @@ function fieldsTable(m) {
   again.title = 'Search this transcript for whatever is ticked right now';
   again.onclick = () => extractNow(m);
   bar.append(again);
-
-  if (templates.length) {
-    const lab = document.createElement('span');
-    lab.className = 'muted-line';
-    lab.textContent = 'Drop these into:';
-    bar.append(lab);
-    templates.forEach((t) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'btn';
-      b.disabled = !!m.fillBusy;
-      b.innerHTML = `${svg('table', 14)}<span></span>`;
-      b.querySelector('span').textContent =
-        m.fillBusy === t.id ? 'Filling...' : t.name;
-      b.title = `${t.workbook}, ${t.fields.length} cells`;
-      b.onclick = () => fillTemplate(m, t.id);
-      bar.append(b);
-    });
-  }
-  // Appended either way: a type with no template still gets Extract again.
   wrap.append(bar);
-
-  if (m.fillError) {
-    const f = document.createElement('div');
-    f.className = 'fail';
-    f.textContent = m.fillError;
-    wrap.append(f);
-  }
-
-  if (m.filled) {
-    const done = document.createElement('div');
-    done.className = 'filled';
-    const line = document.createElement('div');
-    line.className = 'muted-line';
-    const skipped = m.filled.skipped.length;
-    line.textContent = `${m.filled.written.length} cell(s) written`
-      + (skipped ? `, ${skipped} left blank: `
-          + m.filled.skipped.map((s) => `${fieldLabel(s.field)} (${s.why})`).join(', ')
-        : '.');
-    const a = document.createElement('a');
-    a.className = 'btn primary';
-    a.href = m.filled.download;
-    a.innerHTML = `${svg('down', 14)}<span></span>`;
-    a.querySelector('span').textContent = m.filled.file;
-    done.append(a, line);
-    wrap.append(done);
-  }
   return wrap;
 }
 
@@ -1925,9 +2535,16 @@ function render() {
     ? { id: old.id, start: old.selectionStart, end: old.selectionEnd }
     : null;
 
+  // The run list is rebuilt below; keep where it was scrolled to.
+  const runsTop = app.querySelector('.side-scroll')?.scrollTop || 0;
+
   app.className = `shell${S.sidebar ? '' : ' collapsed'}`;
   app.textContent = '';
-  if (S.sidebar) app.append(sidebar());
+  if (S.sidebar) {
+    app.append(sidebar());
+    const sc = app.querySelector('.side-scroll');
+    if (sc) sc.scrollTop = runsTop;
+  }
 
   const main = document.createElement('div');
   main.className = 'main';
@@ -2006,14 +2623,12 @@ document.addEventListener('paste', (e) => {
 (async function boot() {
   render();
   try {
-    const [models, skills, docTypes, templates] = await Promise.all([
+    const [models, skills, docTypes] = await Promise.all([
       api('/api/models'), api('/api/skills'), api('/api/doc_types'),
-      api('/api/templates'),
     ]);
     S.models = models;
     S.skills = skills;
     S.docTypes = docTypes;
-    S.templates = templates;
     await loadHistory();
     // Not in the Promise.all above: this one reaches out to the model
     // service, and the page should still come up if that is down.

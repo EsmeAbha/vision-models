@@ -50,8 +50,24 @@ def _text_of(res, out_dir):
     return ""
 
 
-def run_many(image_paths, out_dir):
-    """Recognise several page images in one pipeline call.
+def _layout_of(res):
+    """Where each block sat on the page image, in that image's pixels.
+
+    The markdown keeps only the words; this keeps the boxes, so a value can be
+    shown on the page it was read from.
+    """
+    try:
+        blocks = [{"label": b.label, "bbox": list(b.bbox),
+                   "text": b.content or ""}
+                  for b in (res["parsing_res_list"] or [])]
+        return {"width": int(res["width"]), "height": int(res["height"]),
+                "blocks": blocks}
+    except Exception:
+        return None
+
+
+def run_many_with_layout(image_paths, out_dir):
+    """Recognise several page images in one pipeline call: (texts, layouts).
 
     Passing the whole batch to predict() lets the pipeline fan every block of
     every page out to the vLLM server together, instead of draining one page
@@ -60,13 +76,20 @@ def run_many(image_paths, out_dir):
     _load()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    texts = []
+    texts, layouts = [], []
     for res in _PIPELINE.predict(list(image_paths)):
         texts.append(_text_of(res, out_dir))
+        layouts.append(_layout_of(res))
     # Guard against the pipeline returning a different count than we sent.
     while len(texts) < len(image_paths):
         texts.append("")
-    return texts[: len(image_paths)]
+        layouts.append(None)
+    n = len(image_paths)
+    return texts[:n], layouts[:n]
+
+
+def run_many(image_paths, out_dir):
+    return run_many_with_layout(image_paths, out_dir)[0]
 
 
 def run_one(image_path, prompt, out_dir):
@@ -88,8 +111,9 @@ def serve():
         try:
             req = json.loads(line)
             if req.get("image_paths"):
-                texts = run_many(req["image_paths"], req["out_dir"])
-                resp = {"ok": True, "texts": texts}
+                texts, layouts = run_many_with_layout(req["image_paths"],
+                                                      req["out_dir"])
+                resp = {"ok": True, "texts": texts, "layouts": layouts}
             else:
                 text, img_out = run_one(req["image_path"], req.get("prompt", ""),
                                         req["out_dir"])

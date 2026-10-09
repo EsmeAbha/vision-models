@@ -205,7 +205,7 @@ async function main() {
   // Top-level const is script-scoped in a vm, so expose what the test drives.
   const source = fs.readFileSync('vision_web/app.js', 'utf8')
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
-    + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, templatesFor,'
+    + ' toggleField, fieldsTable, docTypeMenu, fieldPicker,'
     + ' knownFields, fieldsWanted, run, ask, openView, closeView,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
     + ' toggleGroup, isFolded, reopen, newRun, recall, remember };';
@@ -224,9 +224,20 @@ async function main() {
   let seen = visible(app);
   assert.match(seen, /Local Vision/);
   assert.match(seen, /Read a document, locally/, 'empty state missing');
+  assert.ok(!seen.includes('undefined'), 'undefined leaked into the shell');
+
+  // Models and Skills start folded on every load: the sidebar is for the run
+  // history, and only that part of it scrolls.
+  assert.ok(t.isFolded('models') && t.isFolded('skills'),
+            'Models and Skills do not start folded');
+  assert.equal(app.querySelectorAll('.pick.model').length, 0, 'models drawn while folded');
+  assert.equal(app.querySelectorAll('.pick.skill').length, 0, 'skills drawn while folded');
+  assert.ok(app.querySelector('.side-scroll'), 'the run history has no scroll region of its own');
+  t.toggleGroup('models');
+  t.toggleGroup('skills');
+  seen = visible(app);
   assert.match(seen, /PaddleOCR-VL/);
   assert.match(seen, /DeepSeek-OCR/);
-  assert.ok(!seen.includes('undefined'), 'undefined leaked into the shell');
 
   // Skills come off disk, so assert the shape rather than exact wording.
   assert.ok(t.S.skills.length >= 4, 'fewer skills than expected');
@@ -264,7 +275,7 @@ async function main() {
             'boot did not ask the server for the history');
 
   // ---- a group heading folds its list away --------------------------------
-  assert.ok(!t.isFolded('models'), 'Models starts folded');
+  assert.ok(!t.isFolded('models'), 'Models did not unfold when asked');
   assert.equal(app.querySelectorAll('.pick.model').length, t.S.models.length,
                'the models are not all listed');
 
@@ -359,15 +370,12 @@ async function main() {
   assert.ok(!seen.includes('Tideform') && !seen.includes('Teal'),
             'the theme buttons are still drawn');
 
-  // ---- what is folded stays folded next time ------------------------------
+  // ---- a reload folds Models and Skills again -----------------------------
   // Array.from on everything that crosses out of the vm: assert/strict
   // compares prototypes, and an array built inside the context has a
   // different Array.prototype than this realm's.
-  // A disclosure that springs back open on every reload is not a
-  // preference, it is a nuisance.
-  t.toggleGroup('skills');
-  assert.deepEqual(Array.from(t.recall('collapsed', null)), ['skills'],
-                   'folding a group was not remembered');
+  // Opening a row inside a group is still remembered; opening the group is
+  // not -- they are meant to be closed whenever the page comes up.
   t.toggleExpanded('model:paddleocr_vl');
   assert.deepEqual(Array.from(t.recall('expanded', null)), ['model:paddleocr_vl'],
                    'opening a row was not remembered');
@@ -381,15 +389,11 @@ async function main() {
   vm.createContext(second);
   vm.runInContext(fs.readFileSync('vision_web/app.js', 'utf8')
                   + ';globalThis.__again = { S };', second);
-  assert.deepEqual(Array.from(second.__again.S.collapsed), ['skills'],
-                   'a reload forgot which group was folded');
+  assert.deepEqual(Array.from(second.__again.S.collapsed), ['models', 'skills'],
+                   'a reload left Models or Skills open');
   assert.deepEqual(Array.from(second.__again.S.expanded), ['model:paddleocr_vl'],
                    'a reload forgot which row was open');
-
-  t.toggleGroup('skills');
   t.toggleExpanded('model:paddleocr_vl');
-  assert.deepEqual(Array.from(t.recall('collapsed', null)), [],
-                   'unfolding was not remembered either');
 
   // Storage can refuse outright; the sidebar must not care.
   const realStore = sandbox.localStorage;
@@ -497,28 +501,56 @@ async function main() {
   seen = visible(app);
   assert.equal(t.S.chosen.length, bill.fields.length, 'fields not all ticked');
   assert.equal(t.S.model, bill.reader, 'picking a type did not set its reader');
+  const labelOf = (field) => {
+    const shown = field.replace(/_/g, ' ');
+    return shown.charAt(0).toUpperCase() + shown.slice(1);
+  };
+  // Closed, the picker is only the selected fields as tags -- no grid.
+  assert.equal(app.querySelectorAll('.picked-tag').length, bill.fields.length,
+               'one tag per selected field');
+  assert.equal(app.querySelectorAll('.field-option').length, 0,
+               'the full list is drawn before anyone opened it');
   for (const field of bill.fields) {
-    assert.ok(seen.includes(field), `picker is missing ${field}`);
+    assert.ok(seen.includes(labelOf(field)), `no tag for ${labelOf(field)}`);
+    if (field.includes('_')) {
+      assert.ok(!seen.includes(field), `picker shows the raw key ${field}`);
+    }
   }
-  assert.match(seen, /Other fields/);
-  const boxes = app.querySelectorAll('.field-chip');
-  assert.equal(boxes.length, bill.fields.length, 'wrong number of checkboxes');
 
-  // Unticking one is reflected in the count on the composer button.
+  // Unticking one is reflected in the tags and the composer count.
   t.toggleField(bill.fields[0]);
   assert.equal(t.S.chosen.length, bill.fields.length - 1);
+  assert.equal(app.querySelectorAll('.picked-tag').length, bill.fields.length - 1);
   assert.match(visible(app),
                new RegExp(`${bill.fields.length - 1}/${bill.fields.length}`),
                'the composer count did not follow the picker');
+
+  // Opened, the dropdown lists every field of the type, ticked or not.
+  t.S.menu = 'fields';
+  t.render();
+  const options = app.querySelectorAll('.field-option');
+  assert.equal(options.length, bill.fields.length, 'the dropdown does not list every field');
+  assert.ok(app.querySelector('#field-search'), 'the dropdown has no search box');
+  // Search narrows it, and a name the type lacks can be added as a field.
+  t.S.fieldQuery = 'water';
+  t.render();
+  assert.ok(app.querySelectorAll('.field-option').every(
+    (o) => /water/i.test(visible(o))), 'search did not narrow the list');
+  t.S.fieldQuery = 'Meter number';
+  t.render();
+  assert.match(visible(app), /Add "Meter number" as a field/, 'no way to add a new field');
+  t.S.menu = null;
+  t.S.fieldQuery = '';
+  t.render();
 
   // ---- a type with no fixed list explains itself --------------------------
   const lease = t.S.docTypes.find((d) => d.fields.length === 0);
   assert.ok(lease, 'expected a type with no field list');
   t.pickDocType(lease.id);
   seen = visible(app);
-  assert.equal(app.querySelectorAll('.field-chip').length, 0,
-               'a type with no fields still drew checkboxes');
-  assert.match(seen, /Fields to find/, 'no prompt to name fields');
+  assert.equal(app.querySelectorAll('.picked-tag').length, 0,
+               'a type with no fields still drew tags');
+  assert.match(seen, /Choose the fields to find/, 'no prompt to name fields');
   assert.ok(seen.includes(lease.why.slice(0, 40)),
             'the reason for having no field list is not shown');
 
@@ -556,15 +588,13 @@ async function main() {
   assert.match(seen, /2 of 3 found/, 'the summary line is missing');
   assert.ok(!seen.includes('undefined'), 'undefined leaked into the result card');
 
-  // The template button only appears for a type that has one.
-  if (t.templatesFor(bank.name).length) {
-    assert.match(seen, /Drop these into:/, 'no template bar for Bank statement');
-    assert.match(seen, /Bank statement summary/, 'template name missing');
+  // The result card offers the two workbooks and nothing else: no template
+  // drop, no raw MD/HTML/XLSX saves, no copy of the raw transcript.
+  assert.ok(!seen.includes('Drop these into:'), 'the template bar came back');
+  assert.match(seen, /Fields \(XLSX\)/, 'the fields workbook button is missing');
+  for (const gone of ['>MD<', '>HTML<', '>Save<']) {
+    assert.ok(!serialise(app).includes(gone), `${gone} button came back`);
   }
-  t.S.msgs[1].docTypeName = 'Rent roll';
-  t.render();
-  assert.ok(!visible(app).includes('Drop these into:'),
-            'template bar shown for a type with no template');
 
   // ---- a run made WITHOUT choosing a type first ---------------------------
   // This is the path that hid the template button: fields, and so the
@@ -622,9 +652,12 @@ async function main() {
   };
   await extract.onclick();
   sandbox.fetch = realFetch;
-  assert.equal(calls.length, 1, 'clicking extract sent no request');
+  assert.ok(calls.length >= 1, 'clicking extract sent no request');
   assert.match(calls[0].url, /\/api\/runs\/plain\/fields$/,
                `extract posted to ${calls[0].url}`);
+  // New values void old ticks, so the approval state is fetched again after.
+  assert.ok(calls.slice(1).every((c) => /\/api\/runs\/plain\/review$/.test(c.url)),
+            `unexpected follow-up request: ${calls.slice(1).map((c) => c.url)}`);
   assert.equal(calls[0].opts.method, 'POST');
   const sent = JSON.parse(calls[0].opts.body);
   assert.deepEqual(sent.fields, bank.fields,
@@ -658,7 +691,21 @@ async function main() {
   t.S.busy = false;
   t.S.file = null;
   t.S.prompt = 'what is the total?';
-  await t.ask();
+  // Answered here, not by the live server: a real ask goes to the local model
+  // and is saved as a conversation in the history a person actually reads.
+  const liveFetch = sandbox.fetch;
+  const asked = [];
+  sandbox.fetch = (url) => {
+    asked.push(url);
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(
+      { answer: 'The total is $109.27.', model: 'stub', saved: 'stub', turns: 1 }) });
+  };
+  try {
+    await t.ask();
+  } finally {
+    sandbox.fetch = liveFetch;
+  }
+  assert.ok(asked.length, 'asking sent no request');
   assert.equal(t.S.msgs.length, 4, 'a question should join the chat, not replace it');
   assert.equal(t.S.msgs[1].file, 'first.pdf', 'the document left the thread');
 
@@ -701,6 +748,30 @@ async function main() {
   t.closeView();
   assert.equal(app.querySelector('.viewer'), null, 'the panel would not close');
 
+  // A workbook previews before it is approved, but cannot be copied or
+  // downloaded until every row in it has been ticked against the page.
+  t.S.msgs.push({ role: 'run', runId: 'r9', model: t.S.models[0].id,
+                  modelName: 'PaddleOCR-VL', file: 'bill.pdf', status: 'done',
+                  steps: [], text: 'x', annotated: null, error: null, elapsed: 1,
+                  saved: [], want: null, fieldRows: null, fieldSummary: '',
+                  fieldsBusy: false, fieldError: null, tab: null,
+                  approval: { fields: { need: 2, done: 1, complete: false },
+                              tables: { need: 0, done: 0, complete: true } } });
+  t.openView('export:r9:fields', 'bill.pdf - Fields', '/api/runs/r9/export/fields');
+  let head = app.querySelector('.viewer').children[0];
+  assert.ok(!head.children.some((c) => (href(c) || '').includes('/export/')),
+            'an unapproved workbook can be downloaded');
+  assert.match(visible(head), /Approve to unlock/, 'no way to the review from a locked workbook');
+  assert.ok(!/Copy all/.test(visible(head)), 'an unapproved workbook can be copied');
+  t.S.msgs[t.S.msgs.length - 1].approval.fields = { need: 2, done: 2, complete: true };
+  t.render();
+  head = app.querySelector('.viewer').children[0];
+  assert.ok(head.children.some((c) => (href(c) || '').includes('/export/')),
+            'approving every row did not unlock the download');
+  assert.match(visible(head), /Copy all/, 'approving every row did not unlock copying');
+  t.closeView();
+  t.S.msgs.pop();
+
   // ---- the one palette defines every token the stylesheet uses -----------
   const css = await fetch(BASE + '/assets/style.css');
   assert.equal(css.status, 200);
@@ -717,7 +788,7 @@ async function main() {
 
   console.log(`PASS: live bootstrap, ${t.S.models.length} models, `
     + `${t.S.skills.length} skills, ${t.S.docTypes.length} document types, `
-    + 'field picker, fields result, template bar, error state, one chat per read, side panel, one palette.');
+    + 'field picker, fields result, two-workbook footer, error state, one chat per read, side panel, one palette.');
   console.log('Visual browser verification remains unavailable in this environment.');
 }
 

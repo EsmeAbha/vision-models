@@ -30,6 +30,7 @@ MAX_TEXT = 400_000
 
 CSS = """
 :root { color-scheme: light; }
+* { scrollbar-width: thin; scrollbar-color: rgba(31, 78, 107, .28) transparent; }
 body { margin: 0; padding: 18px 20px; background: #F4F3EE; color: #1F4E6B;
        font: 13px/1.55 "Segoe UI", system-ui, sans-serif; }
 h2 { font-size: 13px; margin: 22px 0 8px; color: #4C687C;

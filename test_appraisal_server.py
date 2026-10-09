@@ -25,7 +25,8 @@ from openpyxl import load_workbook
 
 import test_mhc_rating_table as F
 
-BASE = "http://127.0.0.1:7885"
+# Standalone on 7885, or mounted in the chat server: APPRAISAL_BASE=http://127.0.0.1:7862/appraisals
+BASE = os.environ.get("APPRAISAL_BASE", "http://127.0.0.1:7885").rstrip("/")
 FAILED = []
 
 # Set when the server under test is password-protected, which it is whenever

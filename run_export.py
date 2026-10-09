@@ -13,6 +13,7 @@ different things to whatever reads this next.
 from __future__ import annotations
 
 import io
+import ntpath
 import os
 import posixpath
 
@@ -35,7 +36,12 @@ def split_path(path, name=""):
     relative path. They are columns the next tool fills or ignores; inventing
     a path here would be worse than leaving it blank.
     """
-    raw = (path or "").replace("\\", "/").strip("/")
+    path = (path or "").strip()
+    if ntpath.splitdrive(path)[0] or path.startswith("\\\\"):
+        # A full Windows path, from the file dialog: kept exactly as Windows
+        # writes it, so it can be pasted into Explorer to find the file.
+        return path, ntpath.basename(ntpath.dirname(path)), ntpath.basename(path)
+    raw = path.replace("\\", "/").strip("/")
     leaf = os.path.basename(raw) or (name or "")
     folder = posixpath.dirname(raw)
     return raw, folder, leaf
@@ -62,12 +68,7 @@ def fields_workbook(runs, out_path, fields=None):
             if row.get("field") and row["field"] not in names:
                 names.append(row["field"])
 
-    header = LEAD + names
-    ws.append(header)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(vertical="center")
-
+    records = []
     for run in runs:
         path, folder, leaf = split_path(run.get("path"), run.get("file", ""))
         # One row per page, not per file. Twelve monthly bills in a twelve page
@@ -80,13 +81,26 @@ def fields_workbook(runs, out_path, fields=None):
             by_page.setdefault(row.get("page") or 1, {})[row["field"]] = (
                 row.get("value") or "")
         for page in sorted(by_page):
-            found = by_page[page]
-            # Written as text exactly as printed. An account number with a
-            # leading zero, or an amount with its currency symbol, is the
-            # value that was on the page; letting a spreadsheet retype it as a
-            # number loses both.
-            ws.append([path, folder, leaf, page]
-                      + [found.get(n, "") for n in names])
+            records.append(([path, folder, leaf, page], by_page[page]))
+
+    # A field gets a column only if some page has a value for it. The type's
+    # full list includes fields that were never ticked, and a ticked field can
+    # be printed on none of the pages; either way the column would be empty
+    # top to bottom, and the Evidence sheet already says what was not found.
+    names = [n for n in names if any(found.get(n) for _, found in records)]
+
+    header = LEAD + names
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(vertical="center")
+
+    for lead, found in records:
+        # Written as text exactly as printed. An account number with a
+        # leading zero, or an amount with its currency symbol, is the value
+        # that was on the page; letting a spreadsheet retype it as a number
+        # loses both.
+        ws.append(lead + [found.get(n, "") for n in names])
 
     widths = [34, 22, 28, 6] + [20] * len(names)
     for i, w in enumerate(widths, 1):

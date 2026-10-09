@@ -14,6 +14,7 @@ app.py keeps port 7860; the FinAI workspace keeps 7880.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -27,8 +28,8 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import (FileResponse, HTMLResponse,
-                               StreamingResponse)
+from fastapi.responses import (FileResponse, HTMLResponse, RedirectResponse,
+                               Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -41,6 +42,7 @@ import doc_preview
 import field_search
 import fill_template
 import pdf_pages
+import review
 import run_export
 import run_history
 import save_output
@@ -174,6 +176,24 @@ app = FastAPI(docs_url=None, redoc_url=None)
 app.mount("/assets", StaticFiles(directory=WEB), name="assets")
 
 
+# The appraisal rating-guide page, served from here rather than a server of
+# its own on 7885: one app, one port, one restart. It is mounted whole -- its
+# own page, login, zip guards and job stream unchanged -- and its page uses
+# relative URLs, so the same files still work if appraisal_server.py is run
+# on its own (serve_appraisals.ps1 does that to share it on the network).
+import appraisal_server  # noqa: E402
+
+
+@app.get("/appraisals", include_in_schema=False)
+def appraisals_slash():
+    # Relative URLs resolve against the directory, so the page must be
+    # opened at /appraisals/ -- without the slash they would hit /api here.
+    return RedirectResponse("/appraisals/")
+
+
+app.mount("/appraisals", appraisal_server.app, name="appraisals")
+
+
 # ----------------------------------------------------------------- the page
 
 @app.get("/", response_class=HTMLResponse)
@@ -193,7 +213,9 @@ def index():
         except OSError:
             continue
         html = html.replace(f"/assets/{name}", f"/assets/{name}?v={stamp}")
-    return HTMLResponse(html)
+    # The page itself must never be served from cache, or the stamps above
+    # are never seen and an old app.js keeps running after it changed.
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 # ----------------------------------------------------------- what is on offer
@@ -287,15 +309,25 @@ async def api_upload(file: UploadFile = File(...),
     are for whatever reads that next, and a made-up path would be worse there
     than an empty cell.
     """
-    name = os.path.basename(file.filename or "upload")
+    data = await file.read()
+    return _register_upload(file.filename or "upload",
+                            lambda dest: dest.write_bytes(data), source_path)
+
+
+UPLOAD_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf")
+
+
+def _register_upload(filename, write, source_path=""):
+    """Hold one document for reading. `write(dest)` puts its bytes at dest."""
+    name = os.path.basename(filename)
     ext = os.path.splitext(name)[1].lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"):
+    if ext not in UPLOAD_EXT:
         raise HTTPException(400, f"{ext or 'that'} is not an image or a PDF")
 
     fid = uuid.uuid4().hex
     folder = Path(tempfile.mkdtemp(prefix="vision_up_"))
     path = folder / name
-    path.write_bytes(await file.read())
+    write(path)
 
     is_pdf = ext == ".pdf"
     pages = None
@@ -303,16 +335,79 @@ async def api_upload(file: UploadFile = File(...),
         try:
             pages = pdf_pages.page_count(str(path))
         except Exception as e:
+            shutil.rmtree(folder, ignore_errors=True)
             raise HTTPException(400, f"unreadable PDF: {type(e).__name__}: {e}")
 
+    source_path = (source_path or "").strip()
     entry = {"id": fid, "name": name, "path": str(path),
              "folder": str(folder), "pdf": is_pdf, "pages": pages,
-             "source_path": (source_path or "").strip()}
+             "source_path": source_path}
     with _state_lock:
         _uploads[fid] = entry
         _evict_uploads()
     return {"id": fid, "name": name, "pdf": is_pdf, "pages": pages,
+            "source_path": source_path,
             "preview": None if is_pdf else f"/api/files/{fid}/preview"}
+
+
+# A browser never tells a page where a picked file lives -- only its name --
+# so an upload through the page cannot say where the document came from. This
+# server runs on the same PC as the browser, so it can open the Windows file
+# dialog itself and know the real path. That path is what keeps a value
+# traceable to the file it was read from, so this is the normal way in.
+#
+# tkinter must own the main thread of its process, and this is a worker
+# thread of the web server, so the dialog runs as a small process of its own.
+_PICK_SCRIPT = r"""
+import json, sys, tkinter as tk
+from tkinter import filedialog
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+root.update()
+path = filedialog.askopenfilename(
+    parent=root, title="Choose a document to read",
+    initialdir=sys.argv[1] or None,
+    filetypes=[("Images and PDFs", "*.pdf *.png *.jpg *.jpeg *.webp *.bmp"),
+               ("All files", "*.*")])
+root.destroy()
+print(json.dumps(path or ""))
+"""
+_pick_lock = threading.Lock()
+_last_pick_dir = {"dir": ""}
+
+
+@app.post("/api/pick")
+def api_pick():
+    """Open the Windows file dialog here, and hold what was chosen, path and all."""
+    import subprocess
+    import sys
+    if not _pick_lock.acquire(blocking=False):
+        raise HTTPException(409, "a file dialog is already open -- look behind "
+                                 "the browser window")
+    try:
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", _PICK_SCRIPT, _last_pick_dir["dir"]],
+                capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(408, "the file dialog was left open too long")
+        if out.returncode != 0:
+            raise HTTPException(500, "the file dialog could not open: "
+                                     + (out.stderr.strip()[-300:] or "no detail"))
+        lines = out.stdout.strip().splitlines()
+        chosen = json.loads(lines[-1]) if lines else ""
+    finally:
+        _pick_lock.release()
+
+    if not chosen:
+        return {"cancelled": True}
+    chosen = os.path.normpath(chosen)
+    if not os.path.isfile(chosen):
+        raise HTTPException(404, f"{chosen} is not a file")
+    _last_pick_dir["dir"] = os.path.dirname(chosen)
+    return _register_upload(chosen, lambda dest: shutil.copyfile(chosen, dest),
+                            chosen)
 
 
 @app.get("/api/files/{fid}/preview")
@@ -358,6 +453,7 @@ def api_run(req: RunReq):
            "error": None, "started": time.time(), "elapsed": None,
            "events": queue.Queue(), "saved": [],
            "fields": [], "field_summary": "", "filled": None,
+           "approved": {}, "layout": None,
            # Carried through so the fields workbook can say where the
            # document came from, and the document type so its columns come
            # out in the order that type declares them.
@@ -418,7 +514,7 @@ def _do_run(rid, upload, req):
             step(1, "active")
             t0 = time.time()
             if pages is not None:
-                text, annotated = _read_pages(pages, req, kind)
+                text, annotated, run["layout"] = _read_pages(pages, req, kind)
             else:
                 text, annotated = vision._run_one(kind, upload["path"],
                                                   req.prompt or "")
@@ -464,17 +560,18 @@ def _render_pdf_pages(upload, req):
         raise RuntimeError("that PDF rendered no pages")
     # The caller deletes out_dir once the pages have been read; they are only
     # the way in, and 45 of these folders had been left behind in Temp.
-    return [(n, p) for n, p, _ in rendered], out_dir
+    return [(n, p, info) for n, p, info in rendered], out_dir
 
 
 def _read_pages(pages, req, kind):
-    """Read already-rendered page images, joined with page markers."""
-    numbers = [n for n, _ in pages]
-    images = [p for _, p in pages]
+    """(text joined with page markers, None, layout) for rendered pages."""
+    numbers = [n for n, _, _ in pages]
+    images = [p for _, p, _ in pages]
 
+    layouts = [None] * len(images)
     if kind == "paddleocr_vl":
         # PaddleOCR-VL reads a whole batch in one worker call.
-        texts = vision._ocr_request_batch(images)
+        texts, layouts = vision.ocr_batch_with_layout(images)
     else:
         texts = [vision._run_one(kind, p, req.prompt or "")[0] for p in images]
 
@@ -483,7 +580,9 @@ def _read_pages(pages, req, kind):
     # page: one row of fields instead of twelve, and one sheet in the workbook.
     parts = [f"{save_output.page_marker('', n)}\n{body}"
              for n, body in zip(numbers, texts)]
-    return "\n\n".join(parts), None
+    layout = [review.page_layout(n, info, lay)
+              for (n, _, info), lay in zip(pages, layouts) if lay]
+    return "\n\n".join(parts), None, layout
 
 
 @app.get("/api/runs/{rid}/events")
@@ -769,6 +868,7 @@ def api_fields(rid: str, req: FieldsReq):
                 verdict = "check"
             where = r["evidence"].split("[")[-1].rstrip("]") if r["evidence"] else ""
             rows.append({"field": r["field"], "value": r["value"] or "",
+                         "label": r.get("matched_label") or "",
                          "verdict": verdict, "where": where,
                          "evidence": r["evidence"] or "",
                          "page": number, "page_label": label})
@@ -950,6 +1050,9 @@ def api_history_one(rid: str):
                 "fields": entry.get("fields") or [],
                 "field_summary": entry.get("field_summary", ""),
                 "filled": None,
+                "approved": entry.get("approved") or {},
+                "layout": run_history.load_layout(rid),
+                "source_path": entry.get("source_path", ""),
             }
     entry["annotated"] = (f"/api/runs/{rid}/annotated"
                           if entry.get("annotated") else None)
@@ -1023,6 +1126,7 @@ def api_export_fields(rid: str):
         raise HTTPException(404, "no such run")
     if not run.get("fields"):
         raise HTTPException(400, "pull the fields out first")
+    _require_approved(rid, run, "fields")
 
     order = _doc_type_fields(run.get("doc_type") or "")
 
@@ -1043,6 +1147,7 @@ def api_export_tables(rid: str):
         raise HTTPException(404, "no such run")
     if not (run.get("text") or "").strip():
         raise HTTPException(400, "that run produced nothing to export")
+    _require_approved(rid, run, "tables")
 
     name = _export_name(run, "tables")
     path = os.path.join(vision.OUTPUT_DIR, name)
@@ -1051,6 +1156,109 @@ def api_export_tables(rid: str):
     except Exception as e:
         raise HTTPException(500, f"export failed: {type(e).__name__}: {e}")
     return FileResponse(path, filename=name, media_type=XLSX_TYPE)
+
+
+# ------------------------------------------------------------------- review
+#
+# Nothing leaves this page unchecked. Every value is shown on the page it was
+# read from, the analyst ticks it, and only a fully ticked workbook can be
+# downloaded. A tick is pinned to the value it approved, so re-extracting a
+# different value takes the tick away rather than carrying it over.
+
+def _run_or_404(rid):
+    with _state_lock:
+        run = _runs.get(rid)
+    if not run:
+        raise HTTPException(404, "no such run -- reopen it from the list")
+    return run
+
+
+def _source_of(rid, run):
+    """The document this run read: the live upload, else the kept copy."""
+    with _state_lock:
+        entry = _uploads.get(run.get("upload") or "")
+    if entry and os.path.exists(entry["path"]):
+        return entry["path"]
+    return run_history._source_path(rid) or None
+
+
+def _review_of(rid, run):
+    return review.build(_source_of(rid, run), run.get("fields") or [],
+                        run.get("text") or "", run.get("layout"))
+
+
+def _require_approved(rid, run, what):
+    state = review.approval(_review_of(rid, run), run.get("approved"))[what]
+    if not state["complete"]:
+        left = state["need"] - state["done"]
+        raise HTTPException(409, f"{left} {what[:-1]}(s) still to approve -- "
+                                 f"check them against the page in Review first")
+
+
+@app.get("/api/runs/{rid}/review")
+def api_review(rid: str):
+    run = _run_or_404(rid)
+    data = _review_of(rid, run)
+    data["file"] = run.get("file", "")
+    data["source_path"] = run.get("source_path", "")
+    data["has_source"] = bool(data["pages"])
+    data["state"] = review.approval(data, run.get("approved"))
+    return data
+
+
+class ApproveReq(BaseModel):
+    keys: list = []
+    on: bool = True
+
+
+@app.post("/api/runs/{rid}/approve")
+def api_approve(rid: str, req: ApproveReq):
+    """Tick or untick values. The server pins each tick to the value as it
+    stands now; the page never says what it approved."""
+    run = _run_or_404(rid)
+    data = _review_of(rid, run)
+    approved = dict(run.get("approved") or {})
+    for key in req.keys or []:
+        key = str(key)
+        if not req.on:
+            approved.pop(key, None)
+            continue
+        pinned = review.fingerprint_of(data, key)
+        if pinned is not None:
+            approved[key] = pinned
+    run["approved"] = approved
+    run_history.record(run, MODEL_META.get(run.get("model") or "", {})
+                       .get("name", ""))
+    return review.approval(data, approved)
+
+
+@app.get("/api/runs/{rid}/page/{n}")
+def api_page_image(rid: str, n: int, dpi: int = 110):
+    run = _run_or_404(rid)
+    source = _source_of(rid, run)
+    if not source or not os.path.exists(source):
+        raise HTTPException(404, "the document this run read was not kept")
+    try:
+        img = review.render(source, n, dpi=max(50, min(dpi, 200)))
+    except (IndexError, ValueError):
+        raise HTTPException(404, "no such page")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/api/runs/{rid}/highlighted.pdf")
+def api_highlighted(rid: str):
+    run = _run_or_404(rid)
+    source = _source_of(rid, run)
+    if not source or not os.path.exists(source):
+        raise HTTPException(404, "the document this run read was not kept")
+    data = review.highlighted_pdf(source, _review_of(rid, run))
+    stem = os.path.splitext(os.path.basename(run.get("file") or "run"))[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "run"
+    return Response(data, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="{safe}_highlighted.pdf"'})
 
 
 
@@ -1090,7 +1298,15 @@ def _resolve_view(src):
         # kept beside the run record is the point of keeping it.
         kept = run_history._source_path(rid)
         if kept and os.path.exists(kept):
-            name = (run or {}).get("file", "") or os.path.basename(kept)
+            name = (run or {}).get("file", "")
+            if not name:
+                # run fell out of the live table, so its own history record
+                # has the name it was uploaded under -- falling back to the
+                # kept copy's own "<rid>.src.pdf" instead, as this used to,
+                # is how that meaningless name ended up downloaded,
+                # re-uploaded, and baked into a brand new run as its file.
+                recorded = run_history.load(rid, with_text=False)
+                name = (recorded or {}).get("file") or os.path.basename(kept)
             return kept, name
         raise HTTPException(404, "the document this run read was not kept; "
                                  "upload it again to see it")

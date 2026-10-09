@@ -11,7 +11,8 @@
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-const BASE = 'http://127.0.0.1:7885';
+// Standalone on 7885, or mounted in the chat server: APPRAISAL_BASE=http://127.0.0.1:7862/appraisals
+const BASE = (process.env.APPRAISAL_BASE || 'http://127.0.0.1:7885').replace(/\/$/, '');
 const failed = [];
 
 // Set when the server under test wants a password, which it does whenever it

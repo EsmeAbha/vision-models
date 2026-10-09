@@ -32,6 +32,21 @@ def _text_path(rid):
     return os.path.join(HISTORY_DIR, f"{rid}.txt")
 
 
+def _layout_path(rid):
+    return os.path.join(HISTORY_DIR, f"{rid}.layout.json")
+
+
+def load_layout(rid):
+    """Where the OCR found each block on each page, or None if not kept."""
+    if not _ID_OK.match(str(rid or "")):
+        return None
+    try:
+        with open(_layout_path(rid), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 def _source_path(rid, ext=""):
     """Where the document itself is kept, so it can be looked at later.
 
@@ -68,6 +83,9 @@ def record(run, model_name=""):
     entry = {
         "id": rid,
         "file": run.get("file", ""),
+        # Where the document sat on this PC when it was picked: what keeps a
+        # value traceable to its file after the upload itself is gone.
+        "source_path": run.get("source_path", ""),
         "model": run.get("model", ""),
         "model_name": model_name or run.get("model", ""),
         "at": run.get("at") or time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -88,10 +106,23 @@ def record(run, model_name=""):
     }
     # Keep the first timestamp across refreshes, so a run does not jump to
     # the top of the list every time its fields are pulled again.
-    existing = load(rid)
+    existing = load(rid, with_text=False)
     if existing:
         entry["at"] = existing.get("at", entry["at"])
         entry["seq"] = existing.get("seq", entry["seq"])
+        if not entry["source_path"]:
+            entry["source_path"] = existing.get("source_path", "")
+    # What the analyst signed off, each pinned to the value it signed off. A
+    # caller that never loaded the approvals (a thread save for a run not in
+    # memory) must not wipe them, so absent means keep.
+    if "approved" in run:
+        entry["approved"] = run.get("approved") or {}
+    else:
+        entry["approved"] = (existing or {}).get("approved") or {}
+
+    if run.get("layout"):
+        with open(_layout_path(rid), "w", encoding="utf-8") as fh:
+            json.dump(run["layout"], fh)
 
     # The transcript goes beside the record, not inside it, so listing runs
     # never reads it.
@@ -174,7 +205,8 @@ def summaries(limit=60):
 
 def forget(rid):
     gone = False
-    for path in (_path(rid), _text_path(rid), _source_path(rid) or _path(rid)):
+    for path in (_path(rid), _text_path(rid), _layout_path(rid),
+                 _source_path(rid) or _path(rid)):
         try:
             os.remove(path)
             gone = True

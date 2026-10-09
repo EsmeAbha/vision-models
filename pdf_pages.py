@@ -4,11 +4,17 @@ Used by both the CLI (`pdf_vllm_pages.py`) and the Gradio app so page
 handling (rotation, cropping, page selection) behaves identically in both.
 """
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
 import pypdfium2 as pdfium
 from PIL import Image
+
+# pdfium is not thread-safe: two pages rendered at once on different threads
+# crash the whole process with an access violation, not an exception. The web
+# server renders on a thread pool, so every pdfium call takes this first.
+LOCK = threading.RLock()
 
 
 def parse_pages(spec, total):
@@ -59,9 +65,10 @@ def render_page(page, dpi=300, rotate="auto", crop=True):
     sheet saved as rotated-portrait comes out sideways -- which makes the layout
     model file the whole table as a single 'image' block. Undo it here.
     """
-    page_rot = page.get_rotation()
-    rot = (360 - page_rot) % 360 if rotate == "auto" else int(rotate) % 360
-    img = page.render(scale=dpi / 72.0, rotation=rot).to_pil()
+    with LOCK:
+        page_rot = page.get_rotation()
+        rot = (360 - page_rot) % 360 if rotate == "auto" else int(rotate) % 360
+        img = page.render(scale=dpi / 72.0, rotation=rot).to_pil()
     full = (img.width, img.height)
     box = None
     if crop:
@@ -75,25 +82,42 @@ def render_pdf(pdf_path, out_dir, dpi=300, pages=None, rotate="auto", crop=True)
     """Render selected pages to PNG. Yields (page_no_1based, png_path, info)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    doc = pdfium.PdfDocument(str(pdf_path))
-    total = len(doc)
-    for pno in parse_pages(pages, total):
-        img, info = render_page(doc[pno], dpi=dpi, rotate=rotate, crop=crop)
-        png = out_dir / f"page_{pno + 1:03d}.png"
-        img.save(png)
-        info["total_pages"] = total
-        yield pno + 1, str(png), info
+    with LOCK:
+        doc = pdfium.PdfDocument(str(pdf_path))
+        total = len(doc)
+    try:
+        for pno in parse_pages(pages, total):
+            # Held per page, not across the yield: a caller that OCRs each
+            # page before asking for the next must not block every other
+            # render for that long.
+            with LOCK:
+                page = doc[pno]
+                try:
+                    img, info = render_page(page, dpi=dpi, rotate=rotate,
+                                            crop=crop)
+                finally:
+                    # Closed here, under the lock: left to the garbage
+                    # collector it is closed on whatever thread runs it.
+                    page.close()
+            png = out_dir / f"page_{pno + 1:03d}.png"
+            img.save(png)
+            info["total_pages"] = total
+            yield pno + 1, str(png), info
+    finally:
+        with LOCK:
+            doc.close()
 
 
 def page_count(pdf_path):
-    doc = pdfium.PdfDocument(str(pdf_path))
-    try:
-        return len(doc)
-    finally:
+    with LOCK:
+        doc = pdfium.PdfDocument(str(pdf_path))
         try:
-            doc.close()
-        except Exception:
-            pass
+            return len(doc)
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def win_to_wsl(path):

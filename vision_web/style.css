@@ -43,6 +43,7 @@
   --box-1: #F6A97B;
   --box-2: #4FB8A6;
   --box-3: #E9C23B;
+  --c: #F6A97B;           /* a review box's own colour, set inline per box */
 }
 
 :root {
@@ -994,53 +995,6 @@ svg { flex-shrink: 0; }
   white-space: nowrap;
 }
 
-.field-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-
-.field-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 7px 10px;
-  border: 1px solid var(--m-line-2);
-  border-radius: 8px;
-  background: var(--m-card);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.field-chip:hover { border-color: var(--accent); }
-
-.field-chip input { accent-color: var(--accent); margin: 0; cursor: pointer; }
-
-.field-chip:has(input:checked) {
-  border-color: var(--accent);
-  background: var(--m-card);
-  font-weight: 500;
-}
-
-.picker-extra { margin-top: 11px; }
-
-.picker-extra label {
-  display: block;
-  margin-bottom: 5px;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--m-dim);
-}
-
-/* A field added by hand. Same chip as the ticked ones so the two lists read
-   as one set, with a cross because this one is removable and those are not. */
-.field-chip.added {
-  cursor: default;
-  border-color: var(--accent);
-  font-weight: 500;
-  padding-right: 5px;
-}
-
 .chip-x {
   display: grid;
   place-items: center;
@@ -1057,23 +1011,125 @@ svg { flex-shrink: 0; }
 
 .chip-x:hover { background: var(--m-raise); color: var(--m-text); }
 
-.add-field-row { display: flex; gap: 7px; align-items: stretch; }
-.add-field-row input { flex: 1 1 auto; }
-.add-field-row .btn { flex: 0 0 auto; }
+/* What is selected, as small removable tags, then the button that opens the
+   full list. The list itself is a dropdown, so a type with seventeen fields
+   no longer fills the composer with seventeen boxes. */
+.picker { position: relative; }
 
-.picker-extra .field-grid { margin-bottom: 8px; }
+.picked {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
 
-.picker-extra input {
-  width: 100%;
+.picked-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 3px 3px 10px;
+  border: 1px solid var(--m-line-2);
+  border-radius: 999px;
+  background: var(--m-card);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--m-text-2);
+}
+.picked-tag.custom { border-style: dashed; }
+.picked-tag .chip-x { width: 20px; height: 20px; border-radius: 999px; }
+
+.picked-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px dashed var(--accent);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-ink);
+  cursor: pointer;
+}
+.picked-add:hover, .picked-add.on { background: var(--m-card); border-style: solid; }
+
+.field-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  max-height: min(440px, 60vh);
+  border: 1px solid var(--m-line-2);
+  border-radius: 12px;
+  background: var(--m-card);
+  box-shadow: 0 18px 50px rgba(20, 40, 60, .2);
+  overflow: hidden;
+}
+
+.field-menu input[type="text"] {
+  margin: 10px 10px 4px;
   padding: 9px 11px;
   border: 1px solid var(--m-line-2);
   border-radius: 8px;
   background: var(--m-card);
-  font-size: 12px;
+  font-size: 13px;
   outline: none;
 }
+.field-menu input[type="text"]:focus { border-color: var(--accent); }
 
-.picker-extra input:focus { border-color: var(--accent); }
+.field-menu-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 14px 8px;
+  font-size: 11px;
+  color: var(--m-dim);
+  border-bottom: 1px solid var(--m-line);
+}
+.field-menu-bar span { margin-right: auto; }
+
+.field-menu-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  align-content: start;
+}
+
+.field-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  font-size: 13px;
+  text-align: left;
+  color: var(--m-text-2);
+  cursor: pointer;
+}
+.field-option:hover { background: var(--m-raise); }
+.field-option.on { font-weight: 600; color: var(--m-text); }
+.field-option input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.field-option small { margin-left: auto; font-size: 10px; font-weight: 400; color: var(--m-faint); }
+.field-option.add { grid-column: 1 / -1; color: var(--accent-ink); font-weight: 600; }
+
+.field-menu-empty { grid-column: 1 / -1; padding: 12px; font-size: 12px; color: var(--m-dim); }
+
+.field-menu-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 10px;
+  border-top: 1px solid var(--m-line);
+  background: var(--m-raise);
+}
+.field-menu-foot .btn { min-height: 32px; }
 
 /* ---------------------------------------------------------- fields result */
 
@@ -1404,3 +1460,282 @@ table.fields td.where { color: var(--m-dim); font-size: 11px; white-space: nowra
   .viewer { position: fixed; inset: 0; width: auto !important; z-index: 40; }
   .viewer-grip { display: none; }
 }
+
+/* ------------------------------------------------------------ the review */
+/* Source on the left with every value boxed, values on the right with a
+   tick each. Fixed over everything else: checking is the whole job here. */
+
+body.reviewing { overflow: hidden; }
+
+.review {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  background: var(--m-bg);
+  color: var(--m-text);
+}
+
+.rv-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--m-line);
+  background: var(--m-card);
+}
+.rv-top .icon-btn { color: var(--m-dim); }
+.rv-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; margin-right: auto; }
+.rv-title b { font-size: 15px; }
+.rv-title span { font-size: 12px; color: var(--m-dim); overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; max-width: 36vw; }
+
+.rv-progress { display: flex; gap: 6px; }
+.rv-count {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--m-raise);
+  border: 1px solid var(--m-line-2);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-dim);
+}
+.rv-count.done { background: var(--mint); border-color: var(--mint); color: var(--on-accent); }
+
+.rv-zoom { display: flex; gap: 4px; }
+.rv-zoom .btn { min-width: 34px; justify-content: center; padding: 0; font-size: 15px; }
+
+.btn.disabled { opacity: .6; cursor: not-allowed; }
+.btn.disabled:hover { border-color: var(--m-line-2); }
+
+.rv-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 34%);
+}
+
+.rv-empty { margin: 32px; }
+
+.rv-pages {
+  overflow: auto;
+  background: var(--m-bg-2);
+  padding: 18px 22px 40px;
+}
+.rv-pages-inner { margin: 0 auto; max-width: none; }
+.rv-page { margin-bottom: 26px; }
+.rv-page-no {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--m-dim);
+  margin: 0 0 6px 2px;
+}
+.rv-sheet {
+  position: relative;
+  background: #fff;
+  box-shadow: 0 2px 14px rgba(20, 40, 60, .14);
+  border-radius: 3px;
+}
+.rv-sheet img { display: block; width: 100%; height: auto; user-select: none; }
+
+.rv-box {
+  position: absolute;
+  /* The content area is exactly the value; border and padding sit outside it
+     (4px a side), and the negative margin puts them there instead of shifting
+     the box right and down. */
+  box-sizing: content-box;
+  padding: 2px;
+  margin: -4px 0 0 -4px;
+  border: 2px solid var(--c);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--c) 16%, transparent);
+  cursor: pointer;
+}
+.rv-box:hover { background: color-mix(in srgb, var(--c) 28%, transparent); z-index: 3; }
+.rv-box.table {
+  border-width: 3px;
+  background: transparent;
+  z-index: 1;
+}
+.rv-box.table:hover { background: color-mix(in srgb, var(--c) 7%, transparent); }
+.rv-box.field { z-index: 2; }
+.rv-box.ok { border-style: dashed; background: color-mix(in srgb, var(--c) 8%, transparent); }
+.rv-box.rv-sel {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  z-index: 4;
+}
+.rv-pulse { animation: rv-pulse 1.1s ease-out 2; }
+@keyframes rv-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c) 70%, transparent); }
+  100% { box-shadow: 0 0 0 14px transparent; }
+}
+
+.rv-tags {
+  position: absolute;
+  left: -2px;
+  bottom: 100%;
+  display: flex;
+  gap: 2px;
+}
+.rv-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px 4px 0 0;
+  background: var(--c);
+  color: #fff;
+  font: 600 10px/1.5 var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rv-box.table > .rv-tag { position: absolute; left: -3px; bottom: 100%; }
+.rv-tag.rv-sel { box-shadow: 0 0 0 2px var(--accent); }
+
+.rv-side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--m-line);
+  background: var(--m-card);
+}
+.rv-tabs { display: flex; border-bottom: 1px solid var(--m-line); }
+.rv-tab {
+  flex: 1;
+  padding: 12px 10px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--m-dim);
+  cursor: pointer;
+}
+.rv-tab.on { color: var(--m-text); border-bottom-color: var(--accent); }
+
+.rv-hint {
+  padding: 9px 14px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--m-dim);
+  background: var(--m-raise);
+  border-bottom: 1px solid var(--m-line);
+}
+
+.rv-list { flex: 1; overflow: auto; padding-bottom: 30px; }
+.rv-group {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--m-bg);
+  border-bottom: 1px solid var(--m-line);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--m-dim);
+}
+.rv-group .link { text-transform: none; letter-spacing: 0; font-size: 12px; }
+
+.rv-row {
+  display: flex;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--m-line);
+  border-left: 3px solid transparent;
+  cursor: pointer;
+}
+.rv-row:hover { background: var(--m-raise); }
+.rv-row.ok { background: color-mix(in srgb, var(--mint) 35%, transparent); }
+.rv-row.rv-sel { border-left-color: var(--accent); background: #FFF4EC; }
+.rv-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  accent-color: #2B8A3E;
+  cursor: pointer;
+}
+.rv-row-body { min-width: 0; flex: 1; }
+.rv-row-head { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.rv-row-head small { color: var(--m-faint); font-size: 11px; margin-left: auto; }
+.rv-row-head .verdict { margin-left: auto; }
+.rv-dot { width: 10px; height: 10px; border-radius: 3px; flex: 0 0 auto; }
+.rv-val {
+  margin: 4px 0 2px;
+  font: 500 13px/1.45 var(--mono);
+  color: var(--m-text);
+  overflow-wrap: anywhere;
+}
+.rv-where { font-size: 11px; color: var(--m-faint); }
+.rv-table {
+  margin-top: 6px;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--m-line);
+  border-radius: 6px;
+}
+.rv-table table { border-collapse: collapse; font-size: 11px; width: max-content; min-width: 100%; }
+.rv-table td, .rv-table th { border: 1px solid var(--m-line-2); padding: 3px 7px; }
+.rv-missing {
+  padding: 8px 14px 10px 45px;
+  font-size: 11px;
+  color: var(--m-faint);
+  border-bottom: 1px solid var(--m-line);
+}
+
+@media (max-width: 900px) {
+  .rv-body { grid-template-columns: 1fr; grid-template-rows: 55% 45%; }
+  .rv-side { border-left: none; border-top: 1px solid var(--m-line); }
+  .rv-title span { max-width: 40vw; }
+}
+
+/* Links drawn as buttons (downloads) must not look like body links. */
+a.btn { text-decoration: none; }
+
+/* Where the attached document lives on this PC, under its chip. */
+.attached-path {
+  flex-basis: 100%;
+  padding: 0 4px;
+  font: 11px/1.4 var(--mono);
+  color: var(--m-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attached-path.missing { font-family: var(--sans); color: var(--accent-ink); }
+
+/* ----------------------------------------------------------- scrolling */
+/* The sidebar itself never scrolls: its header, the models and skills, and
+   the footer stay put, and only the run history moves, under its search. */
+.side { overflow: hidden; }
+.side-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -6px;
+  padding: 0 6px;
+}
+.side-scroll .find {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--s-bg);
+  padding-bottom: 10px;
+}
+
+/* One quiet scrollbar style everywhere, instead of the system's thick bar
+   with arrow buttons on every panel. */
+* { scrollbar-width: thin; scrollbar-color: rgba(31, 78, 107, .28) transparent; }
+.side * { scrollbar-color: rgba(251, 247, 239, .22) transparent; }
+
+/* The appraisal page, linked from the sidebar like a model or a skill. */
+a.pick.tool { text-decoration: none; color: inherit; flex-shrink: 0; }

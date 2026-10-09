@@ -436,6 +436,23 @@ def _as_paths(file_obj):
 
 def _ocr_request_batch(image_paths):
     """Recognise several pages in a single worker call (PaddleOCR-VL only)."""
+    return _ocr_batch_response(image_paths)["texts"]
+
+
+def ocr_batch_with_layout(image_paths):
+    """(texts, layouts): the text, plus where each block sat on its page.
+
+    A layout is {width, height, blocks: [{label, bbox, text}]} in the pixels
+    of the image sent, or None when the worker could not say.
+    """
+    resp = _ocr_batch_response(image_paths)
+    texts = resp["texts"]
+    layouts = list(resp.get("layouts") or [])
+    layouts += [None] * (len(texts) - len(layouts))
+    return texts, layouts[:len(texts)]
+
+
+def _ocr_batch_response(image_paths):
     proc = _state["ocr_proc"]
     if proc is None or proc.poll() is not None:
         raise RuntimeError("OCR worker process is not running")
@@ -452,7 +469,7 @@ def _ocr_request_batch(image_paths):
             resp = json.loads(line[len("###RESULT_JSON###"):])
             if not resp["ok"]:
                 raise RuntimeError(resp["error"])
-            return resp["texts"]
+            return resp
     tail = "\n".join(_state.get("stderr_tail") or [])[-2000:]
     raise RuntimeError(f"OCR worker exited unexpectedly.\n{tail}")
 

@@ -12,6 +12,7 @@ server -- including one a running Gradio page was using. Restart that page's
 model, or just run these when nothing else is mid-read.
 """
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -170,8 +171,8 @@ class VisionServerTests(unittest.TestCase):
         with patch.object(server.pdf_pages, "page_count", return_value=9), \
              patch.object(server.pdf_pages, "render_pdf", return_value=iter(rendered)) as rp, \
              patch.object(server.vision, "ensure_model"), \
-             patch.object(server.vision, "_ocr_request_batch",
-                          return_value=["two", "three"]) as batch:
+             patch.object(server.vision, "ocr_batch_with_layout",
+                          return_value=(["two", "three"], [None, None])) as batch:
             up = self.upload("scan.pdf", b"%PDF-1.4 fake")
             self.assertTrue(up["pdf"])
             self.assertEqual(up["pages"], 9)
@@ -436,3 +437,64 @@ class VisionServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PickFromPCTests(unittest.TestCase):
+    """The Windows file dialog path: the file comes in with where it lives.
+
+    The dialog itself is not opened -- subprocess.run is stubbed to answer as
+    the dialog would -- so these never put a window on anyone's screen.
+    """
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+        self.history = tempfile.mkdtemp(prefix="hist_")
+        self.addCleanup(shutil.rmtree, self.history, ignore_errors=True)
+        patcher = patch.object(server.run_history, "HISTORY_DIR", self.history)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # A real document in a real folder, as the dialog would hand it back.
+        self.folder = tempfile.mkdtemp(prefix="APR_")
+        self.addCleanup(shutil.rmtree, self.folder, ignore_errors=True)
+        self.doc = os.path.join(self.folder, "Courtyard bill.png")
+        with open(self.doc, "wb") as fh:
+            fh.write(PNG)
+
+    def answer(self, path, code=0):
+        import subprocess
+        return patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            [], code, stdout=json.dumps(path) + "\n", stderr=""))
+
+    def test_a_picked_file_keeps_its_full_path(self):
+        with self.answer(self.doc):
+            r = self.client.post("/api/pick")
+        self.assertEqual(r.status_code, 200, r.text)
+        up = r.json()
+        self.assertEqual(up["source_path"], os.path.normpath(self.doc))
+        self.assertEqual(up["name"], "Courtyard bill.png")
+
+        # ... and the run made from it remembers that path after a restart.
+        with patch.object(server.vision, "ensure_model"), \
+             patch.object(server.vision, "_run_one", return_value=("text", None)):
+            rid = self.client.post("/api/run", json={
+                "file_id": up["id"], "model": "paddleocr_vl"}).json()["id"]
+            self.assertEqual(wait_for(self.client, rid)["status"], "done")
+        server._runs.pop(rid, None)
+        again = self.client.get(f"/api/history/{rid}").json()
+        self.assertEqual(again["source_path"], os.path.normpath(self.doc))
+        self.assertEqual(server._runs[rid]["source_path"], os.path.normpath(self.doc))
+
+    def test_cancelling_the_dialog_attaches_nothing(self):
+        with self.answer(""):
+            r = self.client.post("/api/pick")
+        self.assertEqual(r.json(), {"cancelled": True})
+
+    def test_the_dialog_script_is_valid_python(self):
+        compile(server._PICK_SCRIPT, "<pick>", "exec")
+
+    def test_only_documents_are_taken(self):
+        other = os.path.join(self.folder, "notes.txt")
+        open(other, "w").close()
+        with self.answer(other):
+            r = self.client.post("/api/pick")
+        self.assertEqual(r.status_code, 400)

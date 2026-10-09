@@ -111,7 +111,13 @@ def _secure(request: Request):
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
+    # Mounted inside the chat server this page lives under /appraisals, and
+    # the full path no longer starts with /api -- which would wave every
+    # request past the password. Judge the path within this app instead.
     path = request.url.path
+    root = request.scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root):] or "/"
     # /api/session and /api/login are how a browser finds out it needs a
     # password and supplies one; gating them behind the password would leave
     # the page with no way to ask for it.
