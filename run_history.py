@@ -32,6 +32,13 @@ def _text_path(rid):
     return os.path.join(HISTORY_DIR, f"{rid}.txt")
 
 
+def _is_record(name):
+    """A run's own record, not the layout kept beside it. Both end in .json;
+    counting the layouts as records halved the cap and logged a "skipping"
+    line for every one on every listing."""
+    return name.endswith(".json") and not name.endswith(".layout.json")
+
+
 def _layout_path(rid):
     return os.path.join(HISTORY_DIR, f"{rid}.layout.json")
 
@@ -182,7 +189,7 @@ def summaries(limit=60):
     if not os.path.isdir(HISTORY_DIR):
         return out
     for name in os.listdir(HISTORY_DIR):
-        if not name.endswith(".json"):
+        if not _is_record(name):
             continue
         entry = load(name[:-5], with_text=False)
         if not entry:
@@ -223,7 +230,7 @@ def _trim(keep=KEEP):
     every single run.
     """
     try:
-        count = sum(1 for n in os.listdir(HISTORY_DIR) if n.endswith(".json"))
+        count = sum(1 for n in os.listdir(HISTORY_DIR) if _is_record(n))
     except OSError:
         return
     if count <= keep:

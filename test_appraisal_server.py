@@ -152,7 +152,10 @@ def main():
     print("\nthe page itself is served")
     html = get("/", raw=True).decode("utf-8")
     check("the shell is there", "<div id=\"app\"" in html, True)
-    check("it loads its script", "/assets/app.js" in html, True)
+    # Relative, so the same page works standalone and mounted under
+    # /appraisals/ in the chat server; an absolute /assets/ would load the
+    # chat page's own script there.
+    check("it loads its script", 'src="assets/app.js"' in html, True)
     check("the stylesheet is served",
           b"--accent" in get("/assets/style.css", raw=True), True)
 

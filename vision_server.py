@@ -27,11 +27,12 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import (FileResponse, HTMLResponse, RedirectResponse,
                                Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 # app.py owns the models. Importing it costs a torch import on startup and
 # gives us the worker lifecycle, the default prompts and the skills for free.
@@ -103,8 +104,14 @@ def _evict_uploads():
     """
     busy = {r.get("upload") for r in _runs.values()
             if r.get("status") == "running"}
+    now = time.time()
     for fid in list(_uploads)[:-MAX_UPLOADS or None]:
         if len(_uploads) <= MAX_UPLOADS or fid in busy:
+            continue
+        # A zip's files wait their turn to be read; a 53-file batch would
+        # otherwise evict its own first files before reaching them. Pinned
+        # until read, or for a few hours if the batch is abandoned.
+        if _uploads[fid].get("pinned_until", 0) > now:
             continue
         entry = _uploads.pop(fid)
         shutil.rmtree(entry.get("folder", ""), ignore_errors=True)
@@ -161,7 +168,8 @@ def sweep_temp(hours=STALE_HOURS):
         # annotated image, and nothing has ever deleted them. They are only
         # needed while the run that produced them is on screen, so the same
         # age cutoff applies.
-        if not name.startswith(("vision_up_", "vision_pdf_", "ocr_")):
+        if not name.startswith(("vision_up_", "vision_pdf_", "vision_zip_",
+                                "vision_part_", "ocr_")):
             continue
         path = os.path.join(root, name)
         try:
@@ -309,15 +317,190 @@ async def api_upload(file: UploadFile = File(...),
     are for whatever reads that next, and a made-up path would be worse there
     than an empty cell.
     """
+    name = os.path.basename(file.filename or "upload")
+    if name.lower().endswith(".zip"):
+        # Streamed to disk, not read into memory: an archive of appraisals is
+        # hundreds of megabytes. Unpacked on a worker thread, so the page and
+        # its progress streams keep answering while it happens.
+        tmp = Path(tempfile.mkdtemp(prefix="vision_zip_"))
+        try:
+            path = tmp / "upload.zip"
+            size = 0
+            with open(path, "wb") as out:
+                while True:
+                    chunk = await file.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > appraisal_server.MAX_ZIP:
+                        raise HTTPException(413, "that archive is over "
+                                            f"{appraisal_server.MAX_ZIP // 1024 ** 3} GB")
+                    out.write(chunk)
+            return await run_in_threadpool(_register_zip, path, name, source_path)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     data = await file.read()
-    return _register_upload(file.filename or "upload",
-                            lambda dest: dest.write_bytes(data), source_path)
+    return _register_upload(name, lambda dest: dest.write_bytes(data), source_path)
+
+
+# --------------------------------------------------------- uploads in pieces
+#
+# Opened from another computer, this page goes through a tunnel, and the
+# tunnel's relay refuses a request much over 12MB with a 413 -- measured: 11MB
+# through, 16MB refused, and even 8-12MB sometimes timing out with a 504. An
+# appraisal is ~11MB and a zip of them hundreds. So the page sends anything
+# large in small pieces, each retried on its own, and they are put back
+# together here. Locally the pieces cost nothing; through a tunnel they are
+# the only way a file of any real size arrives.
+
+_parts: dict = {}
+PART_MAX_AGE = 6 * 3600
+
+
+class PartStart(BaseModel):
+    name: str
+    size: int
+    source_path: str = ""
+
+
+@app.post("/api/upload/start")
+def api_upload_start(req: PartStart):
+    name = os.path.basename(req.name or "upload")
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in UPLOAD_EXT + (".zip",):
+        raise HTTPException(400, f"{ext or 'that'} is not an image, a PDF or a zip")
+    if req.size <= 0:
+        raise HTTPException(400, "that file is empty")
+    if req.size > appraisal_server.MAX_ZIP:
+        raise HTTPException(413, f"that file is over {appraisal_server.MAX_ZIP // 1024 ** 3} GB")
+    now = time.time()
+    with _state_lock:
+        for pid in [p for p, v in _parts.items() if now - v["at"] > PART_MAX_AGE]:
+            shutil.rmtree(_parts.pop(pid)["folder"], ignore_errors=True)
+    folder = Path(tempfile.mkdtemp(prefix="vision_part_"))
+    path = folder / "upload.bin"
+    with open(path, "wb") as fh:
+        fh.truncate(req.size)
+    pid = uuid.uuid4().hex
+    with _state_lock:
+        _parts[pid] = {"folder": str(folder), "path": str(path), "name": name,
+                       "size": req.size, "got": 0, "at": now,
+                       "source_path": req.source_path}
+    return {"id": pid}
+
+
+@app.put("/api/upload/{pid}/at/{offset}")
+async def api_upload_piece(pid: str, offset: int, request: Request):
+    """One piece, written where it belongs. Sending the same piece twice --
+    which a retry after a timeout does -- writes the same bytes twice, so it
+    is harmless."""
+    with _state_lock:
+        part = _parts.get(pid)
+    if not part:
+        raise HTTPException(404, "that upload is no longer held -- start again")
+    data = await request.body()
+    if offset < 0 or offset + len(data) > part["size"]:
+        raise HTTPException(400, "that piece does not fit the file")
+    with open(part["path"], "r+b") as fh:
+        fh.seek(offset)
+        fh.write(data)
+    part.setdefault("pieces", {})[offset] = len(data)
+    part["at"] = time.time()
+    return {"ok": True}
+
+
+def _whole(part):
+    """Did every byte arrive? The file was sized up front, so its length
+    proves nothing -- the pieces must tile it end to end, with no gap."""
+    at = 0
+    for offset, length in sorted((part.get("pieces") or {}).items()):
+        if offset > at:
+            return False
+        at = max(at, offset + length)
+    return at == part["size"]
+
+
+@app.post("/api/upload/{pid}/finish")
+async def api_upload_finish(pid: str):
+    with _state_lock:
+        part = _parts.pop(pid, None)
+    if not part:
+        raise HTTPException(404, "that upload is no longer held -- start again")
+    try:
+        if not _whole(part):
+            raise HTTPException(400, "the file did not arrive whole -- try again")
+        if part["name"].lower().endswith(".zip"):
+            return await run_in_threadpool(_register_zip, part["path"], part["name"],
+                                           part["source_path"])
+        return await run_in_threadpool(
+            _register_upload, part["name"],
+            lambda dest: shutil.move(part["path"], dest), part["source_path"])
+    finally:
+        shutil.rmtree(part["folder"], ignore_errors=True)
 
 
 UPLOAD_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf")
+MAX_ZIP_FILES = 500
+BATCH_PIN_SECONDS = 6 * 3600
 
 
-def _register_upload(filename, write, source_path=""):
+def _junk_member(name):
+    """Files a zip carries that are not documents: macOS forks, Office locks."""
+    base = os.path.basename(name)
+    return (name.startswith("__MACOSX/") or base.startswith("._")
+            or base.startswith("~$"))
+
+
+def _register_zip(zip_path, name, source_path=""):
+    """Hold every PDF and image inside a zip, each as an upload of its own.
+
+    Read straight out of the archive, one member at a time, so nothing is
+    unpacked to a shared folder: each document gets its own upload folder
+    like any other, and evicting one cannot take its neighbours with it.
+    The archive is checked first with the appraisal page's own guards --
+    member count, declared size, expansion ratio -- before a byte is written.
+
+    Each file's source path leads back through the zip:
+    C:\\...\\Appraisal.zip\\folder\\report.pdf when the zip's own location is
+    known, otherwise Appraisal.zip/folder/report.pdf.
+    """
+    import zipfile
+
+    appraisal_server._inspect_archive(zip_path)
+    batch = uuid.uuid4().hex
+    files, skipped = [], []
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [m for m in zf.infolist()
+                   if not m.is_dir() and not _junk_member(m.filename)
+                   and os.path.splitext(m.filename)[1].lower() in UPLOAD_EXT]
+        if not members:
+            raise HTTPException(400, "there is no PDF or image inside that zip")
+        if len(members) > MAX_ZIP_FILES:
+            raise HTTPException(413, f"that zip holds {len(members)} documents; "
+                                     f"the limit is {MAX_ZIP_FILES} at a time")
+        members.sort(key=lambda m: m.filename.lower())
+        for m in members:
+            inner = m.filename.replace("\\", "/")
+            where = (os.path.join(source_path, *inner.split("/")) if source_path
+                     else f"{name}/{inner}")
+            try:
+                entry = _register_upload(
+                    inner, lambda dest, m=m: dest.write_bytes(zf.read(m)), where,
+                    batch=batch)
+            except HTTPException as e:
+                skipped.append({"name": inner, "why": e.detail})
+                continue
+            entry["inner"] = inner
+            files.append(entry)
+    if not files:
+        raise HTTPException(400, "nothing in that zip could be read: "
+                                 + "; ".join(f"{s['name']}: {s['why']}" for s in skipped[:3]))
+    return {"batch": True, "id": batch, "name": name,
+            "source_path": source_path, "files": files, "skipped": skipped}
+
+
+def _register_upload(filename, write, source_path="", batch=None):
     """Hold one document for reading. `write(dest)` puts its bytes at dest."""
     name = os.path.basename(filename)
     ext = os.path.splitext(name)[1].lower()
@@ -342,6 +525,9 @@ def _register_upload(filename, write, source_path=""):
     entry = {"id": fid, "name": name, "path": str(path),
              "folder": str(folder), "pdf": is_pdf, "pages": pages,
              "source_path": source_path}
+    if batch:
+        entry["batch"] = batch
+        entry["pinned_until"] = time.time() + BATCH_PIN_SECONDS
     with _state_lock:
         _uploads[fid] = entry
         _evict_uploads()
@@ -368,7 +554,8 @@ root.update()
 path = filedialog.askopenfilename(
     parent=root, title="Choose a document to read",
     initialdir=sys.argv[1] or None,
-    filetypes=[("Images and PDFs", "*.pdf *.png *.jpg *.jpeg *.webp *.bmp"),
+    filetypes=[("PDFs, images and zips",
+                "*.pdf *.png *.jpg *.jpeg *.webp *.bmp *.zip"),
                ("All files", "*.*")])
 root.destroy()
 print(json.dumps(path or ""))
@@ -406,6 +593,9 @@ def api_pick():
     if not os.path.isfile(chosen):
         raise HTTPException(404, f"{chosen} is not a file")
     _last_pick_dir["dir"] = os.path.dirname(chosen)
+    if chosen.lower().endswith(".zip"):
+        # Read where it lies; each document's path then runs through the zip.
+        return _register_zip(chosen, os.path.basename(chosen), chosen)
     return _register_upload(chosen, lambda dest: shutil.copyfile(chosen, dest),
                             chosen)
 
@@ -483,13 +673,20 @@ def _do_run(rid, upload, req):
     kind = req.model
     names = MODEL_META[kind]["steps"]
 
-    def step(i, state, note=""):
-        entry = {"i": i, "name": names[i], "state": state, "note": note}
+    def step(i, state, note="", done=None, total=None):
+        # `since` is when this step went active, on the server's clock, so a
+        # page that reconnects mid-read still shows how long it has been.
+        prev = next((s for s in run["steps"] if s["i"] == i), None)
+        since = (prev or {}).get("since") if state == "active" else None
+        entry = {"i": i, "name": names[i], "state": state, "note": note,
+                 "since": since or (time.time() if state == "active" else None),
+                 "done": done, "total": total}
         run["steps"] = [s for s in run["steps"] if s["i"] != i] + [entry]
         run["steps"].sort(key=lambda s: s["i"])
         run["events"].put({"type": "step", **entry})
 
     page_dir = None
+    locked = False
     try:
         # Rasterise the PDF BEFORE the model loads, and outside the lock since
         # it needs no GPU. Loading paddle pushes system commit to its ceiling
@@ -498,6 +695,8 @@ def _do_run(rid, upload, req):
         # MemoryError while Windows is still growing a lazily-sized page file.
         # Rendering first keeps that allocation out of the spike, which is the
         # difference between the first run working and needing a retry.
+        if upload["pdf"]:
+            step(0, "active", "preparing the pages")
         pages, page_dir = (_render_pdf_pages(upload, req) if upload["pdf"]
                            else (None, None))
 
@@ -506,24 +705,54 @@ def _do_run(rid, upload, req):
         # if the Gradio page is also serving, the two can still collide over
         # vLLM and VRAM. Run one front end or the other (see the note in
         # __main__), not both.
-        with vision._lock:
-            step(0, "active")
-            vision.ensure_model(kind)
-            step(0, "done")
+        # Every wait gets said out loud: a step sitting silent for a minute is
+        # indistinguishable from a crash.
+        if not vision._lock.acquire(blocking=False):
+            step(0, "active", "waiting for the GPU: another read is running")
+            vision._lock.acquire()
+        locked = True
 
-            step(1, "active")
-            t0 = time.time()
-            if pages is not None:
-                text, annotated, run["layout"] = _read_pages(pages, req, kind)
-            else:
-                text, annotated = vision._run_one(kind, upload["path"],
-                                                  req.prompt or "")
-            step(1, "done", f"{time.time() - t0:.1f}s, {len(text or '')} chars")
+        # Warm only if the worker is up AND, for a reader served from WSL, its
+        # vLLM server is too -- otherwise ensure_model is about to restart it,
+        # which takes a minute, and saying "already loaded" would be a lie.
+        in_wsl = vision.OCR_WORKERS[kind].get("wsl")
+        server_up = not in_wsl or vision._vllm_up()
+        warm = vision._state.get("kind") == kind and server_up
+        # Measured: a cold start (vLLM in WSL plus the layout model) took 178s
+        # for a read that then took 13s. Say so, so three minutes of waiting
+        # reads as expected rather than as a hang.
+        if warm:
+            note = "model already loaded"
+        elif not server_up:
+            note = "starting the OCR engine; after a restart or idle this takes about 3 minutes"
+        else:
+            note = "loading the model; about a minute"
+        step(0, "active", note)
+        vision.ensure_model(kind)
+        step(0, "done")
 
-            step(2, "active")
-            run["text"] = text or ""
-            run["annotated"] = annotated
-            step(2, "done")
+        n = len(pages) if pages is not None else 1
+        step(1, "active", f"page 0 of {n}", 0, n)
+        t0 = time.time()
+
+        def on_page(done, total):
+            step(1, "active", f"page {done} of {total}", done, total)
+
+        if pages is not None:
+            text, annotated, run["layout"] = _read_pages(pages, req, kind,
+                                                         on_page)
+        else:
+            text, annotated = vision._run_one(kind, upload["path"],
+                                              req.prompt or "")
+        step(1, "done", f"{n} page{'' if n == 1 else 's'}, "
+                        f"{time.time() - t0:.1f}s, {len(text or '')} chars")
+
+        step(2, "active")
+        run["text"] = text or ""
+        run["annotated"] = annotated
+        step(2, "done")
+        vision._lock.release()
+        locked = False
 
         run["status"] = "done"
         run["elapsed"] = time.time() - run["started"]
@@ -536,6 +765,10 @@ def _do_run(rid, upload, req):
         traceback.print_exc()
         run["events"].put({"type": "error", "error": run["error"]})
     finally:
+        # Read now, so it no longer needs to outlive the upload cap.
+        upload.pop("pinned_until", None)
+        if locked:
+            vision._lock.release()
         if page_dir:
             shutil.rmtree(page_dir, ignore_errors=True)
         run["events"].put({"type": "end"})
@@ -563,17 +796,39 @@ def _render_pdf_pages(upload, req):
     return [(n, p, info) for n, p, info in rendered], out_dir
 
 
-def _read_pages(pages, req, kind):
-    """(text joined with page markers, None, layout) for rendered pages."""
+PAGES_PER_CALL = int(os.environ.get("VISION_PAGES_PER_CALL", "8"))
+
+
+def _read_pages(pages, req, kind, on_page=None):
+    """(text joined with page markers, None, layout) for rendered pages.
+
+    `on_page(done, total)` is told as each page finishes.
+    """
     numbers = [n for n, _, _ in pages]
     images = [p for _, p, _ in pages]
+    on_page = on_page or (lambda done, total: None)
 
     layouts = [None] * len(images)
     if kind == "paddleocr_vl":
-        # PaddleOCR-VL reads a whole batch in one worker call.
-        texts, layouts = vision.ocr_batch_with_layout(images)
+        # A few pages per worker call, not the whole document. One call for a
+        # 167-page appraisal held every 300dpi page in memory at once and died
+        # with "Unable to allocate 3.05 MiB" in the vlm worker -- the machine
+        # had 1.8GB of commit left. Eight at a time keeps memory the size of
+        # eight pages however long the document is, and the batch is still
+        # big enough for the vLLM server to read its blocks together.
+        texts, layouts = [], []
+        total = len(images)
+        for start in range(0, total, PAGES_PER_CALL):
+            chunk = images[start:start + PAGES_PER_CALL]
+            t, lay = vision.ocr_batch_with_layout(
+                chunk, progress=lambda done, _n, s=start: on_page(s + done, total))
+            texts += t
+            layouts += lay
     else:
-        texts = [vision._run_one(kind, p, req.prompt or "")[0] for p in images]
+        texts = []
+        for p in images:
+            texts.append(vision._run_one(kind, p, req.prompt or "")[0])
+            on_page(len(texts), len(images))
 
     # save_output.page_marker is the canonical form. Writing our own meant
     # split_pages did not recognise it, so a twelve page PDF came back as one

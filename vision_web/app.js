@@ -1124,14 +1124,180 @@ async function extractFields(msg, wanted, extra) {
 async function attach(file) {
   if (!file) return;
   try {
-    const body = new FormData();
-    body.append('file', file, file.name || 'pasted.png');
-    S.file = await api('/api/upload', { method: 'POST', body });
+    let r;
+    if (file.size > SMALL_UPLOAD) {
+      r = await uploadInPieces(file);
+    } else {
+      const body = new FormData();
+      body.append('file', file, file.name || 'pasted.png');
+      r = await api('/api/upload', { method: 'POST', body });
+    }
+    if (!r) return;              // stopped part way; Resume is on screen
+    if (r.batch) { startBatch(r); return; }
+    S.file = r;
     S.menu = null;
     render();
   } catch (e) {
+    S.uploading = null;
+    render();
     toast(`Could not attach that: ${e.message}`);
   }
+}
+
+/* Large files go up in pieces. From another computer this page is reached
+ * through a tunnel whose relay refuses any request much over 12MB (a 413),
+ * and whose throughput from there was measured at ~35KB/s with requests
+ * that sometimes never complete at all. So: small pieces, a few in flight at
+ * once (a slow, high-latency link moves more that way), a time limit on
+ * each so a stuck one is cancelled and sent again rather than waited on
+ * forever, and a Resume that carries on from the pieces that already
+ * arrived if it gives up anyway. */
+const SMALL_UPLOAD = 4 * 1024 * 1024;   // below this, one ordinary request
+const PIECE = 1024 * 1024;
+const IN_FLIGHT = 3;
+const PIECE_TRIES = 6;
+const PIECE_TIMEOUT_MS = 120000;        // 1MB at ~10KB/s, the worst seen
+
+async function sendPiece(pid, at, blob) {
+  for (let tries = 1; ; tries += 1) {
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), PIECE_TIMEOUT_MS);
+    try {
+      const r = await fetch(`/api/upload/${pid}/at/${at}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' },
+        body: blob, signal: stop.signal,
+      });
+      if (r.ok) return;
+      let detail = `the connection answered ${r.status}`;
+      try { detail = (await r.json()).detail || detail; } catch (e) { /* keep */ }
+      // The app refusing the piece will not change on a second try.
+      if (r.status === 400 || r.status === 404) throw Object.assign(new Error(detail), { fatal: true });
+      throw new Error(detail);
+    } catch (raw) {
+      // "Failed to fetch" and "AbortError" say nothing to a person.
+      const e = raw.fatal ? raw : new Error(
+        raw.name === 'AbortError' ? 'a piece timed out in the connection'
+          : /fetch|network/i.test(raw.message) ? 'the connection dropped'
+            : raw.message);
+      if (e.fatal || tries >= PIECE_TRIES) throw e;
+      if (S.uploading) {
+        S.uploading.retrying = `retrying a piece (try ${tries + 1} of ${PIECE_TRIES})`;
+        updateUploadBar();
+      }
+      await new Promise((ok) => setTimeout(ok, Math.min(1500 * tries, 8000)));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function uploadInPieces(file, resume) {
+  let pid = resume && resume.pid;
+  if (!pid) {
+    const start = await api('/api/upload/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: file.name, size: file.size }),
+    });
+    pid = start.id;
+  }
+  const done = new Set(resume ? resume.done : []);
+  const todo = [];
+  for (let at = 0; at < file.size; at += PIECE) if (!done.has(at)) todo.push(at);
+  const sentBefore = [...done].reduce((n, at) => n + Math.min(PIECE, file.size - at), 0);
+  S.uploading = { name: file.name, sent: sentBefore, size: file.size,
+                  began: Date.now(), sentAtStart: sentBefore, retrying: '' };
+  S.uploadResume = null;
+  render();
+
+  let failure = null;
+  const worker = async () => {
+    while (todo.length && !failure) {
+      const at = todo.shift();
+      try {
+        await sendPiece(pid, at, file.slice(at, Math.min(at + PIECE, file.size)));
+      } catch (e) {
+        failure = failure || e;
+        todo.unshift(at);
+        return;
+      }
+      done.add(at);
+      S.uploading.sent += Math.min(PIECE, file.size - at);
+      S.uploading.retrying = '';
+      updateUploadBar();
+    }
+  };
+  await Promise.all(Array.from({ length: IN_FLIGHT }, worker));
+
+  if (failure) {
+    // Keep what arrived: the server holds the pieces for hours, so Resume
+    // sends only the missing ones. A piece the app itself refused (the
+    // upload expired, say) cannot be resumed, so that one starts over.
+    S.uploading = null;
+    S.uploadResume = failure.fatal ? null
+      : { file, pid, done: [...done], error: failure.message };
+    render();
+    if (failure.fatal) throw failure;
+    toast(`The upload stopped at ${Math.floor(100 * sentOf(done, file.size) / file.size)}%: `
+          + `${failure.message}. Press Resume to carry on from there.`);
+    return null;
+  }
+
+  S.uploading.finishing = true;
+  render();
+  try {
+    return await api(`/api/upload/${pid}/finish`, { method: 'POST' });
+  } finally {
+    S.uploading = null;
+  }
+}
+
+function sentOf(done, size) {
+  return [...done].reduce((n, at) => n + Math.min(PIECE, size - at), 0);
+}
+
+async function resumeUpload() {
+  const r = S.uploadResume;
+  if (!r) return;
+  try {
+    const out = await uploadInPieces(r.file, r);
+    if (!out) return;
+    if (out.batch) { startBatch(out); return; }
+    S.file = out;
+    render();
+  } catch (e) {
+    S.uploading = null;
+    S.uploadResume = null;
+    render();
+    toast(`Could not attach that: ${e.message}`);
+  }
+}
+
+/* What the bar says: how far, how fast, and whether a piece is being sent
+ * again -- a slow upload and a dead one must not look the same. */
+function uploadStatus(u) {
+  const mb = (n) => (n / 1048576).toFixed(n < 10 * 1048576 ? 1 : 0);
+  const secs = (Date.now() - u.began) / 1000;
+  const rate = secs > 3 ? (u.sent - u.sentAtStart) / secs : 0;
+  let text = `${Math.floor((100 * u.sent) / u.size)}% · ${mb(u.sent)} of ${mb(u.size)} MB`;
+  if (rate > 0) {
+    text += ` · ${(rate / 1024).toFixed(0)} KB/s`;
+    const left = (u.size - u.sent) / rate;
+    if (left > 5) text += ` · about ${left < 90 ? `${Math.ceil(left)}s` : `${Math.ceil(left / 60)} min`} left`;
+  }
+  if (u.retrying) text += ` · ${u.retrying}`;
+  return text;
+}
+
+/* Moved in place, piece by piece: a full render per piece would rebuild the
+ * page hundreds of times for one zip. */
+function updateUploadBar() {
+  const u = S.uploading;
+  const fill = document.querySelector('.uploading .step-bar span');
+  const pct = document.querySelector('.uploading .uploading-pct');
+  if (!u || !fill) { render(); return; }
+  fill.style.width = `${Math.floor((100 * u.sent) / u.size)}%`;
+  if (pct) pct.textContent = uploadStatus(u);
 }
 
 function detach() {
@@ -1154,6 +1320,7 @@ function newRun() {
 function canSend() {
   if (S.busy) return false;
   if (S.file) return true;
+  if (S.batch && !S.batch.running && batchLeft().length) return true;
   const ta = el('prompt-box');
   const typed = ta ? ta.value : (S.prompt || '');
   return typed.trim().length > 0;
@@ -1228,6 +1395,7 @@ async function ask() {
 
 async function run() {
   if (S.busy) return;
+  if (S.batch && !S.batch.running && batchLeft().length) return runBatch();
   if (!S.file) {
     // No document: this is a plain question. The OCR models cannot answer
     // one, so it goes to the local text model instead of being refused.
@@ -1262,6 +1430,9 @@ async function run() {
                             extra: S.extras.join(', ') } : null,
     fieldRows: null, fieldSummary: '', fieldsBusy: false, fieldError: null,
   };
+  // Settles once the read AND its field search are both over, which is what
+  // a batch waits on before starting the next document.
+  msg.settled = new Promise((resolve) => { msg._settle = resolve; });
   S.msgs.push(msg);
   S.busy = true;
   render();
@@ -1282,7 +1453,8 @@ async function run() {
     msg.error = e.message;
     S.busy = false;
     render();
-    return;
+    msg._settle(msg);
+    return msg.settled;
   }
 
   msg.runId = started.id;
@@ -1292,37 +1464,86 @@ async function run() {
   render();
 
   const es = new EventSource(`/api/runs/${started.id}/events`);
+  let lastEvent = Date.now();
   es.onmessage = (ev) => {
+    lastEvent = Date.now();
     const d = JSON.parse(ev.data);
     if (d.type === 'step') {
       const s = msg.steps.find((x) => x.i === d.i);
-      if (s) { s.state = d.state; s.note = d.note || ''; }
+      if (s) {
+        Object.assign(s, { state: d.state, note: d.note || '', since: d.since,
+                           done: d.done, total: d.total });
+      }
       render();
     } else if (d.type === 'error') {
       msg.status = 'error';
       msg.error = d.error;
       es.close();
       finish(msg);
+      msg._settle(msg);
     } else if (d.type === 'done') {
       es.close();
       loadResult(msg);
     }
   };
-  es.onerror = () => {
-    es.close();
-    // The stream can drop before the run ends; the result endpoint is the
-    // authority either way, so ask it rather than reporting a failure here.
-    loadResult(msg);
+  // A dropped stream is not a finished run. Through the tunnel the stream is
+  // cut off or held back, and treating its end as the end used to ask for
+  // the result mid-read, get "running", and stop following the run for
+  // good: the card froze and the fields were never searched for. The poll
+  // below follows the run to its real end whatever the stream does.
+  es.onerror = () => { es.close(); };
+  const poll = async () => {
+    if (msg._settled) return;
+    try {
+      const r = await api(`/api/runs/${started.id}`);
+      if (r.status !== 'running') {
+        es.close();
+        await loadResult(msg, r);
+        return;
+      }
+      // The stream has gone quiet (held back, or closed): show the server's
+      // own record of the steps so progress keeps moving on screen.
+      if (Date.now() - lastEvent > 4000 && r.steps && r.steps.length) {
+        msg.steps = r.steps;
+        render();
+      }
+    } catch (e) {
+      if (/no such run/.test(e.message)) {
+        msg.status = 'error';
+        msg.error = 'The server restarted during this read. Read the document again.';
+        finish(msg);
+        msg._settle(msg);
+        return;
+      }
+      // Anything else is the connection hiccuping: try again next tick.
+    }
+    setTimeout(poll, 2500);
   };
+  setTimeout(poll, 2500);
+  return msg.settled;
 }
 
-async function loadResult(msg) {
-  // Both the `done` event and a dropped stream land here; whichever arrives
-  // first is the one that counts.
-  if (msg._settled) return;
+async function loadResult(msg, known) {
+  // The `done` event and the poll can both land here; whichever arrives
+  // first is the one that counts. `known` is a state the poll already has,
+  // so a large transcript is not fetched twice through a slow tunnel.
+  if (msg._settled || msg._loading) return;
+  msg._loading = true;
+  let r = known;
+  try {
+    if (!r) r = await api(`/api/runs/${msg.runId}`);
+  } catch (e) {
+    // A hiccup on the way: the poll asks again, rather than calling a run
+    // that may well have finished a failure.
+    msg._loading = false;
+    return;
+  }
+  if (r.status === 'running') {
+    msg._loading = false;     // not over yet; the poll keeps following it
+    return;
+  }
   msg._settled = true;
   try {
-    const r = await api(`/api/runs/${msg.runId}`);
     msg.status = r.status;
     msg.text = r.text || '';
     msg.annotated = r.annotated;
@@ -1344,13 +1565,185 @@ async function loadResult(msg) {
   }
   // Fields were asked for, so search the transcript now the read is done.
   if (msg.status === 'done' && msg.want) {
-    extractFields(msg, msg.want.fields, msg.want.extra);
+    await extractFields(msg, msg.want.fields, msg.want.extra);
   }
+  if (msg._settle) msg._settle(msg);
 }
 
 function finish(msg) {
   S.busy = false;
   render();
+}
+
+/* ------------------------------------------------------------ a zip, read
+ *
+ * A zip is every document inside it, read one after another -- each its own
+ * run, with its own fields, review and row in the history, exactly as if it
+ * had been attached by itself. One at a time on purpose: there is one GPU,
+ * and a run that starts while another is reading only waits for it anyway.
+ */
+
+/* What a zip upload hands back, as the state the batch panel draws. */
+function startBatch(r) {
+  S.batch = {
+    name: r.name, sourcePath: r.source_path || '', skipped: r.skipped || [],
+    items: r.files.map((f) => ({ file: f, status: 'queued', runId: null,
+                                 msg: null, error: null, found: null })),
+    running: false, stop: false, open: true,
+  };
+  S.file = null;
+  S.menu = null;
+  render();
+  const n = r.files.length;
+  toast(`${r.name}: ${n} document${n === 1 ? '' : 's'} ready to read`
+        + (r.skipped && r.skipped.length ? `, ${r.skipped.length} skipped` : ''));
+}
+
+const batchLeft = () => (S.batch ? S.batch.items.filter(
+  (i) => i.status === 'queued' || i.status === 'failed') : []);
+
+async function runBatch() {
+  const b = S.batch;
+  if (!b || b.running) return;
+  b.running = true;
+  b.stop = false;
+  render();
+  for (const it of b.items) {
+    if (b.stop) break;
+    if (it.status === 'done') continue;
+    S.file = it.file;
+    it.status = 'reading';
+    it.error = null;
+    const msg = await run();
+    if (!msg) { it.status = 'failed'; it.error = 'it did not start'; continue; }
+    it.msg = msg;
+    it.runId = msg.runId;
+    it.status = msg.status === 'done' ? 'done' : 'failed';
+    it.error = msg.error;
+    it.found = (msg.fieldRows || []).filter((r) => r.value).length;
+    render();
+  }
+  b.running = false;
+  S.file = null;
+  render();
+  const done = b.items.filter((i) => i.status === 'done').length;
+  toast(b.stop ? `Stopped after ${done} of ${b.items.length}.`
+               : `${b.name}: read ${done} of ${b.items.length}.`);
+}
+
+function batchPanel() {
+  const b = S.batch;
+  const n = b.items.length;
+  const done = b.items.filter((i) => i.status === 'done').length;
+  const failed = b.items.filter((i) => i.status === 'failed').length;
+  const current = b.items.find((i) => i.status === 'reading');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'batch';
+
+  const head = document.createElement('div');
+  head.className = 'batch-head';
+  const title = document.createElement('div');
+  title.className = 'batch-title';
+  title.innerHTML = '<b></b><small></small>';
+  title.querySelector('b').textContent = b.name;
+  title.querySelector('small').textContent = b.sourcePath || 'path not recorded';
+  head.append(title);
+
+  const count = document.createElement('span');
+  count.className = 'batch-count';
+  count.textContent = `${done} of ${n} read` + (failed ? ` · ${failed} failed` : '');
+  head.append(count);
+
+  const btn = (label, cls, fn) => {
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = `btn ${cls}`;
+    x.textContent = label;
+    x.onclick = fn;
+    head.append(x);
+  };
+  if (b.running) {
+    btn(b.stop ? 'Stopping after this one...' : 'Stop after this one', '',
+        () => { b.stop = true; render(); });
+  } else {
+    const left = batchLeft().length;
+    if (left) {
+      btn(done || failed ? `Read the remaining ${left}` : `Read all ${left}`,
+          'primary', runBatch);
+    }
+    btn('Clear', '', () => { S.batch = null; render(); });
+  }
+  const fold = document.createElement('button');
+  fold.type = 'button';
+  fold.className = `icon-btn batch-fold${b.open ? ' open' : ''}`;
+  fold.setAttribute('aria-label', b.open ? 'Hide the list' : 'Show the list');
+  fold.setAttribute('aria-expanded', String(b.open));
+  fold.innerHTML = svg('chev', 16);
+  fold.onclick = () => { b.open = !b.open; render(); };
+  head.append(fold);
+  wrap.append(head);
+
+  const bar = document.createElement('div');
+  bar.className = 'step-bar batch-bar';
+  const fill = document.createElement('span');
+  fill.style.width = `${Math.round(100 * (done + failed) / n)}%`;
+  bar.append(fill);
+  wrap.append(bar);
+
+  if (current) {
+    // The document being read right now, with its own step and clock, so the
+    // batch never sits silent between one finished file and the next.
+    const live = S.msgs.find((m) => m.role === 'run' && m.status === 'running');
+    const step = live && live.steps.find((s) => s.state === 'active');
+    const now = document.createElement('div');
+    now.className = 'batch-now';
+    now.append(`Reading ${current.file.name}`);
+    if (step && step.note) now.append(` · ${step.note}`);
+    if (step && step.since) { now.append(' '); now.append(clock(step.since)); }
+    wrap.append(now);
+  }
+
+  if (b.open) {
+    const list = document.createElement('div');
+    list.className = 'batch-list';
+    b.items.forEach((it) => {
+      const row = document.createElement('div');
+      row.className = `batch-row ${it.status}`;
+      const pill = document.createElement('span');
+      pill.className = `batch-pill ${it.status}`;
+      pill.textContent = { queued: 'waiting', reading: 'reading', done: 'done',
+                           failed: 'failed' }[it.status];
+      const name = document.createElement('span');
+      name.className = 'batch-name';
+      name.textContent = it.file.inner || it.file.name;
+      name.title = it.file.source_path || it.file.name;
+      const meta = document.createElement('small');
+      meta.textContent = it.status === 'failed' ? (it.error || '')
+        : it.status === 'done' && it.found !== null ? `${it.found} value(s) found`
+        : it.file.pages ? `${it.file.pages} page${it.file.pages === 1 ? '' : 's'}` : '';
+      row.append(pill, name, meta);
+      if (it.runId && it.status === 'done') {
+        const open = document.createElement('button');
+        open.type = 'button';
+        open.className = 'link';
+        open.textContent = S.openRun === it.runId ? 'Showing' : 'Open';
+        open.disabled = S.openRun === it.runId;
+        open.onclick = () => reopen(it.runId);
+        row.append(open);
+      }
+      list.append(row);
+    });
+    if (b.skipped.length) {
+      const sk = document.createElement('div');
+      sk.className = 'batch-skipped';
+      sk.textContent = 'Not read: '
+        + b.skipped.map((x) => `${x.name} (${x.why})`).join('; ');
+      list.append(sk);
+    }
+    wrap.append(list);
+  }
+  return wrap;
 }
 
 /* ------------------------------------------------------- getting an image */
@@ -1365,7 +1758,8 @@ async function pickFromPC() {
   toast('Choose the file in the Windows dialog. It may open behind this window.');
   try {
     const r = await api('/api/pick', { method: 'POST' });
-    if (!r.cancelled) S.file = r;
+    if (r.batch) startBatch(r);
+    else if (!r.cancelled) S.file = r;
   } catch (e) {
     toast(`The file dialog did not open (${e.message}). Using the browser picker instead; the path will not be recorded.`);
     chooseFile();
@@ -1377,7 +1771,7 @@ async function pickFromPC() {
 function chooseFile() {
   const inp = document.createElement('input');
   inp.type = 'file';
-  inp.accept = '.png,.jpg,.jpeg,.webp,.bmp,.pdf';
+  inp.accept = '.png,.jpg,.jpeg,.webp,.bmp,.pdf,.zip';
   inp.onchange = () => attach(inp.files[0]);
   inp.click();
   S.menu = null;
@@ -1789,6 +2183,32 @@ function safeHtml(raw) {
   return host;
 }
 
+/* A running clock since `since` (seconds, the server's clock -- the same
+ * machine). The tick below updates these in place, once a second, without
+ * re-rendering the page. */
+function clock(since) {
+  const c = document.createElement('b');
+  c.className = 'step-clock';
+  c.dataset.since = String(since);
+  c.textContent = elapsedText(since);
+  return c;
+}
+
+function elapsedText(since) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - since));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+}
+
+const ticker = setInterval(() => {
+  const app = el('app');
+  if (!app || !app.querySelectorAll) return;
+  app.querySelectorAll('.step-clock').forEach((c) => {
+    c.textContent = elapsedText(Number(c.dataset.since));
+  });
+}, 1000);
+// Node (the headless test) would otherwise stay alive for this forever.
+if (ticker && ticker.unref) ticker.unref();
+
 function runMsg(m) {
   const d = document.createElement('div');
   d.className = 'msg';
@@ -1804,7 +2224,10 @@ function runMsg(m) {
   head.querySelector('strong').textContent = m.modelName;
   const sub = head.querySelector('small');
   if (m.status === 'running') {
-    sub.textContent = `reading ${m.file}…`;
+    sub.textContent = `reading ${m.file}… `;
+    // The whole read's clock, ticking: proof it is still going.
+    const first = (m.steps.find((s) => s.since) || {}).since;
+    if (first) sub.append(clock(first));
   } else {
     const open = document.createElement('button');
     open.type = 'button';
@@ -1830,7 +2253,23 @@ function runMsg(m) {
         em.textContent = s.note;
         row.append(em);
       }
+      if (s.state === 'active' && s.since && m.status === 'running') {
+        row.append(clock(s.since));
+      }
       steps.append(row);
+      // Pages as they finish, as a bar under the step that reads them.
+      if (s.state === 'active' && s.total > 1) {
+        const bar = document.createElement('div');
+        bar.className = 'step-bar';
+        bar.setAttribute('role', 'progressbar');
+        bar.setAttribute('aria-valuemin', '0');
+        bar.setAttribute('aria-valuemax', String(s.total));
+        bar.setAttribute('aria-valuenow', String(s.done || 0));
+        const fill = document.createElement('span');
+        fill.style.width = `${Math.round(100 * (s.done || 0) / s.total)}%`;
+        bar.append(fill);
+        steps.append(bar);
+      }
     });
     card.append(steps);
   }
@@ -1967,7 +2406,57 @@ function composer() {
     if (e.dataTransfer.files[0]) attach(e.dataTransfer.files[0]);
   };
 
-  if (S.file) {
+  if (S.uploading) {
+    const u = S.uploading;
+    const up = document.createElement('div');
+    up.className = 'attached uploading';
+    const line = document.createElement('div');
+    line.className = 'uploading-line';
+    const nm = document.createElement('span');
+    nm.textContent = u.finishing ? `Unpacking ${u.name}...` : `Uploading ${u.name}`;
+    const pct = document.createElement('span');
+    pct.className = 'uploading-pct';
+    pct.textContent = u.finishing ? '' : uploadStatus(u);
+    line.append(nm, pct);
+    const bar = document.createElement('div');
+    bar.className = 'step-bar';
+    const fill = document.createElement('span');
+    fill.style.width = `${u.finishing ? 100 : Math.floor((100 * u.sent) / u.size)}%`;
+    bar.append(fill);
+    up.append(line, bar);
+    box.append(up);
+  }
+
+  if (S.uploadResume && !S.uploading) {
+    const r = S.uploadResume;
+    const stopped = document.createElement('div');
+    stopped.className = 'attached uploading stopped';
+    const line = document.createElement('div');
+    line.className = 'uploading-line';
+    const msgEl = document.createElement('span');
+    const pctDone = Math.floor((100 * sentOf(new Set(r.done), r.file.size)) / r.file.size);
+    msgEl.textContent = `${r.file.name} stopped at ${pctDone}% (${r.error}).`;
+    const acts = document.createElement('span');
+    acts.className = 'uploading-acts';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'btn primary';
+    go.textContent = 'Resume';
+    go.onclick = resumeUpload;
+    const drop = document.createElement('button');
+    drop.type = 'button';
+    drop.className = 'btn';
+    drop.textContent = 'Cancel';
+    drop.onclick = () => { S.uploadResume = null; render(); };
+    acts.append(go, drop);
+    line.append(msgEl, acts);
+    stopped.append(line);
+    box.append(stopped);
+  }
+
+  // During a batch the panel above names the file being read; a second,
+  // ever-changing chip here would only repeat it.
+  if (S.file && !(S.batch && S.batch.running)) {
     const row = document.createElement('div');
     row.className = 'attached';
     const chip = document.createElement('span');
@@ -2572,6 +3061,7 @@ function render() {
   badge.innerHTML = '<span class="dot"></span><span>Local GPU</span>';
   top.append(badge);
   main.append(top);
+  if (S.batch) main.append(batchPanel());
 
   const thread = document.createElement('div');
   thread.className = 'thread';

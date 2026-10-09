@@ -77,9 +77,14 @@ def run_many_with_layout(image_paths, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     texts, layouts = [], []
+    total = len(image_paths)
     for res in _PIPELINE.predict(list(image_paths)):
         texts.append(_text_of(res, out_dir))
         layouts.append(_layout_of(res))
+        # One line per finished page, so the page can say "page 3 of 12"
+        # instead of sitting on "reading" for minutes looking crashed.
+        print("###PROGRESS###" + json.dumps({"done": len(texts), "total": total}),
+              flush=True)
     # Guard against the pipeline returning a different count than we sent.
     while len(texts) < len(image_paths):
         texts.append("")

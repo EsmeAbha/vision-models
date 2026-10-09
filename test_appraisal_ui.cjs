@@ -22,7 +22,10 @@ let cookie = '';
 function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (cookie) headers.Cookie = cookie;
-  return fetch(BASE + path, { ...opts, headers });
+  // The page asks for 'api/spec' relative to itself, as a browser would at
+  // BASE/; the checks here ask for '/api/...' under BASE. Both mean BASE/api.
+  const url = path.startsWith('/') ? BASE + path : `${BASE}/${path}`;
+  return fetch(url, { ...opts, headers });
 }
 
 async function signIn() {

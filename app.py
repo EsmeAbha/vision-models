@@ -217,7 +217,16 @@ def stop_vllm(log=print):
     log(f"vLLM stopped, VRAM {before}MB -> {gpu_used_mb()}MB")
 
 
-atexit.register(stop_vllm)
+def _stop_vllm_at_exit():
+    # Only the process that started the server stops it on the way out.
+    # Registering stop_vllm itself meant anything that merely imported this
+    # module -- every test of the chat server does -- pkill'ed the shared
+    # vLLM when it exited, out from under a read running in the real server.
+    if _state.get("vllm_proc") is not None:
+        stop_vllm()
+
+
+atexit.register(_stop_vllm_at_exit)
 
 
 def _stop_ocr_worker():
@@ -439,20 +448,21 @@ def _ocr_request_batch(image_paths):
     return _ocr_batch_response(image_paths)["texts"]
 
 
-def ocr_batch_with_layout(image_paths):
+def ocr_batch_with_layout(image_paths, progress=None):
     """(texts, layouts): the text, plus where each block sat on its page.
 
     A layout is {width, height, blocks: [{label, bbox, text}]} in the pixels
-    of the image sent, or None when the worker could not say.
+    of the image sent, or None when the worker could not say. `progress`, if
+    given, is called with (pages done, pages in total) as each page finishes.
     """
-    resp = _ocr_batch_response(image_paths)
+    resp = _ocr_batch_response(image_paths, progress)
     texts = resp["texts"]
     layouts = list(resp.get("layouts") or [])
     layouts += [None] * (len(texts) - len(layouts))
     return texts, layouts[:len(texts)]
 
 
-def _ocr_batch_response(image_paths):
+def _ocr_batch_response(image_paths, progress=None):
     proc = _state["ocr_proc"]
     if proc is None or proc.poll() is not None:
         raise RuntimeError("OCR worker process is not running")
@@ -465,6 +475,14 @@ def _ocr_batch_response(image_paths):
     proc.stdin.flush()
     for line in proc.stdout:
         line = line.strip()
+        if line.startswith("###PROGRESS###"):
+            if progress:
+                try:
+                    p = json.loads(line[len("###PROGRESS###"):])
+                    progress(p["done"], p["total"])
+                except Exception:
+                    pass    # a progress line is a courtesy; never fail on one
+            continue
         if line.startswith("###RESULT_JSON###"):
             resp = json.loads(line[len("###RESULT_JSON###"):])
             if not resp["ok"]:

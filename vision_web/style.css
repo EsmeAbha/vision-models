@@ -1739,3 +1739,111 @@ a.btn { text-decoration: none; }
 
 /* The appraisal page, linked from the sidebar like a model or a skill. */
 a.pick.tool { text-decoration: none; color: inherit; flex-shrink: 0; }
+
+/* ------------------------------------------------------- live progress */
+/* A read can take minutes. The active step pulses, its clock ticks every
+   second, and the pages read so far fill a bar -- so a long read never looks
+   the same as a crashed one. */
+.step.active i { animation: step-pulse 1.4s ease-in-out infinite; }
+@keyframes step-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(246, 169, 123, .55); }
+  50%      { box-shadow: 0 0 0 5px rgba(246, 169, 123, 0); }
+}
+.step-clock {
+  min-width: 52px;
+  text-align: right;
+  font: 500 11px/1 var(--mono);
+  color: var(--accent-ink);
+}
+.step em + .step-clock { margin-left: 10px; }
+.step span + .step-clock { margin-left: auto; }
+.card-title .step-clock { min-width: 0; margin-left: 4px; }
+.step-bar {
+  height: 6px;
+  margin: 2px 0 8px 24px;
+  border-radius: 999px;
+  background: var(--m-raise);
+  overflow: hidden;
+}
+.step-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width .4s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .step.active i { animation: none; }
+}
+
+/* ------------------------------------------------------------ zip batch */
+/* Every document in a zip, read one after another. Pinned above the thread
+   so the overall progress stays in view whichever run is open below. */
+.batch {
+  margin: 10px 24px 0;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--m-line-2);
+  border-radius: 12px;
+  background: var(--m-card);
+  box-shadow: 0 4px 18px rgba(20, 40, 60, .06);
+}
+.batch-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.batch-title { display: flex; flex-direction: column; min-width: 0; margin-right: auto; }
+.batch-title b { font-size: 13px; }
+.batch-title small {
+  font: 11px/1.4 var(--mono);
+  color: var(--m-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46vw;
+}
+.batch-count { font-size: 12px; font-weight: 600; color: var(--m-text-2); }
+.batch-head .btn { min-height: 30px; }
+.batch-fold svg { transition: transform .15s; }
+.batch-fold.open svg { transform: rotate(90deg); }
+.batch-bar { margin: 10px 0 6px; }
+.batch-now { font-size: 12px; color: var(--m-text-2); display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.batch-now .step-clock { min-width: 0; }
+.batch-list {
+  margin-top: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  border-top: 1px solid var(--m-line);
+}
+.batch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--m-line);
+  font-size: 12px;
+}
+.batch-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-row small { color: var(--m-faint); font-size: 11px; white-space: nowrap; }
+.batch-row .link:disabled { color: var(--m-faint); text-decoration: none; cursor: default; }
+.batch-pill {
+  flex: 0 0 auto;
+  min-width: 58px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  text-align: center;
+  background: var(--m-raise);
+  color: var(--m-dim);
+}
+.batch-pill.reading { background: var(--accent); color: var(--on-accent); }
+.batch-pill.done { background: var(--mint); color: var(--on-accent); }
+.batch-pill.failed { background: #F6D6CF; color: var(--danger); }
+.batch-skipped { padding: 8px 2px; font-size: 11px; color: var(--accent-ink); }
+
+/* A large file going up in pieces, with how far it has got. */
+.attached.uploading { display: block; padding: 4px 6px 10px; }
+.uploading-line { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--m-text-2); }
+.uploading-pct { font: 500 11px var(--mono); color: var(--accent-ink); }
+.attached.uploading .step-bar { margin: 6px 0 0; }
+.uploading-line { align-items: center; }
+.uploading.stopped .uploading-line span:first-child { color: var(--accent-ink); }
+.uploading-acts { display: flex; gap: 6px; flex: 0 0 auto; }
+.uploading-acts .btn { min-height: 30px; }
