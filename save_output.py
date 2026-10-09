@@ -17,9 +17,13 @@ KNOWN_EXTS = {".pdf", ".md", ".markdown", ".html", ".htm", ".xlsx", ".xls",
 # A batch run covers several PDFs, so a page marker carries the file it came
 # from as well as the page number. The plain `page N` form is still accepted so
 # older single-file output keeps working.
+# The equals signs are optional. page_marker() writes them, but the chat
+# page's PDF path has always written a plain "<!-- page 3 -->", and requiring
+# them meant split_pages saw a twelve page transcript as one page: one row of
+# fields instead of twelve, and one sheet in the workbook instead of twelve.
 PAGE_RE = re.compile(
-    r"<!--\s*=+\s*(?:file:\s*(?P<file>[^|]*?)\s*\|\s*)?"
-    r"page\s+(?P<page>\d+)\s*=+\s*-->",
+    r"<!--\s*=*\s*(?:file:\s*(?P<file>[^|]*?)\s*\|\s*)?"
+    r"page\s+(?P<page>\d+)\s*=*\s*-->",
     re.I,
 )
 

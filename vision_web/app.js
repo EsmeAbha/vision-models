@@ -169,6 +169,15 @@ function clearDocType() {
   render();
 }
 
+/* Field names are PEXL's own snake_case keys -- kept as-is everywhere they
+ * are matched or exported, since that is what another tool's API reads. This
+ * is only for what gets printed on screen: "total_gas_bill" -> "Total gas
+ * bill". */
+function fieldLabel(name) {
+  const s = String(name).replace(/_/g, ' ').trim();
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
 function toggleField(name) {
   S.chosen = S.chosen.includes(name)
     ? S.chosen.filter((f) => f !== name)
@@ -1649,7 +1658,7 @@ function fieldPicker() {
       cb.checked = S.chosen.includes(name);
       cb.onchange = () => toggleField(name);
       const span = document.createElement('span');
-      span.textContent = name;
+      span.textContent = fieldLabel(name);
       label.append(cb, span);
       grid.append(label);
     });
@@ -1810,7 +1819,7 @@ function fieldsTable(m) {
   m.fieldRows.forEach((r) => {
     const tr = document.createElement('tr');
     const f = document.createElement('td');
-    f.textContent = r.field;
+    f.textContent = fieldLabel(r.field);
     const v = document.createElement('td');
     v.className = 'val';
     v.textContent = r.value || '-';
@@ -1888,7 +1897,7 @@ function fieldsTable(m) {
     const skipped = m.filled.skipped.length;
     line.textContent = `${m.filled.written.length} cell(s) written`
       + (skipped ? `, ${skipped} left blank: `
-          + m.filled.skipped.map((s) => `${s.field} (${s.why})`).join(', ')
+          + m.filled.skipped.map((s) => `${fieldLabel(s.field)} (${s.why})`).join(', ')
         : '.');
     const a = document.createElement('a');
     a.className = 'btn primary';

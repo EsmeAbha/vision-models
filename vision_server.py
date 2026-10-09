@@ -474,7 +474,11 @@ def _read_pages(pages, req, kind):
     else:
         texts = [vision._run_one(kind, p, req.prompt or "")[0] for p in images]
 
-    parts = [f"<!-- page {n} -->\n{body}" for n, body in zip(numbers, texts)]
+    # save_output.page_marker is the canonical form. Writing our own meant
+    # split_pages did not recognise it, so a twelve page PDF came back as one
+    # page: one row of fields instead of twelve, and one sheet in the workbook.
+    parts = [f"{save_output.page_marker('', n)}\n{body}"
+             for n, body in zip(numbers, texts)]
     return "\n\n".join(parts), None
 
 
@@ -740,24 +744,34 @@ def api_fields(rid: str, req: FieldsReq):
     if not wanted:
         raise HTTPException(400, "choose at least one field")
 
-    rows, missing, odd = [], 0, 0
-    for r in field_search.find_fields(run["text"], wanted):
-        if not r["found"]:
-            missing += 1
-            verdict = "none"
-        elif r.get("guessed"):
-            verdict = "guess"
-        elif r["shape_ok"]:
-            verdict = "yes"
-        else:
-            odd += 1
-            verdict = "check"
-        where = r["evidence"].split("[")[-1].rstrip("]") if r["evidence"] else ""
-        rows.append({"field": r["field"], "value": r["value"] or "",
-                     "verdict": verdict, "where": where,
-                     "evidence": r["evidence"] or ""})
+    # One page at a time, because one document is not one record. Twelve
+    # monthly bills in a twelve page PDF are twelve bills, and searching the
+    # whole transcript at once returns the first match for every field -- one
+    # row, every value from page 1, the other eleven silently gone.
+    pages = save_output.split_pages(run["text"]) or [("page 1", run["text"])]
 
-    parts = [f"{len(rows) - missing} of {len(rows)} found."]
+    rows, missing, odd = [], 0, 0
+    for number, (label, content) in enumerate(pages, 1):
+        for r in field_search.find_fields(content, wanted):
+            if not r["found"]:
+                missing += 1
+                verdict = "none"
+            elif r.get("guessed"):
+                verdict = "guess"
+            elif r["shape_ok"]:
+                verdict = "yes"
+            else:
+                odd += 1
+                verdict = "check"
+            where = r["evidence"].split("[")[-1].rstrip("]") if r["evidence"] else ""
+            rows.append({"field": r["field"], "value": r["value"] or "",
+                         "verdict": verdict, "where": where,
+                         "evidence": r["evidence"] or "",
+                         "page": number, "page_label": label})
+
+    found_count = len(rows) - missing
+    parts = [f"{found_count} of {len(rows)} found"
+             + (f" across {len(pages)} pages." if len(pages) > 1 else ".")]
     if missing:
         parts.append(f"{missing} label(s) not printed on the page.")
     if odd:
