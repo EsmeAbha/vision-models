@@ -4,7 +4,6 @@ import html
 import json
 import itertools
 import collections
-import shlex
 import time
 import atexit
 import shutil
@@ -27,11 +26,17 @@ import field_search
 import pdf_pages
 import save_output
 
-# PaddleOCR-VL cannot run on Windows here: Application Control blocks
-# libpaddle's DLL. It runs in WSL instead, against the vLLM server that also
-# lives there, so its worker is launched through wsl.exe and every path handed
-# to it is translated to /mnt/<drive>/... form.
-WSL_PADDLE_PYTHON = "/home/esme_abha/ocr/.venv-paddle/bin/python"
+# The two halves of PaddleOCR-VL live on different sides of the WSL boundary.
+# Recognition is the vLLM server, which runs in WSL because that is where it
+# works. Layout detection is paddle, and it runs on WINDOWS, in its own
+# virtualenv, holding its own slice of the card -- a paddle pipeline inside
+# WSL takes the distro down and the vLLM server with it. So the worker is a
+# Windows process talking to a WSL server, and its paths are Windows paths.
+#
+# This note used to say the opposite: that paddle could not run on Windows at
+# all because Application Control blocks libpaddle's DLL. It is wrong, and
+# believing it cost a day -- pdf2text.py --ocr had been reading pages on
+# Windows with the GPU the whole time.
 WSL_VLLM_START = "/home/esme_abha/ocr/start_server.sh"
 VLLM_URL = "http://localhost:8000/v1"
 # Desktop apps (Chrome/Teams/explorer) sit around 4.5GB; anything much above
@@ -47,27 +52,30 @@ OCR_WORKERS = {
             "--serve",
         ],
         "wsl": False,
+        "paths_in_wsl": False,
     },
     "paddleocr_vl": {
-        # CUDA_VISIBLE_DEVICES='' keeps paddle off the card, and it has to.
-        # vLLM already holds a CUDA context there with pinned memory (WSL2
-        # needs that for UVA, and the server will not start without it).
-        # Paddle opening a SECOND context for PP-DocLayoutV3 takes the whole
-        # WSL session down: the worker dies with no traceback and no
-        # faulthandler dump, vLLM dies in the same instant, and the only
-        # symptom upstream is "OCR worker exited unexpectedly".
+        # Runs on WINDOWS, with the GPU, exactly as pdf2text.py --ocr does --
+        # which is the configuration proved to read a page end to end.
         #
-        # So layout detection runs on CPU. Recognition was always the vLLM
-        # server's job, so only the layout pass pays for it; output is
-        # byte-identical either way.
+        # Two things this depends on, both learned the hard way:
+        #
+        #  * Paddle needs VRAM of its own. PP-DocLayoutV3 is a GPU model, and
+        #    vLLM must leave room for it: at --gpu-memory-utilization 0.62 the
+        #    card has ~4GB left after the desktop and paddle dies with
+        #    "fatal : Memory allocation failure". At 0.40 it has ~8.5GB and
+        #    the same page reads fine.
+        #  * It must NOT run inside WSL. A paddle pipeline there takes the
+        #    whole distro down -- with the GPU or forced to CPU, either way --
+        #    which kills the vLLM server in the same instant and leaves no
+        #    traceback anywhere.
         "cmd": [
-            "wsl.exe", "-e", "bash", "-lc",
-            "CUDA_VISIBLE_DEVICES='' " + shlex.quote(WSL_PADDLE_PYTHON)
-            + " -u " + shlex.quote(
-                pdf_pages.win_to_wsl(os.path.join(_here, "paddleocr_worker.py")))
-            + " --serve",
+            os.path.join(_here, ".venv-paddleocr", "Scripts", "python.exe"),
+            os.path.join(_here, "paddleocr_worker.py"),
+            "--serve",
         ],
-        "wsl": True,
+        "wsl": True,            # still needs the server in WSL
+        "paths_in_wsl": False,  # but its own paths are Windows paths
     },
 }
 
@@ -104,16 +112,66 @@ def start_vllm(log=print):
         log("vLLM server already running")
         return
     log("starting vLLM server in WSL (first start loads the model, ~40s)...")
-    _state["vllm_proc"] = subprocess.Popen(
+    # Both streams used to go to DEVNULL. When the server died on startup --
+    # which it does the moment --gpu-memory-utilization leaves too little for
+    # the encoder, with a plain CUDA OOM -- nothing upstream could say why,
+    # and a crash in the first second looked exactly like a slow load. The
+    # page showed a spinner for two minutes and then "did not come up".
+    proc = subprocess.Popen(
         ["wsl.exe", "-e", "bash", "-lc", WSL_VLLM_START],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, errors="replace",
     )
-    for i in range(120):
+    _state["vllm_proc"] = proc
+    tail = collections.deque(maxlen=300)
+    _state["vllm_tail"] = tail
+
+    def _drain(stream, sink):
+        try:
+            for line in stream:
+                sink.append(line.rstrip("\n"))
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain, args=(proc.stdout, tail), daemon=True).start()
+
+    for _ in range(120):
         if _vllm_up():
             log("vLLM server ready")
             return
+        if proc.poll() is not None:
+            # It is gone; waiting out the rest of the two minutes tells
+            # nobody anything.
+            raise RuntimeError("the vLLM server stopped while starting.\n"
+                               + _vllm_reason(tail))
         time.sleep(1)
-    raise RuntimeError("vLLM server did not come up within 120s")
+    raise RuntimeError("vLLM server did not come up within 120s.\n"
+                       + _vllm_reason(tail))
+
+
+def _vllm_reason(tail):
+    """The lines worth reading out of a long startup log.
+
+    vLLM prints hundreds of INFO lines and a handful that matter. Picking the
+    ones that name a cause beats printing the last twenty, which are usually
+    a traceback's inner frames rather than what went wrong.
+    """
+    lines = list(tail)
+    if not lines:
+        return "It printed nothing at all."
+    # The last lines, always. Selecting only lines that match a keyword list
+    # kept hiding the actual exception, because the thing that finally goes
+    # wrong is often the one line that says none of those words -- and it is
+    # always at the end.
+    out = ["The last thing it printed:"]
+    out += ["  " + l[:300] for l in lines[-12:]]
+    wanted = ("out of memory", "oom", "no such file", "address already in use",
+              "permission denied", "killed", "jsondecodeerror")
+    hits = [l for l in lines if any(w in l.lower() for w in wanted)]
+    if hits:
+        out.append("Lines that name a cause:")
+        out += ["  " + l[:300] for l in hits[-4:]]
+    return "\n".join(out)
 
 
 def gpu_used_mb():
@@ -221,8 +279,32 @@ def load_ocr_worker(kind):
     spec = OCR_WORKERS[kind]
     if spec["wsl"]:
         start_vllm()
+    # The worker runs its OWN interpreter, from a different virtualenv to the
+    # one this process is in. Handing it this environment makes it load that
+    # venv's packages against the system Python's standard library -- numpy
+    # out of .venv-paddleocr, re out of AppData\Programs\Python -- and it dies
+    # part-way through an import with no usable message. Clearing the three
+    # variables that point an interpreter at a venv is enough; everything else
+    # (PATH, TEMP, the proxy settings) it still wants.
+    env = dict(os.environ)
+    for leaked in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"):
+        env.pop(leaked, None)
+    # This process points OpenSSL at combined_cacert.pem for the intercepting
+    # proxy on this network. That path is a WINDOWS path, and a worker running
+    # inside WSL cannot use it: OpenSSL given a path it cannot read takes the
+    # process down during PaddleOCRVL construction, with no traceback and no
+    # faulthandler dump, and the WSL distro goes with it -- which kills the
+    # vLLM server in the same instant and surfaces as "OCR worker exited
+    # unexpectedly". Measured: the pipeline builds in 6s without these two
+    # variables and is dead in 2s with them.
+    if spec.get("paths_in_wsl"):
+        for windows_only in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+            env.pop(windows_only, None)
+    env.update(spec.get("env") or {})
+
     proc = subprocess.Popen(
         spec["cmd"],
+        env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -235,12 +317,31 @@ def load_ocr_worker(kind):
     # and the whole request hung. Drain it continuously into a ring buffer.
     tail = collections.deque(maxlen=400)
 
+    # And to a file as well. The in-memory tail comes back empty on every
+    # failing run -- the worker dies before the reader thread is scheduled, or
+    # the pipe closes with the buffer unread -- which leaves nothing at all to
+    # diagnose from. A file keeps whatever it managed to say.
+    log_path = os.path.join(tempfile.gettempdir(), "ocr_worker_stderr.log")
+    try:
+        log_file = open(log_path, "w", encoding="utf-8", errors="replace")
+    except OSError:
+        log_file = None
+
     def _drain(stream, sink):
         try:
             for line in stream:
                 sink.append(line.rstrip("\n"))
+                if log_file:
+                    log_file.write(line)
+                    log_file.flush()
         except Exception:
             pass
+        finally:
+            if log_file:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
 
     threading.Thread(target=_drain, args=(proc.stderr, tail), daemon=True).start()
     _state.update(kind=kind, ocr_proc=proc, stderr_tail=tail)
@@ -287,7 +388,7 @@ def _ocr_request(image_path, prompt, warmup=False):
         raise RuntimeError("OCR worker process is not running")
     out_dir = tempfile.mkdtemp(prefix="ocr_")
     send_img, send_out = image_path, out_dir
-    if OCR_WORKERS[_state["kind"]]["wsl"]:
+    if OCR_WORKERS[_state["kind"]].get("paths_in_wsl"):
         send_img = pdf_pages.win_to_wsl(image_path)
         send_out = pdf_pages.win_to_wsl(out_dir)
     req = json.dumps({"image_path": send_img, "prompt": prompt, "out_dir": send_out})
@@ -340,7 +441,7 @@ def _ocr_request_batch(image_paths):
         raise RuntimeError("OCR worker process is not running")
     out_dir = tempfile.mkdtemp(prefix="ocr_")
     paths, send_out = list(image_paths), out_dir
-    if OCR_WORKERS[_state["kind"]]["wsl"]:
+    if OCR_WORKERS[_state["kind"]].get("paths_in_wsl"):
         paths = [pdf_pages.win_to_wsl(p) for p in paths]
         send_out = pdf_pages.win_to_wsl(out_dir)
     proc.stdin.write(json.dumps({"image_paths": paths, "out_dir": send_out}) + "\n")

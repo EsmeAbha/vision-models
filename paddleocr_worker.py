@@ -3,8 +3,19 @@ import sys
 import json
 
 _here = os.path.dirname(os.path.abspath(__file__))
+
+# The bundle is for Windows, where an intercepting proxy means the system
+# store is not enough. It must NOT be used when this runs inside WSL off the
+# Windows filesystem: pointing OpenSSL at /mnt/c/.../combined_cacert.pem kills
+# the process during PaddleOCRVL construction -- no traceback, no faulthandler
+# dump, and it takes the whole WSL distro down with it, so the vLLM server
+# dies in the same instant and the only symptom upstream is "OCR worker exited
+# unexpectedly".
+#
+# Measured both ways against the same running server: without these variables
+# the pipeline builds in 6s; with them it is dead in 2s.
 _cert_bundle = os.path.join(_here, "combined_cacert.pem")
-if os.path.exists(_cert_bundle):
+if os.path.exists(_cert_bundle) and not _here.replace("\\", "/").startswith("/mnt/"):
     os.environ.setdefault("SSL_CERT_FILE", _cert_bundle)
     os.environ.setdefault("REQUESTS_CA_BUNDLE", _cert_bundle)
 
