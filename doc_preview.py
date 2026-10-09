@@ -39,10 +39,14 @@ pre { white-space: pre-wrap; word-break: break-word; font: 12px/1.5
       "Cascadia Code", Consolas, ui-monospace, monospace;
       background: #fff; border: 1px solid #E6E6DC; border-radius: 10px;
       padding: 14px; }
+/* width:max-content stops the browser squeezing twenty columns into the
+   panel: without it every heading wrapped to one character per line, which
+   is unreadable. The .scroll wrapper scrolls instead. */
 table { border-collapse: collapse; font-size: 12px; background: #fff;
-        margin-bottom: 8px; }
+        margin-bottom: 8px; width: max-content; max-width: none; }
 td, th { border: 1px solid #DEDFD4; padding: 4px 8px; vertical-align: top;
-         max-width: 380px; overflow-wrap: anywhere; }
+         min-width: 90px; max-width: 320px; overflow-wrap: break-word; }
+thead th { white-space: nowrap; }
 thead th { background: #E8EEF4; position: sticky; top: 0; font-weight: 650; }
 tbody tr:nth-child(even) td { background: #FAFAF6; }
 .scroll { overflow-x: auto; }

@@ -362,6 +362,10 @@ def api_run(req: RunReq):
            # document came from, and the document type so its columns come
            # out in the order that type declares them.
            "source_path": upload.get("source_path", ""),
+           # The file on disk, so run_history can keep a copy and the side
+           # panel still works after this upload is evicted or the server
+           # restarts.
+           "source_file": upload.get("path", ""),
            "upload": req.file_id,
            "doc_type": req.doc_type or ""}
     global _last_used
@@ -1074,16 +1078,22 @@ def _resolve_view(src):
         return entry["path"], entry["name"]
 
     if kind == "run" and len(parts) == 2:
+        rid = parts[1]
         with _state_lock:
-            run = _runs.get(parts[1])
-        if not run:
-            raise HTTPException(404, "no such run")
-        with _state_lock:
-            entry = _uploads.get(run.get("upload") or "")
-        if not entry:
-            raise HTTPException(404, "the document this run read is no "
-                                     "longer held; upload it again to see it")
-        return entry["path"], entry["name"]
+            run = _runs.get(rid)
+        if run:
+            with _state_lock:
+                entry = _uploads.get(run.get("upload") or "")
+            if entry and os.path.exists(entry["path"]):
+                return entry["path"], entry["name"]
+        # The upload is gone -- evicted, or the server restarted. The copy
+        # kept beside the run record is the point of keeping it.
+        kept = run_history._source_path(rid)
+        if kept and os.path.exists(kept):
+            name = (run or {}).get("file", "") or os.path.basename(kept)
+            return kept, name
+        raise HTTPException(404, "the document this run read was not kept; "
+                                 "upload it again to see it")
 
     if kind == "export" and len(parts) == 3:
         rid, what = parts[1], parts[2]

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +30,22 @@ def _path(rid):
 
 def _text_path(rid):
     return os.path.join(HISTORY_DIR, f"{rid}.txt")
+
+
+def _source_path(rid, ext=""):
+    """Where the document itself is kept, so it can be looked at later.
+
+    Uploads live in a temp folder and in a dict in memory: a server restart
+    loses both, and the side panel then answers "that upload is no longer
+    held" for every run in the list. The whole point of the panel is checking
+    a value against the page it came from, which is not something that should
+    expire.
+    """
+    if ext:
+        return os.path.join(HISTORY_DIR, f"{rid}.src{ext}")
+    import glob as _glob
+    hits = _glob.glob(os.path.join(HISTORY_DIR, f"{rid}.src.*"))
+    return hits[0] if hits else ""
 
 
 def record(run, model_name=""):
@@ -78,6 +95,20 @@ def record(run, model_name=""):
 
     # The transcript goes beside the record, not inside it, so listing runs
     # never reads it.
+    # Keep the document beside the record, once.
+    src = run.get("source_file") or ""
+    if src and os.path.exists(src):
+        ext = os.path.splitext(src)[1].lower() or ".bin"
+        dest = _source_path(rid, ext)
+        if not os.path.exists(dest):
+            try:
+                shutil.copyfile(src, dest)
+            except OSError as e:
+                print(f"history: could not keep {os.path.basename(src)}: {e}",
+                      flush=True)
+    kept = _source_path(rid)
+    entry["source"] = os.path.basename(kept) if kept else ""
+
     text = run.get("text") or ""
     entry["chars"] = len(text)
     with open(_text_path(rid), "w", encoding="utf-8") as fh:
@@ -143,7 +174,7 @@ def summaries(limit=60):
 
 def forget(rid):
     gone = False
-    for path in (_path(rid), _text_path(rid)):
+    for path in (_path(rid), _text_path(rid), _source_path(rid) or _path(rid)):
         try:
             os.remove(path)
             gone = True
