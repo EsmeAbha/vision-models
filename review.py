@@ -300,6 +300,117 @@ def is_image(path):
     return os.path.splitext(path or "")[1].lower() in IMAGE_EXT
 
 
+# ------------------------------------------------- any figure, from an answer
+
+def _figure_needles(text):
+    """A figure as the answer wrote it, then the ways a page may print it:
+    with or without the currency sign, the thousands commas, the space
+    before a percent sign; a long phrase also by its first words."""
+    t = re.sub(r"\s+", " ", (text or "")).strip(" *_`\"'\u201c\u201d.,;:()")
+    out = [t]
+    bare = t.lstrip("$\u20ac\u00a3 ")
+    out.append(bare)
+    out.append(bare.replace(",", ""))
+    if re.fullmatch(r"-?\d[\d,]*(\.\d+)?", bare.replace(",", "")) and "," not in bare:
+        try:
+            whole, _, frac = bare.partition(".")
+            out.append(f"{int(whole):,}" + (f".{frac}" if frac else ""))
+        except ValueError:
+            pass
+    out.append(re.sub(r"\s+%", "%", bare))
+    out.append(re.sub(r"(\d)%", r"\1 %", bare))
+    words = t.split(" ")
+    if len(words) > 3:
+        out.append(" ".join(words[:3]))
+    seen, uniq = set(), []
+    for n in out:
+        n = n.strip()
+        if len(n) >= 2 and n.lower() not in seen:
+            seen.add(n.lower())
+            uniq.append(n)
+    return uniq
+
+
+_STOP = set("""the and for that this with from have been were their there which what when
+where will would about into than then they them also only over under after before
+other some such more most very your yours page total amount value item figure""".split())
+
+
+def _keywords(near, figure):
+    """The words around a figure that say which of its copies is meant."""
+    fig = _plain(figure)
+    words = re.findall(r"[a-z][a-z\-]{3,}", _plain(near))
+    out = []
+    for w in words:
+        if w not in _STOP and w not in fig and w not in out:
+            out.append(w)
+    return out[:8]
+
+
+def locate(source, figure, layout=None, limit=20, near=""):
+    """Every place a figure is printed in the document, in page order:
+    [{page, box, precise}]. precise means the PDF's own text layer gave the
+    box around just those characters; otherwise it is the OCR region the
+    text was read from (a scanned page has nothing finer)."""
+    needles = _figure_needles(figure)
+    keywords = _keywords(near, figure)
+    layout_by_page = {p["page"]: p["blocks"] for p in (layout or [])}
+    hits, with_text = [], set()
+    if source and os.path.exists(source) and not is_image(source):
+        with pdf_pages.LOCK:
+            doc = pdfium.PdfDocument(source)
+            try:
+                for n in range(1, len(doc) + 1):
+                    page = doc[n - 1]
+                    pg = _PdfPage(page)
+                    try:
+                        if not pg.has_text:
+                            continue
+                        with_text.add(n)
+                        for needle in needles:
+                            boxes = pg.find(needle, limit=10)
+                            if boxes:
+                                anchors = []
+                                found_words = 0
+                                for kw in keywords:
+                                    a = pg.find(kw, limit=6)
+                                    if a:
+                                        found_words += 1
+                                        anchors += a
+                                for b in boxes:
+                                    dist = min((((_centre(b)[0] - _centre(a)[0]) ** 2
+                                                 + (_centre(b)[1] - _centre(a)[1]) ** 2) ** 0.5
+                                                for a in anchors), default=1.5)
+                                    hits.append({"page": n, "box": b, "precise": True,
+                                                 "score": found_words - dist})
+                                break
+                    finally:
+                        pg.text.close()
+                        page.close()
+                    if len(hits) >= 200:
+                        break
+            finally:
+                doc.close()
+    for page in sorted(layout_by_page):
+        if page in with_text or len(hits) >= limit:
+            continue
+        for needle in needles:
+            n = _plain(needle)
+            found = [b for b in layout_by_page[page] if n and n in _plain(b["text"])]
+            if found:
+                for b in found[:5]:
+                    text = _plain(b["text"])
+                    hits.append({"page": page, "box": b["box"], "precise": False,
+                                 "score": sum(kw in text for kw in keywords) - 0.5})
+                break
+    # The copy the answer meant first: most of its surrounding words on the
+    # page, nearest to them; then the rest in page order.
+    hits.sort(key=lambda h: (-round(h["score"], 3), h["page"]))
+    for h in hits:
+        h.pop("score", None)
+    return hits[:limit]
+
+
 def build(source, rows, text, layout):
     """Everything the review screen draws: pages, fields, tables.
 

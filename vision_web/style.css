@@ -2030,3 +2030,104 @@ a.pick.tool { text-decoration: none; color: inherit; flex-shrink: 0; }
 /* The source material stays compact so the answer is never pushed off
    screen; it scrolls within its own box. */
 .ai-body > .card .card-body { max-height: 420px; overflow: auto; }
+
+/* ------------------------------------------------- figures you can verify */
+
+/* A figure the answer says is printed in the document: underlined, and one
+   click shows it on its page beside the conversation. */
+.cite {
+  cursor: pointer; border-radius: 3px;
+  text-decoration: underline; text-decoration-style: dotted;
+  text-decoration-color: var(--accent-ink); text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+.cite:hover, .cite:focus-visible {
+  text-decoration-style: solid; background: rgba(246, 169, 123, .18); outline: none;
+}
+
+/* The source view: the page, with a box over the figure. */
+.cite-nav { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; color: var(--m-dim); }
+.cite-nav .icon-btn { font-size: 16px; line-height: 1; }
+.cite-nav .icon-btn:disabled { opacity: .35; cursor: default; }
+.cite-body { flex: 1; overflow: auto; padding: 14px 16px 24px; background: var(--m-bg-2); }
+.cite-cap { font-size: 12.5px; color: var(--m-dim); margin: 0 0 8px; }
+.cite-page { position: relative; background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.12); }
+.cite-page img { display: block; width: 100%; height: auto; }
+.cite-mark {
+  position: absolute; border: 2.5px solid var(--accent); border-radius: 3px;
+  background: rgba(246, 169, 123, .22);
+  box-shadow: 0 0 0 4000px rgba(31, 78, 107, .08);
+  animation: cite-in .5s ease-out;
+}
+.cite-mark.rough { border-style: dashed; }
+@keyframes cite-in { from { transform: scale(1.6); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .cite-mark { animation: none; } }
+.cite-nav, .viewer-head .btn { white-space: nowrap; flex-shrink: 0; }
+.viewer-head .viewer-name { min-width: 0; }
+
+/* ----------------------------------------------- the sidebar, as Claude has it */
+
+/* Light and quiet: the same family as the page, a shade deeper, so the
+   conversation is what draws the eye. Every sidebar rule reads these. */
+.side {
+  --s-bg: #EDEBE3;
+  --s-deep: #E3E0D6;
+  --s-raise: #E6E3DA;
+  --s-line: #DCD9CF;
+  --s-line-2: #D2CFC4;
+  --s-rail: #D2CFC4;
+  --s-text: #1F3A4A;
+  --s-text-2: #2C4656;
+  --s-dim: #5F7280;
+  --s-dim-2: #6C7F8C;
+  --s-faint: #95A1A9;
+  gap: 10px;
+  padding: 12px 10px;
+}
+.side .brand { padding: 2px 4px 8px; }
+.side .brand-name { font-family: var(--serif); font-size: 18px; font-weight: 500; }
+
+/* "New run" is a row like Claude's "New chat", not a boxed button. */
+.side .new-run {
+  height: 36px; padding: 0 8px; gap: 10px; border: 0; background: transparent;
+  border-radius: 8px; font-size: 14px; font-weight: 500;
+}
+.side .new-run svg {
+  width: 22px; height: 22px; padding: 3px; border-radius: 50%;
+  background: var(--accent); color: var(--on-accent);
+}
+.side .new-run:hover { background: var(--s-deep); }
+
+.side .group-label { font-size: 12px; letter-spacing: 0; text-transform: none; font-weight: 500; padding: 6px 8px; }
+.side .group-count { background: transparent; color: var(--s-faint); }
+.side .pick.tool { min-height: 0; padding: 7px 8px; }
+.side .pick.tool .pick-icon { width: 22px; height: 22px; background: transparent; }
+
+/* Recents: one line per conversation, its title; the rest on hover. */
+.side .run-bucket {
+  padding: 14px 8px 4px; font-size: 12px; font-weight: 500; letter-spacing: 0;
+  text-transform: none; color: var(--s-dim);
+}
+.side .history-item.past { padding: 6px 8px; border-radius: 8px; min-height: 0; }
+.side .past-file {
+  font-size: 13.5px; font-weight: 400; color: var(--s-text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.side .history-item.past:hover { background: var(--s-deep); }
+.side .history-item.past[aria-current="true"] { background: var(--s-deep); }
+.side .history-item.past[aria-current="true"] .past-file { color: var(--s-text); font-weight: 500; }
+.side .past-sub { display: none; }
+.side .find input { border-radius: 8px; height: 34px; font-size: 13px; }
+
+/* The footer: one line, the detail on hover. */
+.side .side-foot { padding: 8px; font-size: 12px; border-top: 1px solid var(--s-line); }
+.side-foot-line { position: relative; }
+.side-foot-line b { display: inline-flex; align-items: center; gap: 7px; font-weight: 500; }
+.side-foot-line .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--box-2); }
+.side-foot-line .dot.off { background: var(--danger); }
+.side-foot-more { display: none; }
+.side-foot-line:hover .side-foot-more {
+  display: block; position: absolute; bottom: calc(100% + 8px); left: 0; right: 0;
+  padding: 10px 12px; border-radius: 10px; background: var(--m-card);
+  box-shadow: 0 6px 24px rgba(0,0,0,.14); color: var(--s-text-2); line-height: 1.5;
+}

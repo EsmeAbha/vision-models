@@ -110,6 +110,7 @@ def record(run, model_name=""):
         "turns": run.get("turns") or [],
         # What to call it in the sidebar when there is no document to name.
         "title": run.get("title") or "",
+        "title_ai": bool(run.get("title_ai")),
         # What kind of document it was read as, so the Pexl template for that
         # kind is still found after a restart.
         "doc_type": run.get("doc_type") or "",
@@ -208,9 +209,77 @@ def summaries(limit=60):
             "fields": len(entry.get("fields") or []),
             "turns": len(entry.get("turns") or []),
             "title": entry.get("title", ""),
+            "display": display_title(entry),
         })
     out.sort(key=lambda e: (e.get("seq") or 0, e["at"]), reverse=True)
     return out[:limit]
+
+
+_TYPE_NAMES = {"utility-bill": "Utility bill", "bank-statement": "Bank statement",
+               "appraisal": "Appraisal", "lease-document": "Lease", "tax-bill": "Tax bill",
+               "rent-roll": "Rent roll"}
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _month(value):
+    """"09/05/2026" or "2026-09-05" -> "Sep 2026"; None if it is not a date."""
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", value or "")
+    if m and 1 <= int(m.group(1)) <= 12:
+        return f"{_MONTHS[int(m.group(1)) - 1]} {m.group(3)}"
+    m = re.search(r"\b(\d{4})-(\d{1,2})-\d{1,2}\b", value or "")
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f"{_MONTHS[int(m.group(2)) - 1]} {m.group(1)}"
+    return None
+
+
+# What each type searches for, to tell the type of a record saved before
+# the type itself was.
+_TYPE_MARKS = {"Utility bill": {"total_electricity_bill", "total_gas_bill", "total_water_bill"},
+               "Bank statement": {"ending_balance", "beginning_balance", "total_debits"},
+               "Appraisal": {"appraised_as_is_value", "cap_rate", "appraised_date"},
+               "Lease": {"monthly_rent", "lease_begin_date", "security_deposit"},
+               "Tax bill": {"total_tax_due", "tax_year", "parcel_id"}}
+
+
+def _kind_from_fields(names):
+    hits = [(len(marks & names), kind) for kind, marks in _TYPE_MARKS.items()]
+    hits = [h for h in hits if h[0]]
+    # Searched for every schema at once (an unrecognised document): no type.
+    return max(hits)[1] if len(hits) == 1 else None
+
+
+def display_title(entry):
+    """What the sidebar calls a record, the way a chat app names a chat: the
+    title the analysis gave it; else the kind of document, who it is about
+    and when, from its fields; else the file name made readable."""
+    title = (entry.get("title") or "").strip()
+    # A typed question names a chat with no document. With a document, the
+    # first thing typed ("extract the data from the bill") names nothing.
+    if title and (entry.get("title_ai") or not entry.get("file")):
+        return title
+    found = {}
+    for r in entry.get("fields") or []:
+        if r.get("verdict") in ("yes", "check") and r.get("value") and r.get("field") not in found:
+            found[r["field"]] = r["value"].strip()
+    kind = _TYPE_NAMES.get(entry.get("doc_type") or "") or _kind_from_fields(
+        {r.get("field") for r in entry.get("fields") or []})
+    who = next((found[k] for k in ("provider_name", "property_name", "landlord_name",
+                                   "tax_authority", "address", "property_address") if found.get(k)), None)
+    if who:
+        who = re.split(r"[,(\n]", who)[0].strip()[:40]
+        # A label read as its own value ("Address") names nothing.
+        if who.lower() in {"address", "property", "name", "provider", "n/a", "none"}:
+            who = None
+    when = next((m for m in (_month(found.get(k)) for k in (
+        "billing_date", "date", "statement_date", "appraised_date", "tax_bill_date",
+        "lease_begin_date", "lease_date")) if m), None)
+    parts = [p for p in (kind, who, when) if p]
+    if len(parts) >= 2:
+        return " \u00b7 ".join(parts)
+    stem = os.path.splitext(entry.get("file") or "")[0]
+    stem = re.sub(r"[_\-]+", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return stem or "Untitled"
 
 
 def forget(rid):

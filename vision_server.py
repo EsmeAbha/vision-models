@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -40,6 +41,7 @@ from starlette.concurrency import run_in_threadpool
 # what a run actually does.
 import app as vision
 import doc_preview
+import native_text
 import field_search
 import fill_template
 import pdf_pages
@@ -756,10 +758,43 @@ def _do_run(rid, upload, req):
         # MemoryError while Windows is still growing a lazily-sized page file.
         # Rendering first keeps that allocation out of the spike, which is the
         # difference between the first run working and needing a retry.
+        # Text layer first. A page whose text is already in the PDF is read
+        # from it -- exact, and in milliseconds; only the rest are rendered
+        # and OCR'd. A fully digital document never starts the GPU engine.
+        native, wanted = {}, None
+        if upload["pdf"] and not FORCE_OCR:
+            step(0, "active", "checking which pages already have their text")
+            total_pages = pdf_pages.page_count(upload["path"])
+            wanted = [i + 1 for i in pdf_pages.parse_pages(req.pages, total_pages)]
+            try:
+                native = native_text.read(upload["path"], wanted)
+            except Exception as e:
+                print(f"text layer unreadable, OCR-ing every page: {e}", flush=True)
+                native = {}
+        need = [n for n in (wanted or []) if n not in native]
+        if upload["pdf"] and native and not need:
+            step(0, "done", "not needed: every page has its own text")
+            t0 = time.time()
+            n = len(native)
+            step(1, "done", f"{n} page{'' if n == 1 else 's'} read from the PDF's own text, "
+                            f"{time.time() - t0:.1f}s, no OCR")
+            step(2, "active")
+            run["text"] = _join_pages(native)
+            run["annotated"] = None
+            run["layout"] = []
+            run["native_pages"] = sorted(native)
+            step(2, "done")
+            run["status"] = "done"
+            run["elapsed"] = round(time.time() - run["started"], 1)
+            run_history.record(run, MODEL_META.get(kind, {}).get("name", kind))
+            run["events"].put({"type": "done", "elapsed": run["elapsed"]})
+            return
+
         if upload["pdf"]:
-            step(0, "active", "preparing the pages")
-        pages, page_dir = (_render_pdf_pages(upload, req) if upload["pdf"]
-                           else (None, None))
+            step(0, "active", f"preparing {len(need)} page{'' if len(need) == 1 else 's'} for OCR"
+                              + (f"; {len(native)} read from their own text" if native else ""))
+        pages, page_dir = (_render_pdf_pages(upload, req, only=need if native else None)
+                           if upload["pdf"] else (None, None))
 
         # Serialises runs started here -- one GPU, one at a time. It does NOT
         # reach a separate app.py process: a threading.Lock is per-process, so
@@ -813,13 +848,17 @@ def _do_run(rid, upload, req):
             step(1, "active", f"page {done} of {total}", done, total)
 
         if pages is not None:
-            text, annotated, run["layout"] = _read_pages(pages, req, kind,
-                                                         on_page)
+            by_page, run["layout"] = _ocr_pages(pages, req, kind, on_page)
+            by_page.update(native)
+            text, annotated = _join_pages(by_page), None
+            run["native_pages"] = sorted(native)
         else:
             text, annotated = vision._run_one(kind, upload["path"],
                                               req.prompt or "")
-        step(1, "done", f"{n} page{'' if n == 1 else 's'}, "
-                        f"{time.time() - t0:.1f}s, {len(text or '')} chars")
+        step(1, "done", f"{n} page{'' if n == 1 else 's'} OCR'd, "
+                        f"{time.time() - t0:.1f}s"
+                        + (f"; {len(native)} read from their own text" if native else "")
+                        + f", {len(text or '')} chars")
 
         step(2, "active")
         run["text"] = text or ""
@@ -848,17 +887,19 @@ def _do_run(rid, upload, req):
         run["events"].put({"type": "end"})
 
 
-def _render_pdf_pages(upload, req):
+def _render_pdf_pages(upload, req, only=None):
     """Rasterise the pages we were asked for, as (page number, png path).
 
     render_pdf is a generator of (page number, png path, info) and parses the
     page spec itself, so the spec goes straight through -- parsing it here as
-    well would hand it a list where it expects '1-3'.
+    well would hand it a list where it expects '1-3'. `only` narrows it to
+    those page numbers: the ones that need OCR.
     """
+    spec = ",".join(str(n) for n in only) if only is not None else req.pages
     out_dir = tempfile.mkdtemp(prefix="vision_pdf_")
     try:
         rendered = list(pdf_pages.render_pdf(upload["path"], out_dir,
-                                             dpi=req.dpi, pages=req.pages))
+                                             dpi=req.dpi, pages=spec))
     except Exception:
         shutil.rmtree(out_dir, ignore_errors=True)
         raise
@@ -871,10 +912,26 @@ def _render_pdf_pages(upload, req):
 
 
 PAGES_PER_CALL = int(os.environ.get("VISION_PAGES_PER_CALL", "8"))
+# Set to OCR every page even when the PDF has its own text, e.g. to compare.
+FORCE_OCR = os.environ.get("VISION_FORCE_OCR", "") not in ("", "0")
+
+
+def _join_pages(by_page):
+    # save_output.page_marker is the canonical form. Writing our own meant
+    # split_pages did not recognise it, so a twelve page PDF came back as one
+    # page: one row of fields instead of twelve, and one sheet in the workbook.
+    return "\n\n".join(f"{save_output.page_marker('', n)}\n{by_page[n]}"
+                       for n in sorted(by_page))
 
 
 def _read_pages(pages, req, kind, on_page=None):
-    """(text joined with page markers, None, layout) for rendered pages.
+    """(text joined with page markers, None, layout) for rendered pages."""
+    by_page, layout = _ocr_pages(pages, req, kind, on_page)
+    return _join_pages(by_page), None, layout
+
+
+def _ocr_pages(pages, req, kind, on_page=None):
+    """({page number: text}, layout) for rendered pages.
 
     `on_page(done, total)` is told as each page finishes.
     """
@@ -904,14 +961,9 @@ def _read_pages(pages, req, kind, on_page=None):
             texts.append(vision._run_one(kind, p, req.prompt or "")[0])
             on_page(len(texts), len(images))
 
-    # save_output.page_marker is the canonical form. Writing our own meant
-    # split_pages did not recognise it, so a twelve page PDF came back as one
-    # page: one row of fields instead of twelve, and one sheet in the workbook.
-    parts = [f"{save_output.page_marker('', n)}\n{body}"
-             for n, body in zip(numbers, texts)]
     layout = [review.page_layout(n, info, lay)
               for (n, _, info), lay in zip(pages, layouts) if lay]
-    return "\n\n".join(parts), None, layout
+    return dict(zip(numbers, texts)), layout
 
 
 @app.get("/api/runs/{rid}/events")
@@ -1045,6 +1097,9 @@ ANALYST_SYSTEM = (
     "Use only the transcript and the found values. Never invent a figure, "
     "date, name or quotation; if something is not in the document, say it is "
     "not there. Write in Markdown, in plain, natural sentences.\n\n"
+    "On a line of its own, name this conversation for a sidebar: "
+    "<title>3 to 6 words: the kind of document, who or what it is for, and "
+    "the period, e.g. Electric bill \u00b7 Emily Carter \u00b7 Aug 2026</title>\n\n"
     "Last, on its own line, suggest what the user might ask next about THIS "
     "document, in exactly this form: <followups>first question|second "
     "question|third question</followups>. Write real, specific questions "
@@ -1058,7 +1113,13 @@ ANALYST_SYSTEM = (
 # a token, a reserve for the answer, and the rest shared between the document
 # and the history with the newest turns kept first.
 CHARS_PER_TOKEN = 4
-ANSWER_RESERVE_TOKENS = 1200
+ANSWER_RESERVE_TOKENS = 2500
+# The window the chat model runs with. It was 8k because the model once had
+# to fit beside the OCR engine; it no longer does (an answer stops vLLM
+# first), and GPT-OSS's attention keeps its cache small: measured 12.7GB at
+# 16k, 12.8GB at 32k and 12.9GB at 64k, all on the GPU. 32k holds a whole
+# conversation and dozens of pages; past that, pages are chosen per question.
+CHAT_CTX = int(os.environ.get("VISION_CHAT_CTX", "32768"))
 DOC_SHARE = 0.55            # of what is left after the system prompt
 
 
@@ -1098,10 +1159,105 @@ def _found_values(fields):
     return "\n".join(lines[:80])
 
 
+_STYLE_ATTR = re.compile(r"""\s+style=(['"]).*?\1""")
+_STOPWORDS = set("""the and for are was were what which when where who whom why how this that
+these those with from into onto have has had does did doing done can could would should will
+shall may might must not any all each every some such than then them they their there here
+about above below after before again also just only very more most other same your yours our
+ours its it's tell show give find look check please document page pages bill statement report
+whats what's much many""".split())
+
+
+def _terms(text):
+    words = re.findall(r"[a-z0-9][a-z0-9$%.,'/-]*[a-z0-9%]|[a-z0-9]", (text or "").lower())
+    return [w.strip(".,") for w in words if len(w) >= 3 and w not in _STOPWORDS]
+
+
+def _pages_for(document, query, allowance, fields=None):
+    """The transcript cut to the pages that matter for this question.
+
+    A long document does not fit the window, and cutting it to its first and
+    last pages is how "check page 74" got "I don't have page 74". So: any page
+    the question names; then pages ranked by how many of the question's words
+    they hold (rare words count more) and by how many found values sit on
+    them; page 1 for context when there is room. Returns (text, shown, total).
+    """
+    pages = []
+    for label, content in save_output.split_pages(document):
+        m = re.search(r"(\d+)\s*$", label)
+        pages.append((int(m.group(1)) if m else len(pages) + 1, content.strip()))
+    total = len(pages)
+    # A page bigger than the window -- or a whole document with no page
+    # markers, like a Word file -- is cut into parts that can be picked on
+    # their own, or it would be skipped and nothing sent at all.
+    part = max(2000, allowance // 4)
+    if any(len(c) > part for _, c in pages):
+        pages = [(n, c[k:k + part]) for n, c in pages for k in range(0, max(len(c), 1), part)]
+    q = (query or "").lower()
+    named = {int(n) for n in re.findall(r"\bpages?\s*(\d{1,4})", q)}
+    named |= {int(a) + i for a, b in re.findall(r"\bpages?\s*(\d{1,4})\s*(?:-|to)\s*(\d{1,4})", q)
+              for i in range(0, max(0, min(int(b) - int(a), 20)) + 1)}
+    terms = list(dict.fromkeys(_terms(q)))
+    lowered = [c.lower() for _, c in pages]
+    df = {t: sum(1 for c in lowered if t in c) for t in terms}
+    hits = {}
+    for r in fields or []:
+        if r.get("verdict") in ("yes", "check") and r.get("value"):
+            hits[int(r.get("page") or 1)] = hits.get(int(r.get("page") or 1), 0) + 1
+
+    def score(i):
+        n, _ = pages[i]
+        if n in named:
+            return 1e9
+        s = sum(math.log(1 + total / df[t]) * min(lowered[i].count(t), 3)
+                for t in terms if df[t] and t in lowered[i])
+        s += 0.4 * hits.get(n, 0)
+        if n <= 3:
+            # Reports summarise up front: who, what, when, and the headline
+            # figures are usually on the first few pages.
+            s += 1.5 - 0.4 * (n - 1)
+        return s
+
+    order = sorted(range(total), key=lambda i: (-score(i), pages[i][0]))
+    chosen, used = [], 0
+    for i in order:
+        n, content = pages[i]
+        if not content:
+            continue
+        block = len(content) + 40
+        if used + block > allowance:
+            if n in named and used < allowance:
+                content = content[: max(0, allowance - used - 80)] + " [... rest of page cut ...]"
+                block = len(content) + 40
+            else:
+                continue
+        chosen.append((n, content))
+        used += block
+        if used >= allowance:
+            break
+    chosen.sort(key=lambda x: x[0])
+    text = "\n\n".join(f"<!-- page {n} -->\n{c}" for n, c in chosen)
+    return text, sorted(set(n for n, _ in chosen)), total
+
+
+def _ranges(numbers):
+    out, run = [], []
+    for n in numbers:
+        if run and n == run[-1] + 1:
+            run.append(n)
+        else:
+            if run:
+                out.append(run)
+            run = [n]
+    if run:
+        out.append(run)
+    return ", ".join(f"{r[0]}" if len(r) == 1 else f"{r[0]}-{r[-1]}" for r in out)
+
+
 def _build_messages(prompt, history, document, doc_name, system=None,
-                    fields=None):
+                    fields=None, query=None):
     """System prompt, document, history and question -- inside the window."""
-    ctx = int(os.environ.get("VISION_CHAT_CTX", "8192"))
+    ctx = CHAT_CTX
     total = max(1000, (ctx - ANSWER_RESERVE_TOKENS)) * CHARS_PER_TOKEN
 
     system = system or (CHAT_SYSTEM_DOC if document else CHAT_SYSTEM)
@@ -1117,17 +1273,21 @@ def _build_messages(prompt, history, document, doc_name, system=None,
         # comes out of the allowance too. Counting only the transcript put the
         # request over the window by exactly the length of this label -- and
         # going over is not an error, it drops the system prompt.
-        prefix = "Transcript of %s:\n\n" % (doc_name or "the document")
-        allowance = max(0, int(room * DOC_SHARE) - len(prefix))
-        doc_text = document.strip()
+        name = doc_name or "the document"
+        # The OCR's tables carry inline styling on every cell; it is half the
+        # characters of a table and none of its content.
+        doc_text = _STYLE_ATTR.sub("", document).strip()
+        allowance = max(0, int(room * DOC_SHARE) - 400)
         if len(doc_text) > allowance:
-            # The head of a document carries the labels and the summary; the
-            # tail is usually the detail tables. Keeping both ends and saying
-            # what was dropped beats a silent cut in the middle.
-            half = allowance // 2
-            doc_text = (doc_text[:half] + "\n\n[... part of this document is "
-                        "not shown: it is longer than this window ...]\n\n"
-                        + doc_text[-half:])
+            doc_text, shown, total = _pages_for(doc_text, query or prompt, allowance, fields)
+            prefix = (f"Transcript of {name}: {total} pages; the pages most relevant to "
+                      f"this question are shown below (pages {_ranges(shown)}). The others "
+                      "exist but were left out to fit. Never say something is not in the "
+                      "document because it is not on these pages -- say it is not on the "
+                      "pages shown, and suggest the user ask about a specific page or topic "
+                      "so those pages are brought in.\n\n")
+        else:
+            prefix = "Transcript of %s:\n\n" % name
         room -= len(doc_text) + len(prefix)
 
     messages = [{"role": "system", "content": system}]
@@ -1184,16 +1344,20 @@ def _chat_request(req):
     if not text:
         raise HTTPException(400, "nothing to answer")
     system = ANALYST_SYSTEM if analyse else None
+    # "And the tax?" is about whatever the last question was about: the pages
+    # are chosen for this question and the two before it.
+    asked = [t.get("content", "") for t in (req.history or []) if t.get("role") == "user"][-2:]
+    query = " ".join(asked + [text])
     return text, _build_messages(text, req.history, req.document or "",
                                  req.document_name or "", system=system,
-                                 fields=req.fields)
+                                 fields=req.fields, query=query)
 
 
 def _ollama_options():
     return {
         "temperature": float(os.environ.get("VISION_CHAT_TEMP", "0.3")),
         "top_p": 0.9,
-        "num_ctx": int(os.environ.get("VISION_CHAT_CTX", "8192")),
+        "num_ctx": CHAT_CTX,
     }
 
 
@@ -1504,6 +1668,9 @@ class ThreadReq(BaseModel):
     """A conversation as the page holds it, on its way to disk."""
     id: str
     title: str = ""
+    # True when the title is the one the analysis wrote, not the first thing
+    # typed: only that kind names a conversation about a document.
+    title_ai: bool = False
     turns: list = []
 
 
@@ -1532,7 +1699,8 @@ def api_save_thread(req: ThreadReq):
                           "thinking": str(t.get("thinking") or "")[:20000],
                           "thought_for": int(t.get("thought_for") or 0),
                           "context": {k: context[k] for k in
-                                      ("file", "pages", "found", "of", "readSecs", "followup")
+                                      ("file", "pages", "found", "of", "readSecs", "followup",
+                                       "runId")
                                       if k in context}})
 
     with _state_lock:
@@ -1543,7 +1711,12 @@ def api_save_thread(req: ThreadReq):
     run.setdefault("id", rid)
     run["status"] = "done"
     run["turns"] = turns
-    run["title"] = (req.title or existing.get("title") or "").strip()[:120]
+    if req.title_ai and req.title.strip():
+        run["title"], run["title_ai"] = req.title.strip()[:120], True
+    elif existing.get("title_ai"):
+        run["title"], run["title_ai"] = existing.get("title", ""), True
+    else:
+        run["title"] = (req.title or existing.get("title") or "").strip()[:120]
     if not run.get("text"):
         run["text"] = existing.get("text", "")
     if not run.get("file"):
@@ -1772,9 +1945,27 @@ def api_approve(rid: str, req: ApproveReq):
     return review.approval(data, approved)
 
 
+@app.get("/api/runs/{rid}/locate")
+def api_locate(rid: str, q: str = "", near: str = ""):
+    """Where a figure from an answer is printed in the document this run read,
+    so clicking it in the answer can show it on its page."""
+    run = _live_run(rid)
+    if not run:
+        raise HTTPException(404, "no such run -- reopen it from the list")
+    q = (q or "").strip()[:200]
+    if not q:
+        raise HTTPException(400, "nothing to look for")
+    source = _source_of(rid, run)
+    hits = review.locate(source, q, run.get("layout"), near=(near or "")[:400])
+    return {"q": q, "hits": hits, "file": run.get("file", ""),
+            "has_source": bool(source and os.path.exists(source))}
+
+
 @app.get("/api/runs/{rid}/page/{n}")
 def api_page_image(rid: str, n: int, dpi: int = 110):
-    run = _run_or_404(rid)
+    run = _live_run(rid)
+    if not run:
+        raise HTTPException(404, "no such run -- reopen it from the list")
     source = _source_of(rid, run)
     if not source or not os.path.exists(source):
         raise HTTPException(404, "the document this run read was not kept")

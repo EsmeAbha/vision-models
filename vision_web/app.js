@@ -231,9 +231,10 @@ async function saveThread() {
                    model: m.model || '', thinking: m.thinking || '',
                    thought_for: m.thoughtFor || 0, context: m.context || null }));
   if (!turns.length) return;
-  // The analysis after a read has no typed question; name the thread after
-  // the first thing that was actually asked, if anything was.
-  const first = ((turns.find((t) => t.question) || {}).question || '')
+  // A conversation is named the way a chat app names one: the title the
+  // analysis wrote for it, else (with no document) the first thing asked.
+  const named = turns.map((t) => aiTitle(t.answer)).find(Boolean) || '';
+  const first = named || ((turns.find((t) => t.question) || {}).question || '')
     .replace(/\s+/g, ' ').trim();
   try {
     await api('/api/history/thread', {
@@ -242,6 +243,7 @@ async function saveThread() {
       body: JSON.stringify({
         id: S.threadId,
         title: first.slice(0, 90),
+        title_ai: !!named,
         turns,
       }),
     });
@@ -263,6 +265,108 @@ function openView(src, name, download) {
   render();
 }
 
+/* Show a figure from an answer on the page it came from: the page image with
+ * a box over the figure, and every other place it is printed a click away. */
+async function openCite(runId, q, near, file) {
+  S.view = { cite: { runId, q, near, file, hits: null, i: 0, error: null }, name: file, src: '' };
+  render();
+  try {
+    const r = await api(`/api/runs/${runId}/locate?q=${encodeURIComponent(q)}&near=${encodeURIComponent((near || '').slice(0, 400))}`);
+    if (S.view && S.view.cite && S.view.cite.q === q) {
+      S.view.cite.hits = r.hits;
+      S.view.cite.hasSource = r.has_source;
+      render();
+    }
+  } catch (e) {
+    if (S.view && S.view.cite) { S.view.cite.error = e.message; render(); }
+  }
+}
+
+function citePanel(wrap) {
+  const c = S.view.cite;
+  const head = document.createElement('div');
+  head.className = 'viewer-head';
+  const title = document.createElement('div');
+  title.className = 'viewer-name';
+  title.textContent = `“${c.q}” in ${c.file}`;
+  title.title = title.textContent;
+  head.append(title);
+
+  const hits = c.hits || [];
+  if (hits.length > 1) {
+    const nav = document.createElement('div');
+    nav.className = 'cite-nav';
+    const prev = document.createElement('button');
+    prev.type = 'button'; prev.className = 'icon-btn'; prev.textContent = '‹';
+    prev.setAttribute('aria-label', 'Previous place');
+    prev.disabled = c.i === 0;
+    prev.onclick = () => { c.i -= 1; render(); };
+    const count = document.createElement('span');
+    count.textContent = `${c.i + 1} of ${hits.length}`;
+    const next = document.createElement('button');
+    next.type = 'button'; next.className = 'icon-btn'; next.textContent = '›';
+    next.setAttribute('aria-label', 'Next place');
+    next.disabled = c.i >= hits.length - 1;
+    next.onclick = () => { c.i += 1; render(); };
+    nav.append(prev, count, next);
+    head.append(nav);
+  }
+  const whole = document.createElement('button');
+  whole.type = 'button'; whole.className = 'btn';
+  whole.textContent = 'Whole document';
+  whole.onclick = () => openView(`run:${c.runId}`, c.file);
+  head.append(whole);
+  const x = document.createElement('button');
+  x.className = 'icon-btn'; x.type = 'button';
+  x.setAttribute('aria-label', 'Close the preview');
+  x.innerHTML = svg('x', 16);
+  x.onclick = closeView;
+  head.append(x);
+  wrap.append(head);
+
+  const body = document.createElement('div');
+  body.className = 'cite-body';
+  if (c.error) {
+    body.innerHTML = '<p class="fail"></p>';
+    body.querySelector('p').textContent = c.error;
+  } else if (!c.hits) {
+    const p = document.createElement('p');
+    p.className = 'muted-line shimmer';
+    p.textContent = `Finding “${c.q}” on the page…`;
+    body.append(p);
+  } else if (!hits.length) {
+    const p = document.createElement('p');
+    p.className = 'muted-line';
+    p.textContent = c.hasSource === false
+      ? 'The document this was read from was not kept, so it cannot be shown.'
+      : `“${c.q}” is not printed in this form in the document. The answer may have worked it out, or the page words it differently.`;
+    body.append(p);
+  } else {
+    const h = hits[c.i];
+    const cap = document.createElement('div');
+    cap.className = 'cite-cap';
+    cap.textContent = `Page ${h.page}` + (h.precise ? '' : ' · the region it was read from (scanned page)');
+    body.append(cap);
+    const pageBox = document.createElement('div');
+    pageBox.className = 'cite-page';
+    const img = document.createElement('img');
+    img.alt = `Page ${h.page} of ${c.file}`;
+    img.src = `/api/runs/${c.runId}/page/${h.page}?dpi=150`;
+    const mark = document.createElement('div');
+    mark.className = `cite-mark${h.precise ? '' : ' rough'}`;
+    const pad = h.precise ? 0.004 : 0;
+    mark.style.left = `${(h.box[0] - pad) * 100}%`;
+    mark.style.top = `${(h.box[1] - pad) * 100}%`;
+    mark.style.width = `${(h.box[2] - h.box[0] + 2 * pad) * 100}%`;
+    mark.style.height = `${(h.box[3] - h.box[1] + 2 * pad) * 100}%`;
+    img.onload = () => { if (mark.scrollIntoView) mark.scrollIntoView({ block: 'center' }); };
+    pageBox.append(img, mark);
+    body.append(pageBox);
+  }
+  wrap.append(body);
+  return wrap;
+}
+
 function closeView() {
   S.view = null;
   render();
@@ -272,6 +376,7 @@ function viewPanel() {
   const wrap = document.createElement('div');
   wrap.className = 'viewer';
   wrap.style.width = `${viewWidthNow()}px`;
+  if (S.view.cite) return citePanel(wrap);
 
   const head = document.createElement('div');
   head.className = 'viewer-head';
@@ -1334,7 +1439,7 @@ async function ask() {
   const lastRead = S.msgs.filter((m) => m.role === 'run' && m.text).pop();
   const msg = { role: 'chat', question: text, answer: '', model: '',
                 busy: true, error: null, startedAt: Date.now(),
-                context: lastRead ? { file: lastRead.file, followup: true } : null };
+                context: lastRead ? { file: lastRead.file, followup: true, runId: lastRead.runId } : null };
   S.msgs.push(msg);
   S.busy = true;
   S.prompt = '';
@@ -1647,7 +1752,7 @@ async function answerDocument(msg) {
   const answer = { role: 'chat', question: msg.instruction || '', answer: '',
                    model: S.chatModel?.model || 'GPT-OSS', busy: true, error: null,
                    startedAt: Date.now(),
-                   context: { file: msg.file, readSecs: msg.elapsed,
+                   context: { file: msg.file, readSecs: msg.elapsed, runId: msg.runId,
                               pages: ((msg.text || '').match(/<!--\s*=*\s*page\s+\d+/g) || []).length || 1,
                               found: rows.filter((r) => r.verdict && r.verdict !== 'none').length,
                               of: rows.length } };
@@ -1992,8 +2097,8 @@ function sidebar() {
   tool.rel = 'noopener';
   tool.innerHTML = `<span class="pick-icon">${svg('table', 15)}</span>`
     + '<span class="pick-text"><span class="pick-head"><span class="pick-name">'
-    + 'Appraisal rating guides</span></span>'
-    + '<span class="pick-sub">A zip of appraisals, one workbook</span></span>';
+    + 'Appraisal rating guides</span></span></span>';
+  tool.title = 'A zip of appraisals, one workbook';
   node.append(tool);
 
   // One list of runs, the way a chat sidebar lists conversations: newest
@@ -2002,6 +2107,7 @@ function sidebar() {
   const needle = S.search.trim().toLowerCase();
   const matching = S.history.filter(
     (h) => !needle || (h.file || '').toLowerCase().includes(needle)
+           || (h.display || '').toLowerCase().includes(needle)
            || (h.title || '').toLowerCase().includes(needle)
            || (h.model_name || '').toLowerCase().includes(needle));
 
@@ -2042,20 +2148,16 @@ function sidebar() {
       b.type = 'button';
       b.className = 'history-item past';
       b.setAttribute('aria-current', String(S.openRun === h.id));
-      b.innerHTML = '<span class="past-text"><span class="past-file"></span>'
-        + '<span class="past-sub"></span></span>';
+      b.innerHTML = '<span class="past-text"><span class="past-file"></span></span>';
       // A conversation with no document is named by what was first asked
       // in it, the way a chat sidebar names a chat.
       const asked = h.turns ? `${h.turns} message${h.turns === 1 ? '' : 's'}` : '';
       b.querySelector('.past-file').textContent =
-        h.file || h.title || 'Untitled conversation';
-      b.querySelector('.past-sub').textContent = h.file
-        ? `${h.model_name}${h.fields ? `, ${h.fields} fields` : ''}`
-          + (asked ? `, ${asked}` : '')
-        : asked;
+        h.display || h.title || h.file || 'Untitled conversation';
+      // The detail a list row used to carry is a hover away.
       b.title = h.file
-        ? `${h.file}, read with ${h.model_name}`
-          + (h.chars ? `, ${h.chars} characters` : '')
+        ? [h.file, `read with ${h.model_name}`, h.fields ? `${h.fields} fields` : '', asked]
+          .filter(Boolean).join(' · ')
         : (h.title || 'Conversation');
       b.onclick = () => reopen(h.id);
       row.append(b);
@@ -2084,10 +2186,13 @@ function sidebar() {
   // so the model answering them is named. If it is not running, say that
   // instead of promising a privacy property for something that will fail.
   const line = document.createElement('div');
+  line.className = 'side-foot-line';
   const b = document.createElement('b');
-  b.textContent = 'Everything runs here.';
+  b.innerHTML = `<i class="dot${S.chatModel && !S.chatModel.available ? ' off' : ''}"></i>`;
+  b.append('Runs on this computer');
   line.append(b);
   const rest = document.createElement('span');
+  rest.className = 'side-foot-more';
   const cm = S.chatModel;
   if (cm && cm.available) {
     rest.textContent = ` Documents are read on this GPU and questions are `
@@ -2241,6 +2346,25 @@ function chatMsg(m) {
     const div = document.createElement('div');
     div.className = `answer-body md${m.busy ? ' streaming' : ''}`;
     div.innerHTML = md(body);
+    const citeRun = (m.context && m.context.runId)
+      || (S.msgs.find((x) => x.role === 'run' && x.runId) || {}).runId;
+    const citeFile = (m.context && m.context.file)
+      || (S.msgs.find((x) => x.role === 'run' && x.runId) || {}).file || 'the document';
+    if (citeRun && !m.busy) {
+      const go = (e) => {
+        const el = e.target && e.target.closest ? e.target.closest('.cite') : null;
+        if (!el) return;
+        // The words around the figure say which of its copies is meant: the
+        // sentence it sits in, or the row label in a table.
+        const row = el.closest('tr');
+        const near = row ? row.textContent : (el.closest('p, li') || el).textContent;
+        openCite(citeRun, el.textContent.trim(), near, citeFile);
+      };
+      div.onclick = go;
+      div.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(e); } };
+    } else {
+      div.classList && div.classList.add('no-cite');
+    }
     b.append(div);
     if (!m.busy && followups.length) {
       const row = document.createElement('div');
@@ -2275,8 +2399,13 @@ function chatMsg(m) {
 /* The model ends an answer with <followups>a|b|c</followups>. That line is
  * buttons, not text. While it is still arriving, a half-written tag is hidden
  * rather than flashed on screen. */
+function aiTitle(text) {
+  const m = /<title>([\s\S]*?)<\/title>/i.exec(text || '');
+  return m ? m[1].replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+}
+
 function splitFollowups(text) {
-  const t = text || '';
+  const t = (text || '').replace(/<title>[\s\S]*?(<\/title>|$)/i, '').replace(/\n{3,}/g, '\n\n');
   const m = /<followups>([\s\S]*?)(<\/followups>|$)/i.exec(t);
   if (!m) return { body: t.replace(/<\/?f?o?l?l?o?w?u?p?s?$/i, ''), followups: [] };
   return {
@@ -2297,10 +2426,14 @@ function esc(text) {
   return text.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
+/* A bold figure -- anything with a digit in it -- is something the answer
+ * says is printed on the page, so it is a link to that place. */
 function mdInline(text) {
   return esc(text)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*\*([^*]+)\*\*/g, (all, inner) => (/\d/.test(inner)
+      ? `<strong class="cite" tabindex="0" role="button" title="Show this on the page">${inner}</strong>`
+      : `<strong>${inner}</strong>`))
     .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>');
 }
 
@@ -2324,9 +2457,13 @@ function md(text) {
       i += 2;
       const rows = [];
       while (i < lines.length && isRow(lines[i])) rows.push(cells(lines[i++]));
+      const valueCol = head.findIndex((h) => /^(value|amount|figure)s?$/i.test(h.replace(/\*/g, '').trim()));
+      const cell = (c, k) => (k === valueCol && /\d/.test(c) && !/\*\*/.test(c)
+        ? `<span class="cite" tabindex="0" role="button" title="Show this on the page">${mdInline(c)}</span>`
+        : mdInline(c));
       out.push('<div class="md-table"><table><thead><tr>'
         + head.map((h) => `<th>${mdInline(h)}</th>`).join('') + '</tr></thead><tbody>'
-        + rows.map((r) => `<tr>${r.map((c) => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')
+        + rows.map((r) => `<tr>${r.map((c, k) => `<td>${cell(c, k)}</td>`).join('')}</tr>`).join('')
         + '</tbody></table></div>');
     } else if (/^#{1,4}\s+/.test(l)) {
       const [, hashes, rest] = /^(#{1,4})\s+(.*)$/.exec(l);

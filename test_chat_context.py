@@ -18,7 +18,7 @@ import unittest
 
 import vision_server as V
 
-BUDGET = (8192 - V.ANSWER_RESERVE_TOKENS) * V.CHARS_PER_TOKEN
+BUDGET = (V.CHAT_CTX - V.ANSWER_RESERVE_TOKENS) * V.CHARS_PER_TOKEN
 
 
 def size(messages):
@@ -91,15 +91,39 @@ class TheDocument(unittest.TestCase):
         _, follow = V._chat_request(V.ChatReq(prompt="what is the total?", document="Total 41.32"))
         self.assertNotIn("Key figures", follow[0]["content"])
 
-    def test_a_long_document_keeps_both_ends_and_says_so(self):
-        """A silent cut in the middle reads as a document that stops."""
-        doc = "HEAD " + "z" * 200_000 + " TAIL"
-        messages = V._build_messages("summarise", [], doc, "big.pdf")
-        sent = messages[1]["content"]
+    def test_a_long_document_sends_the_pages_the_question_needs(self):
+        """Cutting to the first and last pages is how "check page 74" got
+        "I don't have page 74". The page asked about, and the pages holding
+        the question's words, are what go; the model is told the rest exist."""
+        pages = [f"<!-- ===== page {n} ===== -->\nfiller text {n} " + "z" * 3000
+                 for n in range(1, 200)]
+        pages[73] = "<!-- ===== page 74 ===== -->\nComparable Sales Adjustment Grid " + "z" * 3000
+        pages[140] = "<!-- ===== page 141 ===== -->\nThe zoning is M-1 light industrial " + "z" * 3000
+        doc = "\n".join(pages)
+        sent = V._build_messages("check page 74", [], doc, "big.pdf")[1]["content"]
+        self.assertIn("Comparable Sales Adjustment Grid", sent)
+        self.assertIn("199 pages", sent)
+        self.assertIn("left out to fit", sent)
+        sent = V._build_messages("what is the zoning?", [], doc, "big.pdf")[1]["content"]
+        self.assertIn("M-1 light industrial", sent)
+        self.assertLessEqual(len(sent), BUDGET)
+
+    def test_a_follow_up_keeps_the_topic_of_the_question_before(self):
+        pages = [f"<!-- ===== page {n} ===== -->\nfiller {n} " + "z" * 3000 for n in range(1, 200)]
+        pages[88] = "<!-- ===== page 89 ===== -->\nThe capitalization rate concluded is 6.75% " + "z" * 3000
+        req = V.ChatReq(prompt="and on what page?", document="\n".join(pages),
+                        history=[{"role": "user", "content": "what capitalization rate was concluded?"},
+                                 {"role": "assistant", "content": "6.75%"}])
+        _, messages = V._chat_request(req)
+        self.assertIn("concluded is 6.75%", joined(messages))
+
+    def test_one_huge_page_is_still_sent_in_part(self):
+        """A document with no page markers bigger than the window is cut into
+        parts, not dropped."""
+        doc = "HEAD " + "z" * 400_000 + " TAIL"
+        sent = V._build_messages("summarise", [], doc, "big.docx")[1]["content"]
         self.assertIn("HEAD", sent)
-        self.assertIn("TAIL", sent)
-        self.assertIn("not shown", sent)
-        self.assertLessEqual(size(messages), BUDGET)
+        self.assertLessEqual(len(sent), BUDGET)
 
 
 class TheWindow(unittest.TestCase):
@@ -114,10 +138,10 @@ class TheWindow(unittest.TestCase):
 
     def test_what_survives_is_the_recent_end(self):
         history = []
-        for i in range(60):
+        for i in range(160):
             history += exchange(i, 900)
         text = joined(V._build_messages("and now?", history, "", ""))
-        self.assertIn("answer 59", text)
+        self.assertIn("answer 159", text)
         self.assertNotIn("question 0 ", text)
 
     def test_the_system_prompt_is_never_crowded_out(self):

@@ -792,8 +792,14 @@ async function main() {
   assert.equal(t.splitFollowups(reply.answer).body,'The total is **125**.');
   assert.equal(JSON.stringify(t.splitFollowups(reply.answer).followups),JSON.stringify(['What makes up the 125?','Is it overdue?']));
   assert.equal(reply.thinking,'Adding the lines.','the reasoning was dropped');
-  assert.match(t.md('**125**'),/<strong>125<\/strong>/,'markdown is not rendered');
+  assert.match(t.md('**due now**'),/<strong>due now<\/strong>/,'markdown is not rendered');
   assert.ok(!/<script>/.test(t.md('<script>x</script>')),'markdown lets raw HTML through');
+  // A bold figure, and a figure in a Value column, can be clicked to see it on
+  // the page; a bold heading cannot.
+  assert.match(t.md('built in **1985**.'), /class="cite"[^>]*>1985</, 'a bold figure is not clickable');
+  assert.ok(!/cite/.test(t.md('**Key figures**')), 'a bold heading became a link');
+  assert.match(t.md('| Item | Value |\n|---|---|\n| Due | $102.28 |'), /class="cite"[^>]*>\$102\.28</,
+               'a figure in the Value column is not clickable');
   assert.equal(t.S.busy,false);
   sandbox.fetch = realFetch; delete byId['prompt-box'];
   console.log('PASS: OCR then GPT instruction, Paddle editable, evidence preserved, single chat call.');
