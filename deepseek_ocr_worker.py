@@ -54,6 +54,8 @@ def run_one(image_path, prompt, out_dir):
     )
     mmd_path = os.path.join(out_dir, "result.mmd")
     text = open(mmd_path, encoding="utf-8").read() if os.path.exists(mmd_path) else "(no text output produced)"
+    if not text.strip() or text == "(no text output produced)":
+        raise RuntimeError("DeepSeek returned no text for this prompt. Try a short question, such as 'What is the invoice number?', or use the default OCR prompt.")
     boxed_img = os.path.join(out_dir, "result_with_boxes.jpg")
     img_out = boxed_img if os.path.exists(boxed_img) else None
     return text, img_out

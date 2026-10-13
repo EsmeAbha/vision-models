@@ -72,8 +72,24 @@ class TheDocument(unittest.TestCase):
     def test_the_instruction_changes_when_there_is_one(self):
         with_doc = V._build_messages("q", [], "some text", "a.pdf")[0]["content"]
         without = V._build_messages("q", [], "", "")[0]["content"]
-        self.assertIn("Answer from it", with_doc)
+        self.assertIn("Use only the transcript", with_doc)
         self.assertIn("cannot see any document", without)
+
+    def test_a_finished_read_is_analysed_with_what_was_found(self):
+        """The analysis gets the analyst prompt and the label search's hits;
+        a value that was not found is not offered as one."""
+        req = V.ChatReq(prompt="", mode="analyse", document="Total 41.32",
+                        document_name="r.pdf", fields=[
+                            {"field": "total", "value": "41.32", "verdict": "yes", "page": 1},
+                            {"field": "taxes", "value": "", "verdict": "none", "page": 1}])
+        question, messages = V._chat_request(req)
+        self.assertEqual(question, V.ANALYSE_DEFAULT)
+        self.assertIn("Checks", messages[0]["content"])
+        self.assertIn("- total: 41.32 [page 1]", messages[0]["content"])
+        self.assertNotIn("taxes", messages[0]["content"])
+        # A follow-up question is answered, not analysed from scratch.
+        _, follow = V._chat_request(V.ChatReq(prompt="what is the total?", document="Total 41.32"))
+        self.assertNotIn("Key figures", follow[0]["content"])
 
     def test_a_long_document_keeps_both_ends_and_says_so(self):
         """A silent cut in the middle reads as a document that stops."""
@@ -110,7 +126,7 @@ class TheWindow(unittest.TestCase):
             history += exchange(i, 900)
         messages = V._build_messages("q", history, "x" * 100_000, "big.pdf")
         self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("careful assistant", messages[0]["content"])
+        self.assertIn("Never invent a figure", messages[0]["content"])
         self.assertLessEqual(size(messages), BUDGET)
 
     def test_a_document_and_a_conversation_share_the_window(self):

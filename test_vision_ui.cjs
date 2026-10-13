@@ -205,10 +205,10 @@ async function main() {
   // Top-level const is script-scoped in a vm, so expose what the test drives.
   const source = fs.readFileSync('vision_web/app.js', 'utf8')
     + '\n;globalThis.__t = { S, render, pickDocType, pickSkill, pickModel,'
-    + ' toggleField, fieldsTable, docTypeMenu, fieldPicker,'
+    + ' toggleField, fieldsTable, docTypeMenu, fieldPicker, loadResult,'
     + ' knownFields, fieldsWanted, run, ask, openView, closeView,'
     + ' extractFields, dayOf, loadHistory, toggleExpanded, isOpen,'
-    + ' toggleGroup, isFolded, reopen, newRun, recall, remember };';
+    + ' toggleGroup, isFolded, reopen, newRun, recall, remember, md, splitFollowups };';
   vm.runInContext(source, sandbox);
   const t = sandbox.__t;
   globalThis.__sel = () => `${t.S.model}|${t.S.skill}`;
@@ -494,65 +494,12 @@ async function main() {
   t.S.history = [];
   t.render();
 
-  // ---- a document type opens the field picker -----------------------------
-  const bill = t.S.docTypes.find((d) => d.name === 'Utility bill');
-  assert.ok(bill, 'Utility bill type is missing');
-  t.pickDocType(bill.id);
-  seen = visible(app);
-  assert.equal(t.S.chosen.length, bill.fields.length, 'fields not all ticked');
-  assert.equal(t.S.model, bill.reader, 'picking a type did not set its reader');
-  const labelOf = (field) => {
-    const shown = field.replace(/_/g, ' ');
-    return shown.charAt(0).toUpperCase() + shown.slice(1);
-  };
-  // Closed, the picker is only the selected fields as tags -- no grid.
-  assert.equal(app.querySelectorAll('.picked-tag').length, bill.fields.length,
-               'one tag per selected field');
-  assert.equal(app.querySelectorAll('.field-option').length, 0,
-               'the full list is drawn before anyone opened it');
-  for (const field of bill.fields) {
-    assert.ok(seen.includes(labelOf(field)), `no tag for ${labelOf(field)}`);
-    if (field.includes('_')) {
-      assert.ok(!seen.includes(field), `picker shows the raw key ${field}`);
-    }
-  }
-
-  // Unticking one is reflected in the tags and the composer count.
-  t.toggleField(bill.fields[0]);
-  assert.equal(t.S.chosen.length, bill.fields.length - 1);
-  assert.equal(app.querySelectorAll('.picked-tag').length, bill.fields.length - 1);
-  assert.match(visible(app),
-               new RegExp(`${bill.fields.length - 1}/${bill.fields.length}`),
-               'the composer count did not follow the picker');
-
-  // Opened, the dropdown lists every field of the type, ticked or not.
-  t.S.menu = 'fields';
+  // Field controls are no longer part of the composer, even with legacy state.
+  t.pickDocType(t.S.docTypes.find(d => d.name === 'Utility bill').id);
   t.render();
-  const options = app.querySelectorAll('.field-option');
-  assert.equal(options.length, bill.fields.length, 'the dropdown does not list every field');
-  assert.ok(app.querySelector('#field-search'), 'the dropdown has no search box');
-  // Search narrows it, and a name the type lacks can be added as a field.
-  t.S.fieldQuery = 'water';
-  t.render();
-  assert.ok(app.querySelectorAll('.field-option').every(
-    (o) => /water/i.test(visible(o))), 'search did not narrow the list');
-  t.S.fieldQuery = 'Meter number';
-  t.render();
-  assert.match(visible(app), /Add "Meter number" as a field/, 'no way to add a new field');
-  t.S.menu = null;
-  t.S.fieldQuery = '';
-  t.render();
-
-  // ---- a type with no fixed list explains itself --------------------------
-  const lease = t.S.docTypes.find((d) => d.fields.length === 0);
-  assert.ok(lease, 'expected a type with no field list');
-  t.pickDocType(lease.id);
-  seen = visible(app);
-  assert.equal(app.querySelectorAll('.picked-tag').length, 0,
-               'a type with no fields still drew tags');
-  assert.match(seen, /Choose the fields to find/, 'no prompt to name fields');
-  assert.ok(seen.includes(lease.why.slice(0, 40)),
-            'the reason for having no field list is not shown');
+  assert.equal(app.querySelectorAll('.picked-tag').length,0);
+  assert.equal(app.querySelectorAll('.field-option').length,0);
+  assert.ok(!visible(app).includes('Choose fields'));
 
   // ---- a finished run renders its fields and its template button ----------
   const bank = t.S.docTypes.find((d) => d.name === 'Bank statement');
@@ -584,7 +531,15 @@ async function main() {
   assert.match(seen, /4021587390/, 'the found value is not rendered');
   assert.match(seen, /5,940\.20/, 'the corrected balance is not rendered');
   assert.match(seen, /under the Balance column/, 'the evidence column is gone');
-  assert.match(seen, /not found/, 'a missing field is not marked');
+  // A missing field is one click away rather than a row of its own: fifteen
+  // "not found" rows buried the two that were.
+  assert.ok(!/not found/.test(seen), 'missing fields crowd the table again');
+  assert.match(seen, /1 more field not on this document/, 'the missing fields cannot be reached');
+  t.S.msgs[t.S.msgs.length - 1].showMissing = true;
+  t.render();
+  assert.match(visible(app), /not found/, 'opening the missing fields does not show them');
+  t.S.msgs[t.S.msgs.length - 1].showMissing = false;
+  t.render();
   assert.match(seen, /2 of 3 found/, 'the summary line is missing');
   assert.ok(!seen.includes('undefined'), 'undefined leaked into the result card');
 
@@ -623,47 +578,18 @@ async function main() {
   assert.equal(tabNames[0], 'Fields', 'Fields is not the leading tab');
 
   seen = visible(app);
-  assert.match(seen, /Choose a document type/, 'no guidance to pick a type');
-  assert.ok(!seen.includes('Extract fields'),
-            'offered to extract with nothing selected');
-
-  // Pick a type now, after the fact, and the action appears.
-  t.pickDocType(bank.id);
-  t.render();
-  seen = visible(app);
-  assert.match(seen, /Extract fields/, 'no extract action after picking a type');
-  assert.match(seen, new RegExp(`${bank.name}: ${t.S.chosen.length} field`),
-               'the selection is not described');
-
-  // The button has to be wired to a real request, not merely drawn. Capture
-  // the call rather than running a model.
-  const extract = app.querySelectorAll('.btn')
-    .find((b) => visible(b) === 'Extract fields');
-  assert.ok(extract, 'the extract button is not a button');
-  assert.equal(typeof extract.onclick, 'function', 'extract button is inert');
+  assert.ok(!seen.includes('Choose a document type'));
+  const extract = app.querySelectorAll('.btn').find(b => visible(b) === 'Extract document data');
+  assert.ok(extract, 'old runs cannot start automatic extraction');
   const calls = [];
   const realFetch = sandbox.fetch;
-  sandbox.fetch = (url, opts) => {
-    calls.push({ url, opts });
-    return Promise.resolve({
-      ok: true, status: 200,
-      json: () => Promise.resolve({ rows: [], summary: '0 of 0 found.' }),
-    });
+  sandbox.fetch = (url,opts) => {
+    calls.push({url,opts});
+    return Promise.resolve({ok:true,status:200,json:async()=>({rows:[],summary:'No matches',extraction:{description:'Bank statement'}})});
   };
-  await extract.onclick();
-  sandbox.fetch = realFetch;
-  assert.ok(calls.length >= 1, 'clicking extract sent no request');
-  assert.match(calls[0].url, /\/api\/runs\/plain\/fields$/,
-               `extract posted to ${calls[0].url}`);
-  // New values void old ticks, so the approval state is fetched again after.
-  assert.ok(calls.slice(1).every((c) => /\/api\/runs\/plain\/review$/.test(c.url)),
-            `unexpected follow-up request: ${calls.slice(1).map((c) => c.url)}`);
-  assert.equal(calls[0].opts.method, 'POST');
-  const sent = JSON.parse(calls[0].opts.body);
-  assert.deepEqual(sent.fields, bank.fields,
-                   'the ticked fields were not the ones sent');
-  assert.equal(plain.docTypeName, bank.name,
-               'the type was not recorded on the run, so no template matches');
+  await extract.onclick(); sandbox.fetch = realFetch;
+  assert.match(calls[0].url, /\/api\/runs\/plain\/extract$/);
+  assert.deepEqual(JSON.parse(calls[0].opts.body),{prompt:''});
 
   // ---- an error is shown as an error, not swallowed -----------------------
   const last = t.S.msgs[t.S.msgs.length - 1];
@@ -748,8 +674,8 @@ async function main() {
   t.closeView();
   assert.equal(app.querySelector('.viewer'), null, 'the panel would not close');
 
-  // A workbook previews before it is approved, but cannot be copied or
-  // downloaded until every row in it has been ticked against the page.
+  // Ticking is not a gate: a workbook with rows still unticked can be
+  // copied and downloaded straight away.
   t.S.msgs.push({ role: 'run', runId: 'r9', model: t.S.models[0].id,
                   modelName: 'PaddleOCR-VL', file: 'bill.pdf', status: 'done',
                   steps: [], text: 'x', annotated: null, error: null, elapsed: 1,
@@ -758,17 +684,11 @@ async function main() {
                   approval: { fields: { need: 2, done: 1, complete: false },
                               tables: { need: 0, done: 0, complete: true } } });
   t.openView('export:r9:fields', 'bill.pdf - Fields', '/api/runs/r9/export/fields');
-  let head = app.querySelector('.viewer').children[0];
-  assert.ok(!head.children.some((c) => (href(c) || '').includes('/export/')),
-            'an unapproved workbook can be downloaded');
-  assert.match(visible(head), /Approve to unlock/, 'no way to the review from a locked workbook');
-  assert.ok(!/Copy all/.test(visible(head)), 'an unapproved workbook can be copied');
-  t.S.msgs[t.S.msgs.length - 1].approval.fields = { need: 2, done: 2, complete: true };
-  t.render();
-  head = app.querySelector('.viewer').children[0];
+  const head = app.querySelector('.viewer').children[0];
   assert.ok(head.children.some((c) => (href(c) || '').includes('/export/')),
-            'approving every row did not unlock the download');
-  assert.match(visible(head), /Copy all/, 'approving every row did not unlock copying');
+            'an unticked workbook cannot be downloaded');
+  assert.ok(!/Approve to unlock/.test(visible(head)), 'the approval lock is back');
+  assert.match(visible(head), /Copy all/, 'an unticked workbook cannot be copied');
   t.closeView();
   t.S.msgs.pop();
 
@@ -786,9 +706,102 @@ async function main() {
     (v) => !defined.has(v) && !['--sans', '--mono', '--serif'].includes(v));
   assert.equal(missing.length, 0, `the palette never defines ${missing.join(', ')}`);
 
+  // DeepSeek input must remain editable with a document attached.
+  t.S.busy = false; t.S.batch = null; t.S.docType = null;
+  t.S.file = {id: 'prompt-test', name: 'prompt-test.png'};
+  t.S.promptMode = 'ocr';
+  t.pickModel('deepseek_ocr');
+  t.S.prompt = 'Keep this custom instruction'; t.S.promptDirty = true;
+  t.pickDocType(t.S.docTypes.find(d => d.reader === 'paddleocr_vl').id);
+  assert.equal(t.S.model, 'deepseek_ocr', 'Fields silently switched DeepSeek to Paddle');
+  assert.equal(t.S.prompt, 'Keep this custom instruction', 'Fields erased the custom prompt');
+  t.render();
+  const promptInput = app.querySelector('#prompt-box');
+  assert.equal(promptInput.disabled, false, 'DeepSeek prompt is disabled');
+  byId['prompt-box'] = promptInput;
+  promptInput.value = 'Read only the invoice number.';
+  sandbox.document.querySelector = selector => selector === '.composer-hint' ? null : app.querySelector(selector);
+  promptInput.oninput();
+  assert.equal(t.S.prompt, promptInput.value, 'typing did not update prompt state');
+  const promptCalls = [];
+  sandbox.fetch = (url, opts) => {
+    promptCalls.push({url, opts});
+    return Promise.resolve({ok:false,status:400,json:async()=>({detail:'intentional test stop'})});
+  };
+  await t.run();
+  assert.equal(JSON.parse(promptCalls.find(c => c.url === '/api/run').opts.body).model, 'deepseek_ocr', 'request selected Paddle');
+  assert.equal(JSON.parse(promptCalls.find(c => c.url === '/api/run').opts.body).prompt,
+               'Read only the invoice number.', 'custom prompt lost in submission');
+  sandbox.fetch = realFetch;
+  delete byId['prompt-box'];
+  console.log('PASS: DeepSeek prompt editable, typing updates state, exact prompt submitted.');
+  t.S.promptMode = 'assistant'; t.S.busy = false;
+  t.S.prompt = 'Summarize the bill totals.'; t.S.promptDirty = true;
+  t.pickModel('paddleocr_vl'); t.render();
+  const assistantBox = app.querySelector('#prompt-box');
+  assert.equal(assistantBox.disabled, false, 'Paddle disabled GPT instructions');
+  byId['prompt-box'] = assistantBox;
+  const assistantCalls = [];
+  sandbox.fetch = (url, opts) => {
+    assistantCalls.push({url,opts});
+    return Promise.resolve({ok:false,status:400,json:async()=>({detail:'intentional stop'})});
+  };
+  await t.run();
+  const assistantRequest = JSON.parse(assistantCalls.find(c => c.url === '/api/run').opts.body);
+  assert.equal(assistantRequest.model, 'paddleocr_vl');
+  assert.equal(assistantRequest.prompt, '', 'GPT instruction leaked into OCR');
+  const documentMessage = t.S.msgs.find(m => m.role === 'run');
+  assert.equal(documentMessage.instruction, 'Summarize the bill totals.');
+  documentMessage.runId = 'synthetic-assistant';
+  assert.equal(documentMessage.want.automatic,true, 'read omitted automatic extraction');
+  t.S.threadId = documentMessage.runId;
+  // The answer arrives as server-sent events: reasoning, then the answer in
+  // pieces, then done -- the way /api/chat/stream sends it.
+  const sse = (events) => {
+    const chunks = events.map((e) => new TextEncoder().encode(`data: ${JSON.stringify(e)}\n\n`));
+    return { getReader: () => ({ read: async () => chunks.length
+      ? { value: chunks.shift(), done: false } : { value: undefined, done: true } }) };
+  };
+  sandbox.TextDecoder = TextDecoder;
+  sandbox.fetch = (url, opts) => {
+    assistantCalls.push({url,opts});
+    if (url === '/api/chat/stream') {
+      return Promise.resolve({ok:true,status:200,body:sse([
+        {type:'thinking',text:'Adding the lines.'},
+        {type:'answer',text:'The total is '},
+        {type:'answer',text:'**125**.\n<followups>What makes up the 125?|Is it overdue?</followups>'},
+        {type:'done',model:'gpt-oss-test'}])});
+    }
+    return Promise.resolve({ok:true,status:200,json:async()=>url === '/api/history' ? [] :
+      url.endsWith('/extract') ? {rows:[{field:'total',value:'125',verdict:'yes'}],summary:'1 found',extraction:{description:'Utility bill'}} : {}});
+  };
+  const result = {status:'done',text:'TOTAL: 125',steps:[],annotated:null,error:null,elapsed:1};
+  await t.loadResult(documentMessage,result);
+  await t.loadResult(documentMessage,result); // duplicate SSE/poll completion must not ask twice
+  const chatCalls = assistantCalls.filter(c => c.url === '/api/chat/stream');
+  assert.equal(chatCalls.length,1);
+  assert.equal(assistantCalls.filter(c => c.url.endsWith('/extract')).length,1);
+  assert.equal(documentMessage.fieldRows[0].value,'125');
+  const chatRequest = JSON.parse(chatCalls[0].opts.body);
+  assert.equal(chatRequest.prompt,'Summarize the bill totals.');
+  assert.equal(chatRequest.document,'TOTAL: 125');
+  assert.equal(chatRequest.mode,'analyse','a finished read is not analysed');
+  assert.equal(chatRequest.fields[0].value,'125','the found values are not given to the model');
+  assert.equal(documentMessage.text,'TOTAL: 125','chat replaced OCR evidence');
+  const reply = t.S.msgs.at(-1);
+  assert.equal(t.splitFollowups(reply.answer).body,'The total is **125**.');
+  assert.equal(JSON.stringify(t.splitFollowups(reply.answer).followups),JSON.stringify(['What makes up the 125?','Is it overdue?']));
+  assert.equal(reply.thinking,'Adding the lines.','the reasoning was dropped');
+  assert.match(t.md('**125**'),/<strong>125<\/strong>/,'markdown is not rendered');
+  assert.ok(!/<script>/.test(t.md('<script>x</script>')),'markdown lets raw HTML through');
+  assert.equal(t.S.busy,false);
+  sandbox.fetch = realFetch; delete byId['prompt-box'];
+  console.log('PASS: OCR then GPT instruction, Paddle editable, evidence preserved, single chat call.');
+
+
   console.log(`PASS: live bootstrap, ${t.S.models.length} models, `
     + `${t.S.skills.length} skills, ${t.S.docTypes.length} document types, `
-    + 'field picker, fields result, two-workbook footer, error state, one chat per read, side panel, one palette.');
+    + 'automatic extraction, fields result, two-workbook footer, error state, one chat per read, side panel, one palette.');
   console.log('Visual browser verification remains unavailable in this environment.');
 }
 

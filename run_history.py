@@ -110,6 +110,9 @@ def record(run, model_name=""):
         "turns": run.get("turns") or [],
         # What to call it in the sidebar when there is no document to name.
         "title": run.get("title") or "",
+        # What kind of document it was read as, so the Pexl template for that
+        # kind is still found after a restart.
+        "doc_type": run.get("doc_type") or "",
     }
     # Keep the first timestamp across refreshes, so a run does not jump to
     # the top of the list every time its fields are pulled again.

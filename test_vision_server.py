@@ -283,6 +283,39 @@ class VisionServerTests(unittest.TestCase):
         self.assertLessEqual(after, server.MAX_RUNS + 1,
                              f"runs grew unbounded: {before} -> {after}")
 
+    def test_an_unticked_workbook_still_downloads(self):
+        """Ticking values against the page is a record, not a gate."""
+        with server._state_lock:
+            server._runs["unticked"] = {
+                "status": "done", "file": "bill.pdf", "approved": {},
+                "text": "<table><tr><td>Total</td><td>12.50</td></tr></table>"}
+        try:
+            r = self.client.get("/api/runs/unticked/export/tables")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.headers["content-type"], server.XLSX_TYPE)
+        finally:
+            with server._state_lock:
+                server._runs.pop("unticked", None)
+
+    def test_a_run_from_before_a_restart_still_exports(self):
+        """A restart empties the live table; an open page must keep working."""
+        entry = {"model": "paddleocr_vl", "file": "bill.pdf",
+                 "text": "<table><tr><td>Total</td><td>12.50</td></tr></table>",
+                 "fields": [], "approved": {}}
+        with patch.object(server.run_history, "load",
+                          side_effect=lambda rid, **kw: dict(entry)
+                          if rid == "fromdisk" else None), \
+             patch.object(server.run_history, "load_layout", return_value=None):
+            try:
+                r = self.client.get("/api/runs/fromdisk/export/tables")
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(
+                    self.client.get("/api/runs/nosuch/export/tables").status_code,
+                    404)
+            finally:
+                with server._state_lock:
+                    server._runs.pop("fromdisk", None)
+
     def test_sweeping_leaves_fresh_folders_alone(self):
         import os as _os
         import tempfile as _tf

@@ -64,6 +64,7 @@ const S = {
   skill: null,
   file: null,
   prompt: '',
+  promptMode: 'assistant',
   pages: '',
   menu: null,
   msgs: [],
@@ -122,11 +123,16 @@ function promptFor(m) {
   return m && m.takes_prompt ? m.prompt : '';
 }
 
+function composerDefault(m) {
+  return S.promptMode === 'assistant' ? '' : promptFor(m);
+}
+
 function pickModel(id) {
   S.model = id;
+  S.modelExplicit = true;
   S.skill = null;
   // Only overwrite a prompt the user has not touched.
-  if (!S.promptDirty) S.prompt = promptFor(modelById(id));
+  if (!S.promptDirty) S.prompt = composerDefault(modelById(id));
   S.menu = null;
   render();
 }
@@ -137,7 +143,8 @@ function pickSkill(id) {
   // This is all a skill does: set the model and fill in its prompt.
   S.skill = id;
   S.model = k.model;
-  S.prompt = promptFor(modelById(k.model));
+  S.modelExplicit = true;
+  S.prompt = composerDefault(modelById(k.model));
   S.promptDirty = false;
   S.menu = null;
   render();
@@ -146,8 +153,7 @@ function pickSkill(id) {
 
 const docTypeById = (id) => S.docTypes.find((d) => d.id === id) || null;
 
-/* Picking a document type picks its reader too, because each type names the
- * model that suits it. The field list is only ever searched for afterwards,
+/* A document type suggests a reader until the user explicitly chooses one. The field list is only ever searched for afterwards,
  * never put to the model: app.py's compose_prompt carries the measurements
  * that settled that, and handing DeepSeek-OCR a field list made it loop. */
 function pickDocType(id) {
@@ -155,13 +161,14 @@ function pickDocType(id) {
   if (!d) return;
   S.docType = id;
   S.chosen = d.fields.slice();
-  S.model = d.reader;
-  S.prompt = promptFor(modelById(d.reader));
-  S.promptDirty = false;
+  if (!S.modelExplicit) {
+    S.model = d.reader;
+    if (!S.promptDirty) S.prompt = composerDefault(modelById(d.reader));
+  }
   S.skill = null;
   S.menu = null;
   render();
-  toast(`${d.name}: reading with ${d.reader_short}`);
+  toast(`${d.name}: reading with ${modelById(S.model)?.name || S.model}`);
 }
 
 function clearDocType() {
@@ -221,9 +228,13 @@ async function saveThread() {
   const turns = S.msgs
     .filter((m) => m.role === 'chat' && (m.answer || m.error))
     .map((m) => ({ question: m.question, answer: m.answer || '',
-                   model: m.model || '' }));
+                   model: m.model || '', thinking: m.thinking || '',
+                   thought_for: m.thoughtFor || 0, context: m.context || null }));
   if (!turns.length) return;
-  const first = turns[0].question.replace(/\s+/g, ' ').trim();
+  // The analysis after a read has no typed question; name the thread after
+  // the first thing that was actually asked, if anything was.
+  const first = ((turns.find((t) => t.question) || {}).question || '')
+    .replace(/\s+/g, ' ').trim();
   try {
     await api('/api/history/thread', {
       method: 'POST',
@@ -271,21 +282,8 @@ function viewPanel() {
   head.append(title);
 
   const isWorkbook = S.view.src.startsWith('export:');
-  // A workbook previews freely, but copies and downloads only once every row
-  // in it has been approved against the page.
-  const [, runId, what] = S.view.src.split(':');
-  const owner = isWorkbook ? msgByRun(runId) : null;
-  const locked = isWorkbook && lockOf(owner, what);
 
-  if (locked) {
-    const go = document.createElement('button');
-    go.className = 'btn primary';
-    go.type = 'button';
-    go.innerHTML = `${svg('lock', 14)}<span>Approve to unlock</span>`;
-    go.title = 'Copy and download open once every row is checked against the page';
-    go.onclick = () => owner && openReview(owner);
-    head.append(go);
-  } else if (S.view.download) {
+  if (S.view.download) {
     const dl = document.createElement('a');
     dl.className = 'icon-btn';
     dl.href = S.view.download;
@@ -294,7 +292,7 @@ function viewPanel() {
     head.append(dl);
   }
   let frame = null;
-  if (isWorkbook && !locked) {
+  if (isWorkbook) {
     const all = document.createElement('button');
     all.className = 'btn';
     all.type = 'button';
@@ -329,7 +327,7 @@ function viewPanel() {
   frame.className = 'viewer-body';
   frame.src = `/api/view?src=${encodeURIComponent(S.view.src)}`;
   frame.title = S.view.name;
-  if (isWorkbook && !locked) {
+  if (isWorkbook) {
     frame.onload = () => addSheetCopyButtons(frame.contentDocument);
   }
   wrap.append(frame);
@@ -403,14 +401,6 @@ async function copyTables(tables, what) {
 
 const RV = { msg: null, data: null, sel: null, tab: 'fields', zoom: 100,
              busy: false, error: null };
-
-const msgByRun = (runId) => S.msgs.find((m) => m.role === 'run' && m.runId === runId);
-
-/* The two locks for this run, as the card and the side panel need them. */
-function lockOf(m, what) {
-  const st = m && m.approval && m.approval[what];
-  return !st || !st.complete;
-}
 
 async function refreshApproval(m) {
   if (!m || !m.runId || m.status !== 'done') return;
@@ -566,22 +556,10 @@ function reviewTop() {
     top.append(pdf);
 
     [['fields', 'Fields (XLSX)'], ['tables', 'Table (XLSX)']].forEach(([what, label]) => {
-      const locked = lockOf(m, what);
       const a = document.createElement('a');
-      a.className = `btn${locked ? ' disabled' : ' primary'}`;
-      a.innerHTML = `${svg(locked ? 'lock' : 'down', 14)}<span>${label}</span>`;
-      if (locked) {
-        a.title = `Tick every ${what === 'fields' ? 'field' : 'table'} to unlock`;
-        a.onclick = (e) => {
-          e.preventDefault();
-          RV.tab = what;
-          renderReview();
-          toast(a.title + '.');
-        };
-        a.href = '#';
-      } else {
-        a.href = `/api/runs/${m.runId}/export/${what}`;
-      }
+      a.className = 'btn primary';
+      a.innerHTML = `${svg('down', 14)}<span>${label}</span>`;
+      a.href = `/api/runs/${m.runId}/export/${what}`;
       top.append(a);
     });
   }
@@ -974,10 +952,12 @@ async function reopen(id) {
     // plus what was asked about it, and reopening half of that was how the
     // questions came to be lost.
     (entry.turns || []).forEach((t) => {
-      S.msgs.push({ role: 'you', text: t.question, file: null });
+      if (t.question) S.msgs.push({ role: 'you', text: t.question, file: null });
       S.msgs.push({ role: 'chat', question: t.question, answer: t.answer || '',
                     model: t.model || '', busy: false, error: null,
-                    startedAt: 0 });
+                    startedAt: 0, thinking: t.thinking || '',
+                    thoughtFor: t.thought_for || 0, context: t.context || null,
+                    phase: 'done' });
     });
     S.openRun = id;
     S.threadId = id;
@@ -1089,11 +1069,18 @@ function expandable(button, key, detail) {
 /* Pull fields out of a run that has already finished, using whatever is
  * selected in the picker right now. Also records the type on the message, so
  * the matching spreadsheet template appears once the rows are in. */
-async function extractNow(msg) {
-  const type = docTypeById(S.docType);
-  msg.docTypeName = type ? type.name : '';
-  msg.want = { fields: fieldsWanted(), extra: S.extras.join(', ') };
-  await extractFields(msg, msg.want.fields, msg.want.extra);
+async function extractAutomatic(msg) {
+  msg.fieldsBusy = true; msg.fieldError = null; render();
+  try {
+    const result = await api(`/api/runs/${msg.runId}/extract`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:msg.instruction || ''}),
+    });
+    msg.fieldRows = result.rows; msg.fieldSummary = result.summary;
+    msg.docTypeName = result.extraction?.description || '';
+    msg.tab = 'fields';
+  } catch(e) { msg.fieldError = e.message; }
+  msg.fieldsBusy = false; render(); refreshApproval(msg);
 }
 
 /* Search a finished run's transcript for the ticked fields. No model runs. */
@@ -1310,7 +1297,7 @@ function newRun() {
   S.openRun = null;
   S.threadId = null;
   S.file = null;
-  S.prompt = promptFor(modelById(S.model));
+  S.prompt = composerDefault(modelById(S.model));
   S.promptDirty = false;
   S.skill = null;
   render();
@@ -1344,8 +1331,10 @@ async function ask() {
   if (!S.threadId) S.threadId = newThreadId();
 
   S.msgs.push({ role: 'you', text, file: null });
+  const lastRead = S.msgs.filter((m) => m.role === 'run' && m.text).pop();
   const msg = { role: 'chat', question: text, answer: '', model: '',
-                busy: true, error: null, startedAt: Date.now() };
+                busy: true, error: null, startedAt: Date.now(),
+                context: lastRead ? { file: lastRead.file, followup: true } : null };
   S.msgs.push(msg);
   S.busy = true;
   S.prompt = '';
@@ -1359,8 +1348,8 @@ async function ask() {
   const history = [];
   S.msgs.forEach((m) => {
     if (m.role === 'chat' && m.answer) {
-      history.push({ role: 'user', content: m.question });
-      history.push({ role: 'assistant', content: m.answer });
+      history.push({ role: 'user', content: m.question || 'Analyse this document.' });
+      history.push({ role: 'assistant', content: splitFollowups(m.answer).body });
     }
   });
 
@@ -1371,30 +1360,91 @@ async function ask() {
   const read = S.msgs.filter((m) => m.role === 'run' && m.text);
   const doc = read.length ? read[read.length - 1] : null;
 
-  try {
-    const out = await api('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt: text,
-        history,
-        document: doc ? doc.text : '',
-        document_name: doc ? doc.file : '',
-      }),
-    });
-    msg.answer = out.answer;
-    msg.model = out.model;
-  } catch (e) {
-    msg.error = e.message;
-  }
-  msg.busy = false;
+  await streamChat(msg, {
+    prompt: text,
+    history,
+    document: doc ? doc.text : '',
+    document_name: doc ? doc.file : '',
+    fields: doc && doc.fieldRows ? doc.fieldRows : [],
+  });
   S.busy = false;
   render();
   saveThread();
 }
 
+/* Ask the local model and show the answer as it is written: the reasoning
+ * live (folded away once the answer starts), then the answer word by word.
+ * A 20-60 second wait with nothing moving reads as a hang. */
+async function streamChat(msg, body) {
+  Object.assign(msg, { busy: true, error: null, answer: '', thinking: '',
+                       phase: 'waiting', note: '', thinkStart: 0, thoughtFor: 0 });
+  msg.startedAt = msg.startedAt || Date.now();
+  paintChat(msg);
+  try {
+    const res = await fetch('/api/chat/stream', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json()).detail; } catch (e) { /* not JSON */ }
+      throw new Error(typeof detail === 'string' && detail ? detail : `HTTP ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        if (!raw.startsWith('data: ')) continue;
+        const ev = JSON.parse(raw.slice(6));
+        if (ev.type === 'status') msg.note = ev.text;
+        else if (ev.type === 'thinking') {
+          if (!msg.thinkStart) msg.thinkStart = Date.now();
+          msg.phase = 'thinking';
+          msg.thinking += ev.text;
+        } else if (ev.type === 'answer') {
+          if (msg.phase !== 'answer') {
+            msg.thoughtFor = msg.thinkStart
+              ? Math.max(1, Math.round((Date.now() - msg.thinkStart) / 1000)) : 0;
+          }
+          msg.phase = 'answer';
+          msg.answer += ev.text;
+        } else if (ev.type === 'error') throw new Error(ev.error);
+        else if (ev.type === 'done') msg.model = ev.model || msg.model;
+        paintChat(msg);
+      }
+    }
+    if (!msg.answer) throw new Error('The model returned nothing.');
+  } catch (e) {
+    msg.error = e.message;
+  }
+  msg.busy = false;
+  msg.phase = 'done';
+  paintChat(msg);
+}
+
+/* Redraw one answer in place. Rebuilding the whole page for every word
+ * would flicker and fight the scroll position. */
+function paintChat(msg) {
+  const old = msg._node;
+  if (!old || !old.isConnected) { render(); return; }
+  const thread = old.closest('.thread');
+  const atBottom = thread
+    && thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+  old.replaceWith(chatMsg(msg));
+  if (thread && atBottom) thread.scrollTop = thread.scrollHeight;
+}
+
 async function run() {
   if (S.busy) return;
+  const promptBox = el('prompt-box');
+  if (promptBox && !promptBox.disabled) S.prompt = promptBox.value;
   if (S.batch && !S.batch.running && batchLeft().length) return runBatch();
   if (!S.file) {
     // No document: this is a plain question. The OCR models cannot answer
@@ -1416,9 +1466,13 @@ async function run() {
   S.msgs = [];
   S.openRun = null;
   S.threadId = null;      // the run's own id becomes it, once it is started
-  S.msgs.push({ role: 'you', text: m.takes_prompt ? S.prompt : '', file: S.file });
+  const instruction = S.promptMode === 'assistant' ? S.prompt.trim() : '';
+  const submittedPrompt = S.promptMode === 'assistant' ? promptFor(m)
+    : (m.takes_prompt ? (S.prompt.trim() || promptFor(m)) : '');
+  S.msgs.push({ role: 'you', text: instruction || submittedPrompt, file: S.file });
   const msg = {
     role: 'run', model: m.id, modelName: m.name, file: S.file.name,
+    instruction,
     sourcePath: S.file.source_path || '',
     status: 'running', steps: [], tab: null, text: '', annotated: null,
     error: null, elapsed: null, saved: [],
@@ -1426,8 +1480,7 @@ async function run() {
     // run was asked for.
     docType: S.docType,
     docTypeName: docTypeById(S.docType) ? docTypeById(S.docType).name : '',
-    want: wantsFields() ? { fields: fieldsWanted(),
-                            extra: S.extras.join(', ') } : null,
+    want: {automatic: true},
     fieldRows: null, fieldSummary: '', fieldsBusy: false, fieldError: null,
   };
   // Settles once the read AND its field search are both over, which is what
@@ -1444,7 +1497,7 @@ async function run() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         file_id: S.file.id, model: m.id,
-        prompt: m.takes_prompt ? S.prompt : '', pages: S.pages, dpi: 300,
+        prompt: submittedPrompt, pages: S.pages, dpi: 300,
         doc_type: S.docType || '',
       }),
     });
@@ -1459,6 +1512,14 @@ async function run() {
 
   msg.runId = started.id;
   S.threadId = started.id;
+  // The document is in the thread now. Left attached, the next thing typed --
+  // a follow-up question -- read the whole document again instead of being
+  // answered from it.
+  if (!(S.batch && S.batch.running)) {
+    S.file = null;
+    S.prompt = '';
+    S.promptDirty = false;
+  }
   msg.steps = started.steps.map((name, i) => ({ i, name, state: 'wait', note: '' }));
   S.openRun = started.id;
   render();
@@ -1551,12 +1612,15 @@ async function loadResult(msg, known) {
     msg.elapsed = r.elapsed;
     msg.steps = r.steps.length ? r.steps : msg.steps;
     const m = modelById(msg.model);
-    if (!msg.tab && m) msg.tab = m.tabs[0][0];
+    // Fields first: the values are what the read was for, and the full
+    // transcript buried the answer under a page of tables.
+    if (!msg.tab && m) msg.tab = msg.want ? 'fields' : m.tabs[0][0];
   } catch (e) {
     msg.status = 'error';
     msg.error = e.message;
   }
-  finish(msg);
+  // Keep this run busy through the GPT response and field search.
+  render();
   // It is remembered now, so put it in the list rather than leaving the
   // sidebar a refresh behind what the thread is showing.
   if (msg.status === 'done') {
@@ -1565,9 +1629,42 @@ async function loadResult(msg, known) {
   }
   // Fields were asked for, so search the transcript now the read is done.
   if (msg.status === 'done' && msg.want) {
-    await extractFields(msg, msg.want.fields, msg.want.extra);
+    if (msg.want.automatic) await extractAutomatic(msg);
+    else await extractFields(msg, msg.want.fields, msg.want.extra);
   }
+  // Every read ends with the model looking at it -- answering the request if
+  // one was typed, otherwise an analysis. Not in a batch run, where each
+  // document would hold the queue up for another minute.
+  if (msg.status === 'done' && (msg.instruction || !(S.batch && S.batch.running))) {
+    await answerDocument(msg);
+  }
+  finish(msg);
   if (msg._settle) msg._settle(msg);
+}
+
+async function answerDocument(msg) {
+  const rows = msg.fieldRows || [];
+  const answer = { role: 'chat', question: msg.instruction || '', answer: '',
+                   model: S.chatModel?.model || 'GPT-OSS', busy: true, error: null,
+                   startedAt: Date.now(),
+                   context: { file: msg.file, readSecs: msg.elapsed,
+                              pages: ((msg.text || '').match(/<!--\s*=*\s*page\s+\d+/g) || []).length || 1,
+                              found: rows.filter((r) => r.verdict && r.verdict !== 'none').length,
+                              of: rows.length } };
+  S.msgs.push(answer);
+  render();
+  if (!(msg.text || '').trim()) {
+    answer.busy = false;
+    answer.error = 'No text could be read from this document, so there is nothing to analyse. '
+      + 'Try the other reader, or a clearer scan.';
+    render();
+    return;
+  }
+  await streamChat(answer, {
+    prompt: msg.instruction || '', mode: 'analyse', history: [],
+    document: msg.text, document_name: msg.file, fields: msg.fieldRows || [],
+  });
+  await saveThread();
 }
 
 function finish(msg) {
@@ -1794,52 +1891,6 @@ async function fromClipboard() {
   } catch (e) {
     toast('Clipboard read was blocked. Press Ctrl+V over the page instead.');
   }
-}
-
-async function fromWebcam() {
-  S.menu = null;
-  render();
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280 } });
-  } catch (e) {
-    toast('No camera available, or permission was refused.');
-    return;
-  }
-
-  const wrap = document.createElement('div');
-  wrap.style.cssText = 'position:fixed;inset:0;z-index:80;display:grid;place-items:center;'
-    + 'background:rgba(10,30,45,.72);padding:20px';
-  const video = document.createElement('video');
-  video.autoplay = true; video.playsInline = true; video.srcObject = stream;
-  video.style.cssText = 'max-width:100%;max-height:70vh;border-radius:12px';
-  const bar = document.createElement('div');
-  bar.style.cssText = 'display:flex;gap:10px;justify-content:center;margin-top:14px';
-  const shoot = document.createElement('button');
-  shoot.className = 'btn primary'; shoot.textContent = 'Take the picture';
-  const cancel = document.createElement('button');
-  cancel.className = 'btn'; cancel.textContent = 'Cancel';
-  const box = document.createElement('div');
-  box.style.cssText = 'text-align:center';
-  box.append(video, bar);
-  bar.append(shoot, cancel);
-  wrap.append(box);
-  document.body.append(wrap);
-
-  const close = () => {
-    stream.getTracks().forEach((t) => t.stop());
-    wrap.remove();
-  };
-  cancel.onclick = close;
-  shoot.onclick = () => {
-    const c = document.createElement('canvas');
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext('2d').drawImage(video, 0, 0);
-    c.toBlob((blob) => {
-      close();
-      attach(new File([blob], 'webcam.png', { type: 'image/png' }));
-    }, 'image/png');
-  };
 }
 
 /* ------------------------------------------------- rendering the sidebar */
@@ -2069,58 +2120,281 @@ function hello() {
 /* An answer from the local text model. Deliberately plainer than a run card:
  * nothing here was read off a page, so it carries no evidence, no tabs and
  * nothing to download. */
+/* What the model is thinking about, as a short headline -- the way Claude
+ * shows "Checking the arithmetic" rather than raw reasoning. Read off the
+ * newest part of the reasoning, so it moves as the model does. */
+function thoughtHeadline(text) {
+  const tail = (text || '').slice(-400).toLowerCase();
+  const rules = [
+    [/follow-?ups?|next question/, 'Thinking of follow-up questions'],
+    [/\d[\d,.]*\s*[-+×x*/=]\s*\d|\bsum\b|\badd(s|ing)? up\b|reconcil|\bverify|\bcompute|\bcalculat/, 'Checking the arithmetic'],
+    [/histor|previous month|last month|compar|\bavg\b|average|percent/, 'Comparing with past figures'],
+    [/overdue|late fee|due date|\bdue\b|deadline/, 'Looking at what is owed and when'],
+    [/table|key figures/, 'Picking out the key figures'],
+    [/tax|fee|charge|rate/, 'Going through the charges'],
+    [/question|asked|user wants/, 'Working out what you asked'],
+  ];
+  for (const [pattern, label] of rules) if (pattern.test(tail)) return label;
+  return 'Reading the document';
+}
+
+/* The steps behind an answer, as Claude shows tool use: what was read, what
+ * was found, the thinking, the writing. Folded to one line once done. */
+function answerSteps(m) {
+  const c = m.context || {};
+  const steps = [];
+  if (c.file && !c.followup) {
+    steps.push({ done: true, text: `Read ${c.file}`,
+                 note: [`${c.pages || 1} page${c.pages === 1 ? '' : 's'}`,
+                        c.readSecs ? `${c.readSecs.toFixed(1)}s` : ''].filter(Boolean).join(' · ') });
+    if (c.of) steps.push({ done: true, text: `Pulled ${c.found} of ${c.of} fields from the page` });
+  } else if (c.file) {
+    steps.push({ done: true, text: `Used ${c.file} from this conversation` });
+  }
+  const thinking = m.phase === 'thinking';
+  if (m.thinking) {
+    steps.push({ done: !thinking, think: true,
+                 text: thinking ? `${thoughtHeadline(m.thinking)}…` : `Thought for ${m.thoughtFor || 1}s` });
+  } else if (m.busy && !m.answer) {
+    steps.push({ done: false, text: m.note ? `Getting ready — ${m.note}` : 'Getting ready…' });
+  }
+  if (m.answer) steps.push({ done: !m.busy, text: m.busy ? 'Writing the answer…' : 'Wrote the answer' });
+  return steps;
+}
+
 function chatMsg(m) {
   const d = document.createElement('div');
-  d.className = 'msg';
+  d.className = 'msg ai';
+  m._node = d;
+
+  const mark = document.createElement('div');
+  mark.className = `ai-mark${m.busy ? ' working' : ''}`;
+  mark.setAttribute('aria-hidden', 'true');
+  mark.textContent = '✻';
+  d.append(mark);
+
   const b = document.createElement('div');
-  b.className = 'bubble answer';
-  if (m.busy) {
-    // A 13GB model on a shared card takes 20-60 seconds, and a motionless
-    // "Thinking..." for that long reads as a hang. The dots prove the page
-    // is alive and the clock proves the model is, so nobody reloads at 40s
-    // believing it died.
-    const wait = document.createElement('div');
-    wait.className = 'thinking';
+  b.className = 'ai-body';
 
-    const dots = document.createElement('span');
-    dots.className = 'thinking-dots';
-    dots.setAttribute('aria-hidden', 'true');
-    for (let i = 0; i < 3; i += 1) dots.append(document.createElement('i'));
+  // One line for the whole process; open it to see each step.
+  const steps = answerSteps(m);
+  const worthShowing = m.busy || steps.some((x) => x.think || !/^Wrote/.test(x.text));
+  if (steps.length && worthShowing) {
+    const box = document.createElement('details');
+    box.className = 'process';
+    box.open = !!m.showSteps;
+    box.ontoggle = () => { m.showSteps = box.open; };
+    const sum = document.createElement('summary');
+    const live = m.busy ? steps.find((x) => !x.done) : null;
+    if (live) {
+      const headline = document.createElement('span');
+      headline.className = 'shimmer';
+      headline.textContent = live.text;
+      sum.append(headline);
+      const since = m.startedAt || Date.now();
+      const clockEl = document.createElement('span');
+      clockEl.className = 'process-clock';
+      clockEl.textContent = `${Math.round((Date.now() - since) / 1000)}s`;
+      sum.append(clockEl);
+      const timer = setInterval(() => {
+        if (!clockEl.isConnected) { clearInterval(timer); return; }
+        clockEl.textContent = `${Math.round((Date.now() - since) / 1000)}s`;
+      }, 1000);
+    } else {
+      const c = m.context || {};
+      const bits = [];
+      if (c.file && !c.followup) bits.push('Read the document');
+      if (c.of) bits.push(`pulled ${c.found} value${c.found === 1 ? '' : 's'}`);
+      if (m.thinking) bits.push(`thought for ${m.thoughtFor || 1}s`);
+      if (!bits.length) bits.push(m.error ? 'Stopped' : 'Answered');
+      sum.textContent = bits.join(' · ');
+    }
+    const list = document.createElement('ol');
+    list.className = 'process-steps';
+    steps.forEach((step) => {
+      const li = document.createElement('li');
+      li.className = step.done ? 'done' : 'now';
+      const line = document.createElement('div');
+      line.className = 'step-line';
+      line.textContent = step.text;
+      if (step.note) {
+        const note = document.createElement('span');
+        note.className = 'step-note';
+        note.textContent = step.note;
+        line.append(note);
+      }
+      li.append(line);
+      if (step.think && m.thinking) {
+        const body = document.createElement('div');
+        body.className = 'reasoning-body';
+        body.textContent = m.thinking.trim();
+        li.append(body);
+      }
+      list.append(li);
+    });
+    box.append(sum, list);
+    b.append(box);
+  }
 
-    const word = document.createElement('span');
-    word.className = 'thinking-word';
-    word.textContent = 'Thinking';
+  if (m.answer) {
+    const { body, followups } = splitFollowups(m.answer);
+    const div = document.createElement('div');
+    div.className = `answer-body md${m.busy ? ' streaming' : ''}`;
+    div.innerHTML = md(body);
+    b.append(div);
+    if (!m.busy && followups.length) {
+      const row = document.createElement('div');
+      row.className = 'followups';
+      followups.forEach((q) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'followup';
+        chip.innerHTML = '<span aria-hidden="true">↳</span> ';
+        chip.append(q);
+        chip.onclick = () => {
+          if (S.busy) return;
+          S.prompt = q;
+          ask();
+        };
+        row.append(chip);
+      });
+      b.append(row);
+    }
+  }
 
-    const clock = document.createElement('span');
-    clock.className = 'thinking-clock';
-    const since = m.startedAt || Date.now();
-    const tick = () => {
-      const secs = Math.round((Date.now() - since) / 1000);
-      clock.textContent = secs >= 1 ? `${secs}s` : '';
-      // The model is cold on the first question of a session and the wait is
-      // long enough to look broken. Say why rather than let it be a mystery.
-      if (secs === 12) word.textContent = 'Thinking — loading the model';
-      if (secs === 45) word.textContent = 'Thinking — still going';
-    };
-    tick();
-    const timer = setInterval(() => {
-      if (!document.body.contains(clock)) { clearInterval(timer); return; }
-      tick();
-    }, 1000);
-
-    wait.append(dots, word, clock);
-    b.append(wait);
-  } else if (m.error) {
+  if (m.error) {
     const p = document.createElement('div');
     p.className = 'fail';
     p.textContent = m.error;
     b.append(p);
-  } else {
-    const body = document.createElement('div');
-    body.className = 'answer-body';
-    body.textContent = m.answer;
-    b.append(body);
   }
+  d.append(b);
+  return d;
+}
+
+/* The model ends an answer with <followups>a|b|c</followups>. That line is
+ * buttons, not text. While it is still arriving, a half-written tag is hidden
+ * rather than flashed on screen. */
+function splitFollowups(text) {
+  const t = text || '';
+  const m = /<followups>([\s\S]*?)(<\/followups>|$)/i.exec(t);
+  if (!m) return { body: t.replace(/<\/?f?o?l?l?o?w?u?p?s?$/i, ''), followups: [] };
+  return {
+    body: t.slice(0, m.index).trim(),
+    // The model sometimes runs the questions together without the bars;
+    // a question mark followed by a capital is then the break.
+    followups: m[2] ? (m[1].includes('|') ? m[1].split('|') : m[1].split(/(?<=\?)\s+(?=[A-Z])/))
+      .map((q) => q.trim())
+      .filter((q) => q.length > 8 && !/^(question|q)\s*(one|two|three|\d)?$|^(first|second|third) question$/i.test(q))
+      .slice(0, 3) : [],
+  };
+}
+
+/* Just enough Markdown for an answer: headings, lists, tables, code, bold,
+ * italics. Everything is escaped first, so nothing the model writes can
+ * become markup it did not mean. */
+function esc(text) {
+  return text.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function mdInline(text) {
+  return esc(text)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>');
+}
+
+function md(text) {
+  const lines = (text || '').replace(/\r/g, '').split('\n');
+  const out = [];
+  const isRow = (l) => /^\s*\|.*\|\s*$/.test(l);
+  const isItem = (l) => /^\s*([-*•]|\d+[.)])\s+/.test(l);
+  const cells = (l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^\s*```/.test(l)) {
+      const buf = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+      i += 1;
+      out.push(`<pre><code>${esc(buf.join('\n'))}</code></pre>`);
+    } else if (isRow(l) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      const head = cells(l);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && isRow(lines[i])) rows.push(cells(lines[i++]));
+      out.push('<div class="md-table"><table><thead><tr>'
+        + head.map((h) => `<th>${mdInline(h)}</th>`).join('') + '</tr></thead><tbody>'
+        + rows.map((r) => `<tr>${r.map((c) => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')
+        + '</tbody></table></div>');
+    } else if (/^#{1,4}\s+/.test(l)) {
+      const [, hashes, rest] = /^(#{1,4})\s+(.*)$/.exec(l);
+      const n = Math.min(hashes.length + 2, 6);
+      out.push(`<h${n}>${mdInline(rest)}</h${n}>`);
+      i += 1;
+    } else if (isItem(l)) {
+      const tag = /^\s*\d/.test(l) ? 'ol' : 'ul';
+      const items = [];
+      while (i < lines.length && isItem(lines[i])) {
+        items.push(lines[i++].replace(/^\s*([-*•]|\d+[.)])\s+/, ''));
+      }
+      out.push(`<${tag}>${items.map((x) => `<li>${mdInline(x)}</li>`).join('')}</${tag}>`);
+    } else if (/^\s*(-{3,}|\*{3,})\s*$/.test(l)) {
+      out.push('<hr>');
+      i += 1;
+    } else if (!l.trim()) {
+      i += 1;
+    } else {
+      const para = [lines[i++]];
+      while (i < lines.length && lines[i].trim() && !isItem(lines[i]) && !isRow(lines[i])
+             && !/^\s*(#{1,4}\s|```)/.test(lines[i])) para.push(lines[i++]);
+      out.push(`<p>${para.map(mdInline).join('<br>')}</p>`);
+    }
+  }
+  return out.join('');
+}
+
+/* What came back from Pexl, in the conversation where it was asked for. */
+function pexlMsg(m) {
+  const d = document.createElement('div');
+  d.className = 'msg ai';
+  const mark = document.createElement('div');
+  mark.className = 'ai-mark';
+  mark.setAttribute('aria-hidden', 'true');
+  mark.textContent = '✻';
+  d.append(mark);
+  const b = document.createElement('div');
+  b.className = 'ai-body';
+  const body = document.createElement('div');
+  body.className = 'answer-body md';
+  const head = document.createElement('p');
+  head.innerHTML = `<strong>Pexl built ${m.outputs.length === 1 ? 'the workbook' : `${m.outputs.length} workbooks`}</strong>`
+    + (m.kind ? ` <span class="muted-line"></span>` : '');
+  if (m.kind) head.querySelector('span').textContent = `· ${m.kind}`;
+  body.append(head);
+  m.outputs.forEach((o) => {
+    const p = document.createElement('p');
+    const a = document.createElement('a');
+    a.className = 'btn';
+    a.href = o.download;
+    a.innerHTML = `${svg('down', 14)}<span></span>`;
+    a.querySelector('span').textContent = o.filename || o.name;
+    p.append(a);
+    body.append(p);
+  });
+  if (m.notes.length) {
+    const ul = document.createElement('ul');
+    m.notes.forEach((n) => { const li = document.createElement('li'); li.textContent = n; ul.append(li); });
+    body.append(ul);
+  }
+  if (m.unknown.length) {
+    const p = document.createElement('p');
+    p.className = 'muted-line';
+    p.textContent = `Only on Pexl's "Plain Data" sheet (not fields Pexl knows): ${m.unknown.join(', ')}`;
+    body.append(p);
+  }
+  b.append(body);
   d.append(b);
   return d;
 }
@@ -2209,80 +2483,123 @@ const ticker = setInterval(() => {
 // Node (the headless test) would otherwise stay alive for this forever.
 if (ticker && ticker.unref) ticker.unref();
 
+/* The server names its steps for the log; the page says them in plain words. */
+function stepWords(name) {
+  const n = name || '';
+  if (/^started .*worker|loading|load the model/i.test(n)) return 'Starting the reader';
+  if (/layout|recogni/i.test(n)) return 'Reading the page';
+  if (/rendered table|table/i.test(n)) return 'Putting the tables together';
+  if (/prepar|render/i.test(n)) return 'Preparing the pages';
+  return n;
+}
+
 function runMsg(m) {
+  // A read is the assistant's turn like an answer is: the mark, one line
+  // saying what it is doing (shimmering while it does it), the steps a click
+  // away, and what it found below.
   const d = document.createElement('div');
-  d.className = 'msg';
+  d.className = 'msg ai';
+  const mark = document.createElement('div');
+  mark.className = `ai-mark${m.status === 'running' ? ' working' : ''}`;
+  mark.setAttribute('aria-hidden', 'true');
+  mark.textContent = '✻';
+  d.append(mark);
+  const b = document.createElement('div');
+  b.className = 'ai-body';
+  d.append(b);
+
   const card = document.createElement('div');
   card.className = 'card';
   if (m.runId) card.dataset.run = m.runId;
-
   const model = modelById(m.model);
-  const head = document.createElement('div');
-  head.className = 'card-head';
-  head.innerHTML = `<span class="pick-icon">${svg(model ? model.icon : 'eye', 15)}</span>`
-    + '<span class="card-title"><strong></strong><small></small></span>';
-  head.querySelector('strong').textContent = m.modelName;
-  const sub = head.querySelector('small');
+
+  const box = document.createElement('details');
+  box.className = 'process';
+  box.open = !!m.showSteps;
+  box.ontoggle = () => { m.showSteps = box.open; };
+  const sum = document.createElement('summary');
+  const active = m.steps.find((x) => x.state === 'active');
+  const pageStep = m.steps.find((x) => x.total > 1);
   if (m.status === 'running') {
-    sub.textContent = `reading ${m.file}… `;
-    // The whole read's clock, ticking: proof it is still going.
-    const first = (m.steps.find((s) => s.since) || {}).since;
-    if (first) sub.append(clock(first));
+    const headline = document.createElement('span');
+    headline.className = 'shimmer';
+    headline.textContent = active
+      ? `${stepWords(active.name)}${active.total > 1 ? ` — page ${active.done || 0} of ${active.total}` : ''}…`
+      : `Reading ${m.file}…`;
+    sum.append(headline);
+    if (active && active.note && !(active.total > 1)) {
+      const note = document.createElement('span');
+      note.className = 'process-note';
+      note.textContent = active.note;
+      sum.append(note);
+    }
+    const first = (m.steps.find((x) => x.since) || {}).since;
+    if (first) {
+      const c = clock(first);
+      c.className += ' process-clock';
+      sum.append(c);
+    }
+  } else if (m.status === 'error') {
+    sum.textContent = `Could not read ${m.file}`;
   } else {
+    sum.textContent = [`Read ${m.file}`,
+      pageStep ? `${pageStep.total} pages` : '',
+      m.elapsed ? `${m.elapsed.toFixed(1)}s` : ''].filter(Boolean).join(' · ');
+  }
+
+  const list = document.createElement('ol');
+  list.className = 'process-steps';
+  const reader = document.createElement('li');
+  reader.className = 'done';
+  const readerLine = document.createElement('div');
+  readerLine.className = 'step-line';
+  readerLine.textContent = `${m.modelName} on this computer`;
+  if (m.status !== 'running' && m.runId) {
     const open = document.createElement('button');
     open.type = 'button';
-    open.className = 'openable';
-    open.textContent = m.file;
+    open.className = 'openable step-note';
+    open.textContent = `open ${m.file}`;
     open.onclick = () => openView(`run:${m.runId}`, m.file);
-    sub.append(open);
-    if (m.elapsed) sub.append(` · ${m.elapsed.toFixed(1)}s`);
+    readerLine.append(open);
   }
-  card.append(head);
-
-  // the live timeline
-  if (m.steps.length) {
-    const steps = document.createElement('div');
-    steps.className = 'steps';
-    m.steps.forEach((s) => {
-      const row = document.createElement('div');
-      row.className = `step ${s.state}`;
-      row.innerHTML = '<i></i><span></span>';
-      row.querySelector('span').textContent = s.name;
-      if (s.note) {
-        const em = document.createElement('em');
-        em.textContent = s.note;
-        row.append(em);
-      }
-      if (s.state === 'active' && s.since && m.status === 'running') {
-        row.append(clock(s.since));
-      }
-      steps.append(row);
-      // Pages as they finish, as a bar under the step that reads them.
-      if (s.state === 'active' && s.total > 1) {
-        const bar = document.createElement('div');
-        bar.className = 'step-bar';
-        bar.setAttribute('role', 'progressbar');
-        bar.setAttribute('aria-valuemin', '0');
-        bar.setAttribute('aria-valuemax', String(s.total));
-        bar.setAttribute('aria-valuenow', String(s.done || 0));
-        const fill = document.createElement('span');
-        fill.style.width = `${Math.round(100 * (s.done || 0) / s.total)}%`;
-        bar.append(fill);
-        steps.append(bar);
-      }
-    });
-    card.append(steps);
-  }
+  reader.append(readerLine);
+  list.append(reader);
+  m.steps.forEach((x) => {
+    const li = document.createElement('li');
+    li.className = x.state === 'done' ? 'done' : x.state === 'active' ? 'now' : 'todo';
+    const line = document.createElement('div');
+    line.className = 'step-line';
+    line.textContent = stepWords(x.name);
+    if (x.note) {
+      const note = document.createElement('span');
+      note.className = 'step-note';
+      note.textContent = x.note;
+      line.append(note);
+    }
+    li.append(line);
+    // Pages as they finish, as a bar under the step that reads them.
+    if (x.state === 'active' && x.total > 1) {
+      const bar = document.createElement('div');
+      bar.className = 'step-bar';
+      bar.setAttribute('role', 'progressbar');
+      bar.setAttribute('aria-valuemin', '0');
+      bar.setAttribute('aria-valuemax', String(x.total));
+      bar.setAttribute('aria-valuenow', String(x.done || 0));
+      const fill = document.createElement('span');
+      fill.style.width = `${Math.round(100 * (x.done || 0) / x.total)}%`;
+      bar.append(fill);
+      li.append(bar);
+    }
+    list.append(li);
+  });
+  box.append(sum, list);
+  b.append(box);
 
   if (m.status === 'error') {
-    const body = document.createElement('div');
-    body.className = 'card-body';
     const fail = document.createElement('div');
     fail.className = 'fail';
     fail.textContent = m.error || 'The run failed.';
-    body.append(fail);
-    card.append(body);
-    d.append(card);
+    b.append(fail);
     return d;
   }
 
@@ -2352,8 +2669,8 @@ function runMsg(m) {
     // Both workbooks open in the panel rather than downloading straight
     // away. Checking what is about to be sent is the whole reason the panel
     // exists; the download sits in its header, one click further on.
-    // The source with every value boxed on it. Checking happens there, and
-    // the workbooks below stay locked until it is done.
+    // The source with every value boxed on it, for checking against. The
+    // workbooks below do not wait on it.
     const hl = document.createElement('button');
     hl.className = 'btn primary';
     hl.type = 'button';
@@ -2364,18 +2681,19 @@ function runMsg(m) {
 
     const workbook = (what, label, on) => {
       if (!on) return;
-      const locked = lockOf(m, what);
       const b = document.createElement('button');
       b.className = 'btn';
       b.type = 'button';
-      b.innerHTML = `${svg(locked ? 'lock' : 'sheet', 14)}<span>${label}</span>`;
-      b.title = locked ? 'Preview only until every row is approved in Highlighted PDF'
-                       : 'Approved: preview, copy and download';
+      b.innerHTML = `${svg('sheet', 14)}<span>${label}</span>`;
+      b.title = 'Preview, copy and download';
       b.onclick = () => openView(`export:${m.runId}:${what}`,
                                  `${m.file} — ${label}`,
                                  `/api/runs/${m.runId}/export/${what}`);
       foot.append(b);
     };
+    const pexlButton = document.createElement('button');
+    pexlButton.className = 'btn'; pexlButton.textContent = 'Send to Pexl';
+    pexlButton.onclick = () => openPexl(m.runId); foot.append(pexlButton);
     workbook('fields', 'Fields (XLSX)', m.fieldRows && m.fieldRows.length);
     workbook('tables', 'Table (XLSX)', (m.text || '').includes('<table'));
     if (m.approval === undefined) {
@@ -2385,7 +2703,7 @@ function runMsg(m) {
     card.append(foot);
   }
 
-  d.append(card);
+  if (card.children.length) b.append(card);
   return d;
 }
 
@@ -2494,13 +2812,14 @@ function composer() {
     box.append(row);
   }
 
-  const picker = fieldPicker();
-  if (picker) box.append(picker);
 
   const model = modelById(S.model);
   const ta = document.createElement('textarea');
   ta.id = 'prompt-box';
-  ta.rows = 2;
+  ta.rows = 3;
+  ta.setAttribute('aria-label', 'Document prompt or chat question');
+  ta.style.border = '1px solid #c8cdd0';
+  ta.style.borderRadius = '8px';
   ta.value = S.prompt;
   // Whether the box is usable depends on whether a document is attached, not
   // on the reader. With a file, this is the instruction for reading it, and a
@@ -2508,9 +2827,11 @@ function composer() {
   // for the text model, which every reader is irrelevant to -- and disabling
   // it then left nowhere to type at all.
   const fixedReader = !!(model && !model.takes_prompt);
-  ta.disabled = !!S.file && fixedReader;
+  ta.disabled = !!S.file && fixedReader && S.promptMode === 'ocr';
   if (S.file) {
-    ta.placeholder = fixedReader
+    ta.placeholder = S.promptMode === 'assistant'
+      ? 'Ask GPT-OSS what to extract, compare, or explain after reading this document?'
+      : fixedReader
       ? `${model.name} takes no prompt. It runs a fixed layout pipeline.`
       : 'Tell the model what to read, or leave its default prompt as it is…';
   } else {
@@ -2547,44 +2868,6 @@ function composer() {
   };
   row.append(plus);
 
-  if (model) {
-    const mb = document.createElement('button');
-    mb.type = 'button';
-    mb.className = 'model-btn';
-    mb.setAttribute('aria-expanded', String(S.menu === 'model'));
-    mb.innerHTML = `${svg(model.icon, 14)}<span></span>`
-      + (model.tag ? '<span class="tag"></span>' : '');
-    mb.querySelector('span').textContent = model.name;
-    if (model.tag) mb.querySelector('.tag').textContent = model.tag;
-    mb.onclick = (e) => {
-      e.stopPropagation();
-      S.menu = S.menu === 'model' ? null : 'model';
-      render();
-    };
-    row.append(mb);
-  }
-
-  const chosenType = docTypeById(S.docType);
-  const dt = document.createElement('button');
-  dt.type = 'button';
-  dt.className = 'model-btn';
-  dt.setAttribute('aria-expanded', String(S.menu === 'doctype'));
-  const showCount = chosenType && chosenType.fields.length > 0;
-  dt.innerHTML = `${svg('fields', 14)}<span></span>`
-    + (showCount ? '<span class="tag"></span>' : '');
-  dt.querySelector('span').textContent = chosenType ? chosenType.name : 'Fields';
-  if (showCount) {
-    dt.querySelector('.tag').textContent =
-      `${S.chosen.length}/${chosenType.fields.length}`;
-  }
-  dt.onclick = (e) => {
-    e.stopPropagation();
-    S.menu = S.menu === 'doctype' ? null : 'doctype';
-    render();
-  };
-  row.append(dt);
-
-
   const go = document.createElement('button');
   go.type = 'button';
   go.className = 'run';
@@ -2598,8 +2881,7 @@ function composer() {
   box.append(row);
 
   if (S.menu === 'attach') box.append(attachMenu());
-  if (S.menu === 'model') box.append(modelMenu());
-  if (S.menu === 'doctype') box.append(docTypeMenu());
+
 
   wrap.append(box);
   const hint = document.createElement('div');
@@ -2613,13 +2895,7 @@ function composer() {
     hint.textContent = 'Running. The Run button comes back when it finishes.';
   } else if (typedOnly) {
     hint.classList.add('needs-file');
-    const m = modelById(S.model);
-    hint.textContent = m && m.takes_prompt
-      ? `${m.name} reads a document — it does not answer on its own. `
-        + 'Attach an image or PDF and this becomes the instruction for '
-        + 'reading it.'
-      : `${m ? m.name : 'This model'} reads a document. Attach an image or a `
-        + 'PDF to run it.';
+    hint.textContent = 'Your question goes to the local GPT-OSS chat model.';
   } else {
     hint.textContent =
       'Ctrl+Enter runs · Ctrl+V pastes an image · drop a file anywhere on the box';
@@ -2647,19 +2923,7 @@ function attachMenu() {
   m.innerHTML = '<div class="menu-label">Add</div>';
   m.append(menuItem('doc', 'Open from this PC', 'Keeps the file’s full path for tracking', pickFromPC));
   m.append(menuItem('image', 'Browser upload', 'PDF or image; the browser hides the path', chooseFile));
-  m.append(menuItem('camera', 'Use webcam', 'Take a picture now', fromWebcam));
   m.append(menuItem('clip', 'Paste from clipboard', 'Whatever you last copied', fromClipboard));
-  return m;
-}
-
-function modelMenu() {
-  const m = document.createElement('div');
-  m.className = 'menu';
-  m.onclick = (e) => e.stopPropagation();
-  m.innerHTML = '<div class="menu-label">Model</div>';
-  S.models.forEach((x) => {
-    m.append(menuItem(x.icon, x.name, x.sub, () => pickModel(x.id), x.id === S.model));
-  });
   return m;
 }
 
@@ -2905,7 +3169,7 @@ function fieldsTable(m) {
   if (m.fieldsBusy) {
     const p = document.createElement('div');
     p.className = 'muted-line';
-    p.textContent = 'Searching the text for those fields...';
+    p.textContent = 'Identifying and extracting document data…';
     wrap.append(p);
     return wrap;
   }
@@ -2917,31 +3181,10 @@ function fieldsTable(m) {
     return wrap;
   }
   if (!m.fieldRows) {
-    // Nothing pulled yet. The transcript is already here, so this costs a
-    // text search and no model time: say what is currently selected and
-    // offer to run it, rather than sending anyone back to read again.
-    const type = docTypeById(S.docType);
-    const p = document.createElement('div');
-    p.className = 'muted-line';
-    p.textContent = type
-      ? `${type.name}: ${S.chosen.length} field(s) ticked`
-        + (S.extras.length ? ` plus ${S.extras.join(', ')}` : '')
-      : 'Choose a document type with the Fields button below, or type the '
-        + 'field names you want, then pull them out of this transcript.';
-    wrap.append(p);
-
-    if (wantsFields()) {
-      const go = document.createElement('button');
-      go.type = 'button';
-      go.className = 'btn primary';
-      go.innerHTML = `${svg('fields', 14)}<span>Extract fields</span>`;
-      go.onclick = () => extractNow(m);
-      const bar = document.createElement('div');
-      bar.className = 'template-bar';
-      bar.append(go);
-      wrap.append(bar);
-    }
-    return wrap;
+    const p = document.createElement('p'); p.textContent = 'Extract the document data automatically using your instruction.';
+    const button = document.createElement('button'); button.className = 'btn primary';
+    button.textContent = 'Extract document data'; button.onclick = () => extractAutomatic(m);
+    wrap.append(p, button); return wrap;
   }
 
   const scroll = document.createElement('div');
@@ -2962,7 +3205,11 @@ function fieldsTable(m) {
     guess: ['warn', 'guess'],
     none: ['none', 'not found'],
   };
-  m.fieldRows.forEach((r) => {
+  // A field that is not on the page is not news, and fifteen "not found"
+  // rows bury the two that were. They are one click away.
+  const missing = m.fieldRows.filter((r) => r.verdict === 'none');
+  const shown = m.showMissing ? m.fieldRows : m.fieldRows.filter((r) => r.verdict !== 'none');
+  shown.forEach((r) => {
     const tr = document.createElement('tr');
     const f = document.createElement('td');
     f.textContent = fieldLabel(r.field);
@@ -2985,6 +3232,17 @@ function fieldsTable(m) {
   scroll.append(t);
   wrap.append(scroll);
 
+  if (missing.length) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'linkish';
+    more.textContent = m.showMissing
+      ? `Hide the ${missing.length} not on this document`
+      : `${missing.length} more field${missing.length === 1 ? '' : 's'} not on this document`;
+    more.onclick = () => { m.showMissing = !m.showMissing; render(); };
+    wrap.append(more);
+  }
+
   if (m.fieldSummary) {
     const sum = document.createElement('div');
     sum.className = 'muted-line';
@@ -3000,10 +3258,10 @@ function fieldsTable(m) {
   const again = document.createElement('button');
   again.type = 'button';
   again.className = 'btn';
-  again.disabled = !wantsFields() || !!m.fieldsBusy;
+  again.disabled = !!m.fieldsBusy;
   again.innerHTML = `${svg('fields', 14)}<span>Extract again</span>`;
-  again.title = 'Search this transcript for whatever is ticked right now';
-  again.onclick = () => extractNow(m);
+  again.title = 'Extract document data automatically';
+  again.onclick = () => extractAutomatic(m);
   bar.append(again);
   wrap.append(bar);
   return wrap;
@@ -3071,6 +3329,7 @@ function render() {
   S.msgs.forEach((m) => {
     if (m.role === 'you') inner.append(youMsg(m));
     else if (m.role === 'chat') inner.append(chatMsg(m));
+    else if (m.role === 'pexl') inner.append(pexlMsg(m));
     else inner.append(runMsg(m));
   });
   thread.append(inner);
@@ -3125,10 +3384,246 @@ document.addEventListener('paste', (e) => {
     await loadChatModel();
     if (models.length) {
       S.model = models[0].id;
-      S.prompt = promptFor(models[0]);
+      S.prompt = composerDefault(models[0]);
     }
     render();
   } catch (e) {
     toast(`Could not reach the server: ${e.message}`);
   }
 })();
+
+// Server-side Pexl handoff; credentials never reach this page.
+async function openPexl(runId) {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'pexl-dialog';
+  dialog.style.cssText = 'width:min(760px,90vw);max-height:85vh;padding:28px;border:1px solid #cbd5d9;border-radius:16px;overflow:auto;background:#fff;color:#203b4a;box-shadow:0 16px 60px #0005';
+  // The main path needs only the document type: Pexl builds its own standard
+  // workbook for that type, so there is no template and no column mapping.
+  // A custom template is still possible under Advanced, remembered per type.
+  dialog.innerHTML = `<style>
+      .pexl-dialog select, .pexl-dialog input[type=file] { background:#fff; color:#203b4a;
+        border:1px solid #cbd5d9; border-radius:8px; padding:5px 8px; font:inherit; }
+      .pexl-dialog input[type=file]::file-selector-button { background:#eef3f5; color:#203b4a;
+        border:1px solid #cbd5d9; border-radius:6px; padding:3px 10px; margin-right:8px; font:inherit; cursor:pointer; }
+      .pexl-dialog details { margin:14px 0; }
+      .pexl-dialog .warn { color:#9a5b00; }
+    </style>
+    <h2>Send to Pexl</h2>
+    <p>Pexl builds its standard Excel workbook for the document type.</p>
+    <p><label>Document type <select data-pexltype></select></label></p>
+    <p data-daterow hidden><label>Month each bill counts toward <select data-datefield>
+      <option value="auto">Automatic (billing date if found, else date)</option>
+      <option value="billing_date">Billing date (before the 15th counts as the month before)</option>
+      <option value="date">Date as printed</option></select></label></p>
+    <p><button class="btn primary" data-export>Create Excel file</button> <button class="btn" data-close>Back to chat</button></p>
+    <p data-status role="status"></p><div data-results></div>
+    <details><summary>Advanced: use your own template instead</summary>
+      <p><label>FinAi document type <select data-doctype></select></label></p>
+      <p data-tpl></p>
+      <p data-uploadrow hidden><label><span data-uploadlabel></span> <input data-file type="file" accept=".xlsx"></label></p>
+      <p><label>Template <select data-template></select></label>
+      <button class="btn" data-prepare>Match columns</button></p>
+      <p data-plan></p><div data-preview></div>
+      <p><label>Source <select data-kind><option value="fields">Fields</option><option value="tables">Tables</option></select></label>
+      <button class="btn" data-load>Load source</button></p>
+      <label>Source sheet <select data-source></select></label>
+      <label>Template sheet <select data-sheet></select></label>
+      <button class="btn" data-map>Load column mapping</button>
+      <div data-columns></div><button class="btn" data-add>Add mapped template</button>
+      <p data-count>No templates added.</p>
+      <p><button class="btn" data-send disabled>Create from template</button></p>
+    </details>`;
+  document.body.append(dialog); dialog.showModal();
+  const el = name => dialog.querySelector(`[data-${name}]`);
+  let sources = [], templates = [], docTypes = [], outputs = [], timer, configured = false;
+  const status = message => { el('status').textContent = message; };
+  const api = async (path, options) => {
+    const response = await fetch('/api/pexl' + path, options);
+    const data = await response.json();
+    if (!response.ok) throw new Error(response.status === 404 && data.detail === 'Not Found'
+      ? 'The running FinAi service needs an update. Please contact your administrator.'
+      : typeof data.detail === 'string' ? data.detail : 'Pexl request failed');
+    return data;
+  };
+  const guard = fn => async () => { try { await fn(); } catch (e) { status(e.message); } };
+  const choices = (select, values) => { select.replaceChildren(...values.map(([value, text]) => new Option(text, value))); };
+  const busy = on => { el('export').disabled = on || !configured; };
+
+  const templateSheets = () => {
+    outputs = []; el('send').disabled = true; el('preview').replaceChildren(); el('plan').textContent = '';
+    choices(el('sheet'), (templates.find(t => t.id === el('template').value)?.sheets || []).map(s => [s.name,s.name]));
+    el('columns').replaceChildren();
+  };
+  const docType = () => docTypes.find(d => d.id === el('doctype').value);
+  const refresh = async (first) => {
+    const data = await api(`/runs/${runId}/setup`);
+    configured = data.configured;
+    templates = data.templates; docTypes = data.doc_types;
+    if (first) {
+      choices(el('pexltype'), [['', 'Choose the document type'], ...data.pexl_types.map(t => [t.value, t.label])]);
+      el('pexltype').value = data.pexl_type || '';
+    }
+    const picked = el('doctype').value || data.doc_type;
+    choices(el('doctype'), [['', 'Choose the document type'], ...docTypes.map(d => [d.id, d.name])]);
+    el('doctype').value = picked || '';
+    choices(el('template'), [['', 'None'], ...templates.map(t => [t.id,t.filename])]);
+    el('prepare').disabled = !configured; el('file').disabled = !configured;
+    el('daterow').hidden = el('pexltype').value !== 'utility_bill';
+    busy(false);
+    if (!configured) status('Pexl is not connected yet. An administrator needs to set PEXL_API_KEY on the FinAi server once.');
+  };
+  // Advanced only: a template remembered per FinAi document type.
+  const showType = () => {
+    const dt = docType();
+    el('template').value = (dt && dt.template_id) || '';
+    templateSheets();
+    const name = (templates.find(t => t.id === el('template').value) || {}).filename;
+    el('tpl').textContent = !dt ? '' : name ? `Template for ${dt.name}: ${name}`
+      : `No template is saved for ${dt.name}.`;
+    el('uploadrow').hidden = !dt;
+    el('uploadlabel').textContent = !dt ? '' : name ? 'Use a different template'
+      : `Upload one; it is kept for every ${dt.name}:`;
+  };
+  const display = job => {
+    const words = {uploading: 'Sending the values to Pexl…', 'building workbook': 'Pexl is building the workbook…',
+                   'filling templates': 'Pexl is filling the template…', downloading: 'Downloading the workbook…',
+                   completed: 'Done.', failed: 'Failed'};
+    status((words[job.status] || job.status) + (job.error ? ': ' + job.error : ''));
+    const rows = job.outputs.map(output => {
+      const row = document.createElement('p'), a = document.createElement('a');
+      a.href = output.download; a.textContent = 'Download ' + (output.filename || output.name); row.append(a); return row;
+    });
+    (job.notes || []).forEach((note) => {
+      const p = document.createElement('p'); p.className = 'muted-line'; p.textContent = note; rows.push(p);
+    });
+    if ((job.unknown_fields || []).length) {
+      const warn = document.createElement('p'); warn.className = 'warn';
+      warn.textContent = 'Pexl did not recognise these fields, so they are only on its "Plain Data" sheet: '
+        + job.unknown_fields.join(', ');
+      rows.push(warn);
+    }
+    el('results').replaceChildren(...rows);
+  };
+  // A file made here goes into the conversation too, and the dialog steps
+  // aside: the conversation is where the work is, the dialog only a form.
+  // Polling carries on after "Back to chat", so the card still arrives.
+  const started = new Set();
+  const poll = async id => {
+    try {
+      const job = await api('/jobs/' + id);
+      if (dialog.open) display(job);
+      if (!['completed','failed'].includes(job.status)) {
+        if (dialog.open) busy(true);
+        timer = setTimeout(() => poll(id), 1000);
+        return;
+      }
+      if (dialog.open) { busy(false); el('send').disabled = !outputs.length; }
+      if (started.has(id) && job.status === 'completed' && job.outputs.length) {
+        started.delete(id);
+        postToChat(job);
+        if (dialog.open) dialog.close();
+      }
+    } catch (e) { if (dialog.open) { busy(false); status(e.message); } }
+  };
+  const postToChat = (job) => {
+    const label = (el('pexltype').selectedOptions[0] || {}).textContent || '';
+    S.msgs.push({ role: 'pexl', runId, outputs: job.outputs, notes: job.notes || [],
+                  unknown: job.unknown_fields || [], kind: job.mode === 'export' ? label : 'template' });
+    render();
+  };
+
+  el('pexltype').onchange = () => { el('daterow').hidden = el('pexltype').value !== 'utility_bill'; };
+  el('export').onclick = guard(async () => {
+    if (!el('pexltype').value) throw new Error('Choose the document type first.');
+    busy(true);
+    try {
+      const body = {doc_type: el('pexltype').value};
+      if (body.doc_type === 'utility_bill') body.date_field = el('datefield').value;
+      const job = await api(`/runs/${runId}/exports`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+      started.add(job.id);
+      await poll(job.id);
+    } catch (e) { busy(false); throw e; }
+  });
+
+  const prepare = async () => {
+    if (!el('template').value) throw new Error('Choose or upload a template first.');
+    el('prepare').disabled = true; el('send').disabled = true; outputs = [];
+    status('Matching columns. This can take a moment…');
+    try {
+      const plan = await api(`/runs/${runId}/prepare`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({template_id:el('template').value})});
+      outputs = plan.outputs; el('kind').value = plan.kind;
+      el('plan').textContent = plan.method;
+      const rows = Object.entries(outputs[0].mapping).map(([target, source]) => {
+        const row = document.createElement('p'); row.textContent = `${target} ← ${source}`; return row;
+      });
+      if (plan.unmatched.length) {
+        const warning = document.createElement('p'); warning.textContent = 'These template columns will remain unchanged: ' + plan.unmatched.join(', '); rows.push(warning);
+      }
+      el('preview').replaceChildren(...rows); el('send').disabled = false;
+      status('Check the matches, then create the file from the template.');
+    } finally { el('prepare').disabled = !configured; }
+  };
+  el('prepare').onclick = guard(prepare);
+  el('doctype').onchange = showType;
+  el('close').onclick = () => dialog.close();
+  dialog.onclose = () => { dialog.remove(); };
+  // Picking another template for a type makes it that type's template.
+  el('template').onchange = guard(async () => {
+    templateSheets();
+    const dt = docType();
+    if (dt && el('template').value) {
+      await api(`/doc-types/${dt.id}/template`, {method:'PUT', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({template_id:el('template').value})});
+      await refresh(); showType();
+    }
+  });
+  el('source').onchange = el('sheet').onchange = () => el('columns').replaceChildren();
+  el('kind').onchange = () => { sources = []; outputs = []; choices(el('source'), []); el('columns').replaceChildren(); el('count').textContent = 'No templates added.'; };
+  el('load').onclick = guard(async () => {
+    const data = await api(`/runs/${runId}/source?kind=${el('kind').value}`);
+    sources = data.sheets; choices(el('source'), sources.map(s => [s.name,s.name]));
+    status('Source loaded. Select a template and load its columns.');
+  });
+  el('file').onchange = guard(async () => {
+    const file = el('file').files[0]; if (!file) return;
+    const body = new FormData(); body.append('file', file);
+    if (docType()) body.append('doc_type', docType().id);
+    status('Uploading template…'); await api('/templates', {method:'POST',body});
+    el('file').value = '';
+    await refresh(); showType(); status('Template saved.');
+  });
+  el('map').onclick = guard(async () => {
+    const source = sources.find(s => s.name === el('source').value);
+    if (!source) throw new Error('Load the source first.');
+    const data = await api(`/templates/${el('template').value}/headers?sheet=${encodeURIComponent(el('sheet').value)}`);
+    el('columns').replaceChildren(...data.headers.map(header => {
+      const row = document.createElement('p'), label = document.createElement('label'), select = document.createElement('select');
+      label.textContent = header + ' ← '; select.dataset.header = header;
+      choices(select, [['','Leave unchanged'], ...source.headers.filter(Boolean).map(h => [h,h])]);
+      if (source.headers.includes(header)) select.value = header;
+      label.append(select); row.append(label); return row;
+    }));
+  });
+  el('add').onclick = guard(async () => {
+    const mapping = Object.fromEntries([...el('columns').querySelectorAll('select')].filter(s => s.value).map(s => [s.dataset.header,s.value]));
+    if (!Object.keys(mapping).length) throw new Error('Map at least one column.');
+    if (outputs.length >= 10) throw new Error('Maximum ten templates per request.');
+    outputs.push({template_id:el('template').value, source_sheet:el('source').value, template_sheet:el('sheet').value,mapping});
+    el('count').textContent = `${outputs.length} template(s) ready. Headers: row 1; output starts at row 2.`;
+    el('send').disabled = false;
+  });
+  el('send').onclick = guard(async () => {
+    if (!outputs.length) throw new Error('Add a mapped template first.');
+    el('send').disabled = true;
+    try {
+      const job = await api(`/runs/${runId}/jobs`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:el('kind').value,outputs})});
+      started.add(job.id);
+      await poll(job.id);
+    } catch(e) { el('send').disabled = false; throw e; }
+  });
+  await guard(async () => {
+    await refresh(true); showType();
+    const jobs = await api(`/runs/${runId}/jobs`);
+    if (jobs.length) await poll(jobs[jobs.length-1].id);
+  })();
+}

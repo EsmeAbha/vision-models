@@ -93,6 +93,63 @@ MAX_RUNS = 100
 # changes nothing about what comes out.
 IDLE_UNLOAD_SECONDS = int(os.environ.get("VISION_IDLE_UNLOAD", "600"))
 _last_used = time.time()
+
+# The chat model and the OCR engine cannot share the card, so an answer
+# stops vLLM. Starting it again is quick only while WSL is up and its files
+# are still in memory -- and WSL's disk is on the spinning drive (G:), so
+# once loading the chat model has pushed them out, the next read paid
+# 110-160s re-reading them (measured; 26s when warm). So shortly after an
+# answer the engine is put back in the background, while the answer is
+# being read. A question that arrives meanwhile cancels it rather than
+# waiting behind it.
+REWARM_DELAY = float(os.environ.get("VISION_REWARM_DELAY", "15"))
+_last_ocr_kind = None
+_rewarm = {"timer": None, "running": threading.Event(), "kind": None}
+
+
+def _schedule_rewarm():
+    if not _last_ocr_kind or REWARM_DELAY < 0:
+        return
+    old = _rewarm["timer"]
+    if old:
+        old.cancel()
+    timer = threading.Timer(REWARM_DELAY, _do_rewarm)
+    timer.daemon = True
+    _rewarm["timer"] = timer
+    timer.start()
+
+
+def _do_rewarm():
+    kind = _last_ocr_kind
+    if not kind or vision._state.get("kind") is not None:
+        return
+    if not vision._lock.acquire(blocking=False):
+        return              # a read or an answer is running; it decides
+    _rewarm["kind"] = kind
+    _rewarm["running"].set()
+    try:
+        t0 = time.time()
+        vision.ensure_model(kind)
+        globals()["_last_used"] = time.time()
+        print(f"re-warmed {kind} in {time.time() - t0:.0f}s", flush=True)
+    except Exception as e:
+        print(f"re-warm of {kind} stopped: {type(e).__name__}: {e}", flush=True)
+    finally:
+        _rewarm["running"].clear()
+        vision._lock.release()
+
+
+def _preempt_rewarm():
+    """A question goes first. Stopping vLLM makes a re-warm in progress fail
+    fast and let go of the lock, instead of the question waiting it out."""
+    old = _rewarm["timer"]
+    if old:
+        old.cancel()
+    if _rewarm["running"].is_set():
+        try:
+            vision.stop_vllm()
+        except Exception:
+            pass
 # Anything older than this in Temp is from a previous run of the server.
 STALE_HOURS = 6
 
@@ -637,6 +694,10 @@ def api_run(req: RunReq):
     if req.model not in MODEL_META:
         raise HTTPException(400, f"unknown model {req.model!r}")
 
+    # Empty input means use the reader default, never an image-only instruction.
+    if req.model == "deepseek_ocr" and not req.prompt.strip():
+        req.prompt = vision.DEFAULT_PROMPTS[req.model]
+
     rid = uuid.uuid4().hex
     run = {"id": rid, "model": req.model, "file": upload["name"],
            "status": "running", "steps": [], "text": "", "annotated": None,
@@ -708,7 +769,18 @@ def _do_run(rid, upload, req):
         # Every wait gets said out loud: a step sitting silent for a minute is
         # indistinguishable from a crash.
         if not vision._lock.acquire(blocking=False):
-            step(0, "active", "waiting for the GPU: another read is running")
+            warming = _rewarm["running"].is_set() and _rewarm.get("kind")
+            if warming == kind:
+                # Loading exactly what this read needs: waiting for it is
+                # quicker than starting over.
+                step(0, "active", "the OCR engine is already loading in the "
+                                  "background; this read starts when it is ready")
+            elif warming:
+                step(0, "active", "stopping the other reader's background load")
+                _preempt_rewarm()
+            else:
+                step(0, "active", "waiting for the GPU: another read or answer "
+                                  "is using it")
             vision._lock.acquire()
         locked = True
 
@@ -718,17 +790,19 @@ def _do_run(rid, upload, req):
         in_wsl = vision.OCR_WORKERS[kind].get("wsl")
         server_up = not in_wsl or vision._vllm_up()
         warm = vision._state.get("kind") == kind and server_up
-        # Measured: a cold start (vLLM in WSL plus the layout model) took 178s
-        # for a read that then took 13s. Say so, so three minutes of waiting
-        # reads as expected rather than as a hang.
+        # Measured: vLLM took 123s to come up while it checked the Hugging Face
+        # hub on every start; with that switched off in start_server.sh it is
+        # 26s in a running WSL, plus ~13s for the layout model. Say roughly
+        # how long, so the wait reads as expected rather than as a hang.
         if warm:
             note = "model already loaded"
         elif not server_up:
-            note = "starting the OCR engine; after a restart or idle this takes about 3 minutes"
+            note = "starting the OCR engine; usually under a minute"
         else:
             note = "loading the model; about a minute"
         step(0, "active", note)
         vision.ensure_model(kind)
+        globals()["_last_ocr_kind"] = kind
         step(0, "done")
 
         n = len(pages) if pages is not None else 1
@@ -842,8 +916,7 @@ def _read_pages(pages, req, kind, on_page=None):
 
 @app.get("/api/runs/{rid}/events")
 def api_events(rid: str):
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
 
@@ -876,8 +949,7 @@ def _sse(payload):
 
 @app.get("/api/runs/{rid}")
 def api_run_state(rid: str):
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
     return {
@@ -913,13 +985,71 @@ CHAT_SYSTEM = (
 # with the question, so the honest instruction is the opposite one: read it,
 # quote it, and say when it does not contain the answer.
 CHAT_SYSTEM_DOC = (
-    "You are a careful assistant inside a document-reading tool, answering on "
-    "a local machine. Answer the question directly and briefly.\n\n"
-    "The transcript of the document the user is looking at is given below. "
-    "Answer from it. Quote the figure or the line as it is printed rather "
-    "than rephrasing it, and if the transcript does not contain the answer, "
-    "say so plainly. Never invent a figure, a date or a quotation, and never "
-    "fill a gap in the transcript from general knowledge."
+    "You are FinAi, a thoughtful financial analyst on the user's own machine, "
+    "talking with them about a document you have read. Its transcript, and the "
+    "values a label search found on it, are below.\n\n"
+    "Reasoning: medium\n\n"
+    "Answer like a capable colleague would: the direct answer first, in plain "
+    "sentences; figures quoted exactly as printed, with where they are; any "
+    "arithmetic the question implies, shown briefly; and anything else in the "
+    "document that changes the answer. Keep it as short as the question "
+    "allows -- a one-line question gets a one- or two-sentence answer. Use a "
+    "small table or list only when it genuinely helps.\n\n"
+    "The transcript is machine-read: it contains HTML table markup, image "
+    "placeholders and repeated text. Treat those as how the page was "
+    "captured, not as content, and never comment on them.\n\n"
+    "Use only the transcript and the found values. Never invent a figure, "
+    "date, name or quotation, and never fill a gap from general knowledge; if "
+    "the answer is not there, say so plainly and say what comes closest.\n\n"
+    "Last, on its own line, suggest what the user might ask next about THIS "
+    "document, in exactly this form: <followups>first question|second "
+    "question</followups>. Write real, specific questions "
+    "(about a figure, a date, a change, a next step) -- never placeholder "
+    "words like 'question one'."
+)
+
+# What a read gets when it finishes: an analysis, not a list of steps. The
+# transcript and the values the field search found are both given; the model
+# reads them like an analyst would and says what matters, what adds up, what
+# does not, and what is missing. Follow-up suggestions come back in a tag the
+# page turns into buttons, so they are never shown as raw text.
+ANALYST_SYSTEM = (
+    "You are FinAi, a thoughtful financial analyst on the user's own machine. "
+    "You have just read a document for them; its transcript, and the values a "
+    "label search found on it, are below.\n\n"
+    "Reasoning: medium\n\n"
+    "If the user asked something, answer that first and fully. Otherwise write "
+    "a short analysis the way a capable colleague would brief them:\n\n"
+    "1. Open with two or three plain sentences: what this is (type, issuer, "
+    "account holder, period) and the bottom line -- what is owed or shown, by "
+    "when, and the one thing that matters most.\n"
+    "2. **Key figures** -- a compact table (Item | Value | Where), at most "
+    "eight rows: the figures someone would act on or check for this kind of "
+    "document, quoted exactly as printed. No meter, bill or reference "
+    "numbers unless they are the point.\n"
+    "3. **Checks** -- actually do the arithmetic and show it: do the line "
+    "items add up to the subtotal and the total; does the previous balance, "
+    "payment and new charges reconcile; do dates and periods agree. One line "
+    "each, ending with \u2713 or \u2717, at most five. If something does not "
+    "reconcile, say by how much.\n"
+    "4. **Worth a look** -- only things that matter financially: an amount "
+    "overdue or a late fee; a charge that is unusual or changed; usage or "
+    "cost well above or below the history the document itself gives (say by "
+    "what percentage); an estimated reading; a rate change; a due date close "
+    "at hand; a figure that contradicts another. If nothing qualifies, leave "
+    "this section out entirely rather than padding it.\n\n"
+    "The transcript is machine-read: it contains HTML table markup, image "
+    "placeholders and repeated headings. Those are how the page was captured, "
+    "not content -- never comment on layout, formatting, labels, images, "
+    "repetition or the transcription itself.\n\n"
+    "Use only the transcript and the found values. Never invent a figure, "
+    "date, name or quotation; if something is not in the document, say it is "
+    "not there. Write in Markdown, in plain, natural sentences.\n\n"
+    "Last, on its own line, suggest what the user might ask next about THIS "
+    "document, in exactly this form: <followups>first question|second "
+    "question|third question</followups>. Write real, specific questions "
+    "(about a figure, a date, a change, a next step) -- never placeholder "
+    "words like 'question one'."
 )
 
 # Ollama is asked for an 8k window, and going over it does not fail -- it
@@ -957,12 +1087,27 @@ def _fit_history(history, budget):
     return kept
 
 
-def _build_messages(prompt, history, document, doc_name):
+def _found_values(fields):
+    """The field search's hits, one line each, for the model to work from."""
+    lines = []
+    for row in fields or []:
+        if row.get("verdict") in ("yes", "check", "guess") and row.get("value"):
+            flag = "" if row["verdict"] == "yes" else "  (uncertain)"
+            lines.append(f"- {row.get('field')}: {row['value']}"
+                         f" [page {row.get('page') or 1}]{flag}")
+    return "\n".join(lines[:80])
+
+
+def _build_messages(prompt, history, document, doc_name, system=None,
+                    fields=None):
     """System prompt, document, history and question -- inside the window."""
     ctx = int(os.environ.get("VISION_CHAT_CTX", "8192"))
     total = max(1000, (ctx - ANSWER_RESERVE_TOKENS)) * CHARS_PER_TOKEN
 
-    system = CHAT_SYSTEM_DOC if document else CHAT_SYSTEM
+    system = system or (CHAT_SYSTEM_DOC if document else CHAT_SYSTEM)
+    found = _found_values(fields) if document else ""
+    if found:
+        system += "\n\nValues the label search found on the page:\n" + found
     question = prompt[:8000]
     room = total - len(system) - len(question)
 
@@ -1020,6 +1165,110 @@ class ChatReq(BaseModel):
     # "what is the account number" has something to be answered from.
     document: str = ""
     document_name: str = ""
+    # "analyse": the read just finished; look at it like an analyst.
+    mode: str = ""
+    fields: list = []
+
+
+ANALYSE_DEFAULT = ("Analyse this document for me: what it is, the key figures, "
+                   "whether the numbers add up, and anything I should look at.")
+
+
+def _chat_request(req):
+    """The question and the messages for a ChatReq, the same for both the
+    whole-answer and the streamed path."""
+    text = (req.prompt or "").strip()
+    analyse = req.mode == "analyse" and bool(req.document)
+    if analyse and not text:
+        text = ANALYSE_DEFAULT
+    if not text:
+        raise HTTPException(400, "nothing to answer")
+    system = ANALYST_SYSTEM if analyse else None
+    return text, _build_messages(text, req.history, req.document or "",
+                                 req.document_name or "", system=system,
+                                 fields=req.fields)
+
+
+def _ollama_options():
+    return {
+        "temperature": float(os.environ.get("VISION_CHAT_TEMP", "0.3")),
+        "top_p": 0.9,
+        "num_ctx": int(os.environ.get("VISION_CHAT_CTX", "8192")),
+    }
+
+
+@app.post("/api/chat/stream")
+def api_chat_stream(req: ChatReq):
+    """The same answer as /api/chat, streamed as it is written.
+
+    Server-sent events: {"type":"thinking","text":...} while the model reasons,
+    {"type":"answer","text":...} for each piece of the answer, then
+    {"type":"done"} or {"type":"error","error":...}. A 20-60 second wait with
+    nothing moving reads as a hang; words arriving do not.
+    """
+    import requests as _rq
+
+    _, messages = _chat_request(req)
+
+    def events():
+        locked = False
+        try:
+            _preempt_rewarm()
+            vision._lock.acquire()
+            locked = True
+            if vision._state.get("kind") is not None:
+                yield _sse({"type": "status", "text": "freeing the GPU"})
+                vision.unload_current(keep_wsl=True)
+            elif vision._vllm_up(timeout=1):
+                # A vLLM this process does not know about -- left running by
+                # the server before a restart. Answering beside it pushed the
+                # chat model half onto the CPU: 173s for a 20s answer.
+                yield _sse({"type": "status", "text": "freeing the GPU"})
+                vision.stop_vllm()
+            yield _sse({"type": "status", "text": "loading the model"})
+            with _rq.post(f"{OLLAMA_URL}/api/chat", timeout=600, stream=True, json={
+                    "model": CHAT_MODEL, "messages": messages, "stream": True,
+                    "keep_alive": 0, "options": _ollama_options()}) as r:
+                if not r.ok:
+                    yield _sse({"type": "error", "error":
+                                f"the local model returned {r.status_code}. "
+                                f"If that is 500, the GPU may be full."})
+                    return
+                wrote = False
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    if chunk.get("error"):
+                        yield _sse({"type": "error", "error": chunk["error"]})
+                        return
+                    msg = chunk.get("message") or {}
+                    if msg.get("thinking"):
+                        yield _sse({"type": "thinking", "text": msg["thinking"]})
+                    if msg.get("content"):
+                        wrote = True
+                        yield _sse({"type": "answer", "text": msg["content"]})
+                    if chunk.get("done"):
+                        break
+                if not wrote:
+                    yield _sse({"type": "error",
+                                "error": "the local model returned nothing"})
+                    return
+            yield _sse({"type": "done", "model": CHAT_MODEL})
+        except _rq.exceptions.ConnectionError:
+            yield _sse({"type": "error", "error":
+                        f"the local model service is not answering on "
+                        f"{OLLAMA_URL}. Start Ollama and try again."})
+        except Exception as e:
+            yield _sse({"type": "error", "error": f"{type(e).__name__}: {e}"})
+        finally:
+            if locked:
+                vision._lock.release()
+            _schedule_rewarm()
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/chat")
@@ -1027,41 +1276,44 @@ def api_chat(req: ChatReq):
     """Answer a typed question with the local text model."""
     import requests as _rq
 
-    text = (req.prompt or "").strip()
-    if not text:
-        raise HTTPException(400, "nothing to answer")
+    text, messages = _chat_request(req)
 
-    messages = _build_messages(text, req.history, req.document or "",
-                               req.document_name or "")
-
+    _preempt_rewarm()
     try:
-        r = _rq.post(f"{OLLAMA_URL}/api/chat", timeout=600, json={
-            "model": CHAT_MODEL, "messages": messages, "stream": False,
-            "options": {
-                # Greedy decoding with a fixed seed was making "rewrite
-                # that, more casual" return almost exactly what it returned
-                # the first time. Nothing checkable depends on this being
-                # deterministic -- field extraction calls no model at all, it
-                # matches labels in the transcript -- so the answer is allowed
-                # a little room to differ when the question asks it to.
-                "temperature": float(os.environ.get("VISION_CHAT_TEMP", "0.3")),
-                "top_p": 0.9,
-                # The model's own default is a 64k window, and reserving the
-                # KV cache for it needs 1.6GB on top of 13.8GB of weights --
-                # which failed outright with "cudaMalloc failed ... kv cache"
-                # whenever anything else held a few GB of the card. A typed
-                # question and eight turns of history do not need 64k, and
-                # asking for what is actually used leaves room for the OCR
-                # models to coexist.
-                "num_ctx": int(os.environ.get("VISION_CHAT_CTX", "8192")),
-            },
-        })
+        with vision._lock:
+            if vision._state.get("kind") is not None:
+                vision.unload_current(keep_wsl=True)
+            elif vision._vllm_up(timeout=1):
+                vision.stop_vllm()      # left over from before a restart
+            r = _rq.post(f"{OLLAMA_URL}/api/chat", timeout=600, json={
+                "model": CHAT_MODEL, "messages": messages, "stream": False,
+                "keep_alive": 0,
+                "options": {
+                    # Greedy decoding with a fixed seed was making "rewrite
+                    # that, more casual" return almost exactly what it returned
+                    # the first time. Nothing checkable depends on this being
+                    # deterministic -- field extraction calls no model at all, it
+                    # matches labels in the transcript -- so the answer is allowed
+                    # a little room to differ when the question asks it to.
+                    "temperature": float(os.environ.get("VISION_CHAT_TEMP", "0.3")),
+                    "top_p": 0.9,
+                    # The model's own default is a 64k window, and reserving the
+                    # KV cache for it needs 1.6GB on top of 13.8GB of weights --
+                    # which failed outright with "cudaMalloc failed ... kv cache"
+                    # whenever anything else held a few GB of the card. A typed
+                    # question and eight turns of history do not need 64k, and
+                    # asking for what is actually used leaves room for the OCR
+                    # models to coexist.
+                    "num_ctx": int(os.environ.get("VISION_CHAT_CTX", "8192")),
+                },
+            })
     except _rq.exceptions.ConnectionError:
         raise HTTPException(503, f"the local model service is not answering on "
                                  f"{OLLAMA_URL}. Start Ollama and try again.")
     except Exception as e:
         raise HTTPException(502, f"{type(e).__name__}: {e}")
 
+    _schedule_rewarm()
     if not r.ok:
         raise HTTPException(502, f"the local model returned {r.status_code}. "
                                  f"If that is 500, the GPU may be full.")
@@ -1090,8 +1342,7 @@ def api_fields(rid: str, req: FieldsReq):
     sat relative to it -- so a wrong answer reads as a wrong answer instead of
     a confident number. Same grading as the Gradio page's pull_fields.
     """
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
     if not (run["text"] or "").strip():
@@ -1144,6 +1395,26 @@ def api_fields(rid: str, req: FieldsReq):
     return {"rows": rows, "summary": summary}
 
 
+class AutoFieldsReq(BaseModel):
+    prompt: str = ""
+
+
+@app.post("/api/runs/{rid}/extract")
+def api_auto_fields(rid: str, req: AutoFieldsReq):
+    from automatic_fields import plan_fields
+    run = _run_or_404(rid)
+    if run.get("status") != "done":
+        raise HTTPException(409, "Wait for the document to finish reading")
+    if not (run.get("text") or "").strip():
+        raise HTTPException(400, "No document text was found to extract")
+    plan = plan_fields(req.prompt, run["text"], run.get("file", ""), api_doc_types(),
+                      suggest=lambda prompt: api_chat(ChatReq(prompt=prompt))["answer"])
+    run["doc_type"] = plan["types"][0] if len(plan["types"]) == 1 else ""
+    result = api_fields(rid, FieldsReq(fields=plan["fields"])) if plan["fields"] else {
+        "rows":[], "summary":"This document is table-based. Use the Table workbook for its data."}
+    return dict(result, extraction=plan)
+
+
 @app.get("/api/templates")
 def api_templates(doc_type: str = ""):
     """Spreadsheets a finished run's fields can be dropped into."""
@@ -1172,8 +1443,7 @@ def api_fill_template(rid: str, req: TemplateReq):
     written and which were not, so a half-read document is visibly half
     filled instead of quietly wrong.
     """
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
     if not run["fields"]:
@@ -1255,9 +1525,15 @@ def api_save_thread(req: ThreadReq):
         question = (t.get("question") or "").strip()
         answer = (t.get("answer") or "").strip()
         if question or answer:
+            context = t.get("context") if isinstance(t.get("context"), dict) else {}
             turns.append({"question": question[:20000],
                           "answer": answer[:40000],
-                          "model": (t.get("model") or "")[:80]})
+                          "model": (t.get("model") or "")[:80],
+                          "thinking": str(t.get("thinking") or "")[:20000],
+                          "thought_for": int(t.get("thought_for") or 0),
+                          "context": {k: context[k] for k in
+                                      ("file", "pages", "found", "of", "readSecs", "followup")
+                                      if k in context}})
 
     with _state_lock:
         run = dict(_runs.get(rid) or {})
@@ -1290,8 +1566,15 @@ def api_history_one(rid: str):
     entry = run_history.load(rid)
     if entry is None:
         raise HTTPException(404, "that run is not remembered")
-    # Put it back in the live table so the fields and template actions on it
-    # work exactly as they do for a run from this session.
+    _restore_run(rid, entry)
+    entry["annotated"] = (f"/api/runs/{rid}/annotated"
+                          if entry.get("annotated") else None)
+    return entry
+
+
+def _restore_run(rid, entry):
+    """Put a remembered run back in the live table, so the fields, review and
+    export actions on it work exactly as they do for a run from this session."""
     with _state_lock:
         if rid not in _runs:
             _runs[rid] = {
@@ -1308,10 +1591,25 @@ def api_history_one(rid: str):
                 "approved": entry.get("approved") or {},
                 "layout": run_history.load_layout(rid),
                 "source_path": entry.get("source_path", ""),
+                "doc_type": entry.get("doc_type", ""),
             }
-    entry["annotated"] = (f"/api/runs/{rid}/annotated"
-                          if entry.get("annotated") else None)
-    return entry
+        return _runs[rid]
+
+
+def _live_run(rid):
+    """The run, from the live table or else from history.
+
+    The live table is memory only, so a server restart empties it while a
+    page that was open keeps pointing at its runs. Reading the run back from
+    history here means the export and review buttons on that page keep
+    working instead of answering "no such run".
+    """
+    with _state_lock:
+        run = _runs.get(rid)
+    if run:
+        return run
+    entry = run_history.load(rid)
+    return _restore_run(rid, entry) if entry else None
 
 
 @app.delete("/api/history/{rid}")
@@ -1333,8 +1631,7 @@ def api_annotated(rid: str):
 @app.post("/api/runs/{rid}/save")
 def api_save(rid: str):
     """Write the result to .md / .html / .xlsx, the same way app.py does."""
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
     if not (run["text"] or "").strip():
@@ -1375,13 +1672,11 @@ def api_export_fields(rid: str):
     Nothing is worked out here. The cells carry what was found on the page,
     in the document type's own field order, for another tool's API to read.
     """
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
     if not run.get("fields"):
         raise HTTPException(400, "pull the fields out first")
-    _require_approved(rid, run, "fields")
 
     order = _doc_type_fields(run.get("doc_type") or "")
 
@@ -1396,13 +1691,11 @@ def api_export_fields(rid: str):
 @app.get("/api/runs/{rid}/export/tables")
 def api_export_tables(rid: str):
     """The rendered table as a workbook, a sheet per table, as it was read."""
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run")
     if not (run.get("text") or "").strip():
         raise HTTPException(400, "that run produced nothing to export")
-    _require_approved(rid, run, "tables")
 
     name = _export_name(run, "tables")
     path = os.path.join(vision.OUTPUT_DIR, name)
@@ -1415,14 +1708,14 @@ def api_export_tables(rid: str):
 
 # ------------------------------------------------------------------- review
 #
-# Nothing leaves this page unchecked. Every value is shown on the page it was
-# read from, the analyst ticks it, and only a fully ticked workbook can be
-# downloaded. A tick is pinned to the value it approved, so re-extracting a
-# different value takes the tick away rather than carrying it over.
+# Every value is shown on the page it was read from and the analyst can tick
+# it there. Ticking is a record of what was checked, not a gate: the workbooks
+# download whether or not every row is ticked -- approving every page of a
+# long document is not practical. A tick is pinned to the value it approved,
+# so re-extracting a different value takes the tick away.
 
 def _run_or_404(rid):
-    with _state_lock:
-        run = _runs.get(rid)
+    run = _live_run(rid)
     if not run:
         raise HTTPException(404, "no such run -- reopen it from the list")
     return run
@@ -1440,14 +1733,6 @@ def _source_of(rid, run):
 def _review_of(rid, run):
     return review.build(_source_of(rid, run), run.get("fields") or [],
                         run.get("text") or "", run.get("layout"))
-
-
-def _require_approved(rid, run, what):
-    state = review.approval(_review_of(rid, run), run.get("approved"))[what]
-    if not state["complete"]:
-        left = state["need"] - state["done"]
-        raise HTTPException(409, f"{left} {what[:-1]}(s) still to approve -- "
-                                 f"check them against the page in Review first")
 
 
 @app.get("/api/runs/{rid}/review")
@@ -1568,8 +1853,7 @@ def _resolve_view(src):
 
     if kind == "export" and len(parts) == 3:
         rid, what = parts[1], parts[2]
-        with _state_lock:
-            run = _runs.get(rid)
+        run = _live_run(rid)
         if not run:
             raise HTTPException(404, "no such run")
         name = _export_name(run, what)
@@ -1643,6 +1927,29 @@ def _gradio_is_serving(timeout=1.5):
         return True          # answering at all is enough
     except Exception:
         return False
+
+
+import pexl_integration
+
+
+def _pexl_source(rid):
+    """What a Pexl export sends for a run: the file it read and its values."""
+    run = _live_run(rid)
+    if not run:
+        raise HTTPException(404, "no such run -- reopen it from the list")
+    _, folder, leaf = run_export.split_path(run.get("source_path"), run.get("file", ""))
+    return {"filename": leaf or run.get("file") or "document",
+            "folder_name": folder, "rows": run.get("fields") or [],
+            "text": run.get("text") or ""}
+
+
+pexl_integration.mount(app, api_export_fields, api_export_tables, ROOT / "outputs" / "pexl",
+    suggest=lambda prompt: api_chat(ChatReq(prompt=prompt))["answer"],
+    doc_types=lambda: [{"id": d["id"], "name": d["name"], "pexl": d["pexl"],
+                        "fields": d["fields"]} for d in api_doc_types()],
+    doc_type_of=lambda rid: (_live_run(rid) or {}).get("doc_type") or "",
+    run_source=lambda rid: _pexl_source(rid),
+    check_on_start=__name__ == "__main__")
 
 
 if __name__ == "__main__":

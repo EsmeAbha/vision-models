@@ -111,7 +111,7 @@ def start_vllm(log=print):
     if _vllm_up():
         log("vLLM server already running")
         return
-    log("starting vLLM server in WSL (first start loads the model, ~40s)...")
+    log("starting vLLM server in WSL (about 30s)...")
     # Both streams used to go to DEVNULL. When the server died on startup --
     # which it does the moment --gpu-memory-utilization leaves too little for
     # the encoder, with a plain CUDA OOM -- nothing upstream could say why,
@@ -260,7 +260,12 @@ def release_wsl():
         print(f"wsl shutdown failed: {type(e).__name__}: {e}", flush=True)
 
 
-def unload_current():
+def unload_current(keep_wsl=False):
+    """Free the card. keep_wsl leaves the WSL VM running after vLLM stops:
+    the chat model only needs the VRAM, and shutting the VM down made the next
+    PaddleOCR-VL read boot it from nothing -- about three minutes instead of
+    a vLLM restart in a warm VM. A switch to DeepSeek-OCR still shuts it down,
+    because that one needs the memory the VM holds."""
     outgoing = _state.get("kind")
     if _state["model"] is not None:
         del _state["model"]
@@ -276,7 +281,8 @@ def unload_current():
     # healthy vLLM alone, which is what start_vllm would reuse anyway.
     if outgoing and OCR_WORKERS.get(outgoing, {}).get("wsl"):
         stop_vllm()
-        release_wsl()
+        if not keep_wsl:
+            release_wsl()
     _state["kind"] = None
     _state["model"] = None
     _state["processor"] = None
